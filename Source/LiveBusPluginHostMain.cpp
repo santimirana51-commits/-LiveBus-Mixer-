@@ -3,6 +3,8 @@
 #include <iostream>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <thread>
 
 class LiveBusPluginHostApp final : public juce::JUCEApplication
@@ -98,8 +100,10 @@ private:
             auto* data = channel.getData();
             if (!data) continue;
 
+            const auto command = data->command;
             handleCommand(data);
-            channel.signalResponse();
+            if (command != LiveBusIPC::Command::ProcessBlock)
+                channel.signalResponse();
         }
     }
 
@@ -128,7 +132,9 @@ private:
 
             case LiveBusIPC::Command::SetParameter:
             {
-                if (pluginInstance && data->parameterIndex < (uint32_t)pluginInstance->getParameters().size())
+                if (pluginInstance && std::isfinite(data->parameterValue) &&
+                    data->parameterValue >= 0.0f && data->parameterValue <= 1.0f &&
+                    data->parameterIndex < (uint32_t)pluginInstance->getParameters().size())
                 {
                     if (auto* param = pluginInstance->getParameters()[(int)data->parameterIndex])
                         param->setValue(data->parameterValue);
@@ -160,7 +166,7 @@ private:
 
             case LiveBusIPC::Command::RestoreState:
             {
-                if (pluginInstance && data->stateSize > 0)
+                if (pluginInstance && data->stateSize > 0 && data->stateSize <= LiveBusIPC::maxStateSize)
                 {
                     pluginInstance->setStateInformation(data->stateData, (int)data->stateSize);
                     data->status = LiveBusIPC::Status::Success;
@@ -214,17 +220,33 @@ private:
     void loadPlugin(LiveBusIPC::SharedMemoryData* data)
     {
         releasePlugin();
+        data->pluginLatencySamples = 0;
+
+        if (std::memchr(data->pluginPath, '\0', sizeof(data->pluginPath)) == nullptr)
+        {
+            LiveBusIPC::copyNullTerminatedString(data->errorMessage, sizeof(data->errorMessage),
+                                                 "Plugin path is not null terminated");
+            data->status = LiveBusIPC::Status::Error;
+            return;
+        }
 
         juce::String pluginPath = juce::String::fromUTF8(data->pluginPath);
+        if (pluginPath.isEmpty() || !std::isfinite(data->sampleRate) ||
+            data->sampleRate < 8000.0 || data->sampleRate > 384000.0 ||
+            !LiveBusIPC::isSupportedFrameCount(data->frames))
+        {
+            LiveBusIPC::copyNullTerminatedString(data->errorMessage, sizeof(data->errorMessage),
+                                                 "Invalid plugin path, sample rate, or block size");
+            data->status = LiveBusIPC::Status::Error;
+            return;
+        }
         juce::PluginDescription desc;
         desc.fileOrIdentifier = pluginPath;
         desc.pluginFormatName = "VST3";
 
         juce::String errorMessage;
-        double sr = data->sampleRate > 0 ? data->sampleRate : 48000.0;
-        int bs = data->frames > 0
-            ? juce::jmin((int)data->frames, (int)LiveBusIPC::maxFrames)
-            : 512;
+        const double sr = data->sampleRate;
+        const int bs = (int)data->frames;
 
         pluginInstance = formatManager.createPluginInstance(desc, sr, bs, errorMessage);
 
@@ -248,12 +270,14 @@ private:
             pluginInstance->setPlayConfigDetails(2, 2, sr, bs);
             pluginInstance->prepareToPlay(sr, bs);
             audioBuffer.setSize(2, LiveBusIPC::maxFrames);
-            std::strncpy(data->pluginName, pluginInstance->getName().toRawUTF8(), sizeof(data->pluginName) - 1);
+            data->pluginLatencySamples = (std::uint32_t)juce::jmax(
+                0, pluginInstance->getLatencySamples());
+            LiveBusIPC::copyNullTerminatedString(data->pluginName, sizeof(data->pluginName), pluginInstance->getName().toRawUTF8());
             data->status = LiveBusIPC::Status::Success;
         }
         else
         {
-            std::strncpy(data->errorMessage, errorMessage.toRawUTF8(), sizeof(data->errorMessage) - 1);
+            LiveBusIPC::copyNullTerminatedString(data->errorMessage, sizeof(data->errorMessage), errorMessage.toRawUTF8());
             data->status = LiveBusIPC::Status::PluginNotFound;
         }
     }

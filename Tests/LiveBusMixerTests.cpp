@@ -1,5 +1,7 @@
 #include <JuceHeader.h>
+#include <algorithm>
 #include "../Source/RoutingMatrix.h"
+#include "../Source/RoutingGraphRouting.h"
 #include "../Source/ChannelStripDSP.h"
 #include "../Source/SceneManager.h"
 #include "../Source/PluginHostProtocol.h"
@@ -14,6 +16,8 @@
 #include "../Source/RecallFilter.h"
 #include "../Source/PresetManager.h"
 #include "../Source/OBSIntegrationService.h"
+#include "../Source/MasterOutputRouter.h"
+#include "../Source/OBSWebSocketClient.h"
 #include "../Source/MidiMappingModel.h"
 #include "../Source/MidiParameterRegistry.h"
 #include "../Source/MidiManager.h"
@@ -27,6 +31,7 @@
 #include "../Source/DiagnosticsLogManager.h"
 #include "../Source/AutoDucker.h"
 #include "../Source/AudioSafetyProcessor.h"
+#include "../Source/AudioDelayCompensator.h"
 #include "../Source/MacroEngine.h"
 #include "../Source/YouTubeAudioCaptureService.h"
 #include "../Source/YouTubePlayerComponent.h"
@@ -34,7 +39,19 @@
 #include <cassert>
 #include <cmath>
 #include <chrono>
+#include <array>
+#include <memory>
+#include <limits>
+#include <string>
 #include <thread>
+#include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 
 static int passedTests = 0;
 static int failedTests = 0;
@@ -91,6 +108,319 @@ void testRoutingMatrixAndPanLaw()
     float rRight = streamBuf.getSample(1, 0);
     TEST_ASSERT(std::abs(lRight) < 1e-5f, "Full right has silent left channel");
     TEST_ASSERT(std::abs(rRight - 1.4142f) < 1e-3f, "Full right has sqrt(2) boost");
+}
+
+void testAudioDelayCompensatorImpulseAlignment()
+{
+    LiveBus::AudioDelayCompensator compensator;
+    compensator.prepare(2, 128);
+    TEST_ASSERT(compensator.setDelaySamples(64), "A valid compensation delay is accepted");
+
+    juce::AudioBuffer<float> silence(2, 128);
+    silence.clear();
+    compensator.process(silence, 128);
+
+    juce::AudioBuffer<float> impulse(2, 128);
+    impulse.clear();
+    impulse.setSample(0, 0, 1.0f);
+    impulse.setSample(1, 1, 0.5f);
+    compensator.process(impulse, 128);
+
+    TEST_ASSERT(std::abs(impulse.getSample(0, 64) - 1.0f) < 1.0e-5f,
+                "Left impulse is delayed by the configured sample count");
+    TEST_ASSERT(std::abs(impulse.getSample(1, 65) - 0.5f) < 1.0e-5f,
+                "Right impulse retains channel separation and the same delay");
+    TEST_ASSERT(!compensator.setDelaySamples(LiveBus::AudioDelayCompensator::maxDelaySamples + 1),
+                "Delay requests beyond the preallocated limit are rejected");
+    TEST_ASSERT(compensator.getRequestedDelaySamples() == 0,
+                "Rejected delay requests safely fall back to zero compensation");
+
+    LiveBus::AudioDelayCompensator pluginPath;
+    LiveBus::AudioDelayCompensator dryPath;
+    pluginPath.prepare(2, 128);
+    dryPath.prepare(2, 128);
+    TEST_ASSERT(pluginPath.setDelaySamples(0) && dryPath.setDelaySamples(64),
+                "Parallel paths accept complementary compensation delays");
+    juce::AudioBuffer<float> pluginSilence(2, 128);
+    juce::AudioBuffer<float> drySilence(2, 128);
+    pluginSilence.clear();
+    drySilence.clear();
+    pluginPath.process(pluginSilence, 128);
+    dryPath.process(drySilence, 128);
+
+    juce::AudioBuffer<float> pluginImpulse(2, 128);
+    juce::AudioBuffer<float> dryImpulse(2, 128);
+    pluginImpulse.clear();
+    dryImpulse.clear();
+    pluginImpulse.setSample(0, 64, 1.0f);
+    dryImpulse.setSample(0, 0, 1.0f);
+    pluginPath.process(pluginImpulse, 128);
+    dryPath.process(dryImpulse, 128);
+    TEST_ASSERT(std::abs(pluginImpulse.getSample(0, 64) - dryImpulse.getSample(0, 64)) < 1.0e-5f,
+                "A delayed plugin path aligns with a dry path after PDC");
+}
+
+void testWavRecorderOverwritesExistingFile()
+{
+    auto file = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("LiveBusMixerRecorderTest_" + juce::Uuid().toString() + ".wav");
+    struct FileCleanup
+    {
+        juce::File& fileToDelete;
+        ~FileCleanup() { fileToDelete.deleteFile(); }
+    } cleanup{ file };
+
+    std::array<char, 4096> oldContents{};
+    {
+        juce::FileOutputStream oldFile(file);
+        TEST_ASSERT(oldFile.openedOk() && oldFile.write(oldContents.data(), oldContents.size()),
+                    "Test fixture creates a pre-existing file");
+    }
+
+    juce::WavAudioFormat format;
+    auto outputStream = std::make_unique<juce::FileOutputStream>(file);
+    TEST_ASSERT(outputStream->openedOk(), "Existing WAV destination can be opened");
+    TEST_ASSERT(outputStream->setPosition(0), "Existing WAV destination can be rewound");
+    TEST_ASSERT(outputStream->truncate().wasOk(), "Existing WAV destination is truncated before recording");
+
+    std::unique_ptr<juce::AudioFormatWriter> writer(
+        format.createWriterFor(outputStream.get(), 48000.0, 2, 24, {}, 0));
+    TEST_ASSERT(writer != nullptr, "WAV writer can be created after truncation");
+    outputStream.release();
+
+    juce::AudioBuffer<float> audio(2, 16);
+    audio.clear();
+    TEST_ASSERT(writer->writeFromAudioSampleBuffer(audio, 0, audio.getNumSamples()),
+                "Short stereo recording is written");
+    writer.reset();
+
+    std::unique_ptr<juce::AudioFormatReader> reader(
+        format.createReaderFor(file.createInputStream().release(), true));
+    TEST_ASSERT(reader != nullptr, "Overwritten output remains a readable WAV file");
+    TEST_ASSERT(reader->lengthInSamples == (juce::int64)audio.getNumSamples(),
+                "Output contains only the newly recorded audio, without stale trailing data");
+}
+
+void testRoutingGraphEditsUpdateAudioEngine()
+{
+    RoutingMatrix matrix;
+    juce::AudioBuffer<float> streamBuffer(2, 64);
+    juce::AudioBuffer<float> monitorBuffer(2, 64);
+    std::vector<std::vector<float>> inputs(4, std::vector<float>(64, 0.0f));
+    std::fill(inputs[0].begin(), inputs[0].end(), 1.0f);
+    const float* inputPointers[4] =
+    {
+        inputs[0].data(), inputs[1].data(), inputs[2].data(), inputs[3].data()
+    };
+
+    for (int channel = 0; channel < 4; ++channel)
+    {
+        matrix.getChannel(channel).routeEnable[0].store(false);
+        matrix.getChannel(channel).routeEnable[1].store(false);
+    }
+    matrix.getChannel(0).gain.store(1.0f);
+    matrix.getChannel(0).pan.store(0.0f);
+
+    const LiveBus::RoutingGraphEndpoint channel0{ LiveBus::RoutingGraphNodeType::Channel, 0 };
+    const LiveBus::RoutingGraphEndpoint stream{ LiveBus::RoutingGraphNodeType::Stream, 0 };
+    const auto connected = LiveBus::connectRoutingGraphEndpoints(matrix, channel0, stream);
+    TEST_ASSERT(connected == LiveBus::RoutingGraphEditResult::Updated,
+                "Graph route connection updates routing state");
+
+    matrix.routeAndSum(inputPointers, 4, streamBuffer, monitorBuffer, 64);
+    TEST_ASSERT(streamBuffer.getSample(0, 0) > 0.99f,
+                "Graph route reaches the actual Stream bus");
+    TEST_ASSERT(std::abs(monitorBuffer.getSample(0, 0)) < 1.0e-5f,
+                "Graph route leaves the Monitor bus isolated");
+
+    const auto duplicate = LiveBus::connectRoutingGraphEndpoints(matrix, channel0, stream);
+    TEST_ASSERT(duplicate == LiveBus::RoutingGraphEditResult::AlreadyConnected,
+                "Duplicate graph cables are reported without changing routing");
+
+    const LiveBus::RoutingGraphEndpoint monitor{ LiveBus::RoutingGraphNodeType::Monitor, 0 };
+    TEST_ASSERT(LiveBus::connectRoutingGraphEndpoints(matrix, stream, monitor) ==
+                    LiveBus::RoutingGraphEditResult::Unsupported,
+                "Unsupported bus-to-bus connections are rejected");
+
+    const LiveBus::RoutingGraphEndpoint submix{ LiveBus::RoutingGraphNodeType::Submix, 0 };
+    TEST_ASSERT(LiveBus::connectRoutingGraphEndpoints(matrix, channel0, submix) ==
+                    LiveBus::RoutingGraphEditResult::Updated,
+                "Input can be assigned to a supported Submix");
+    TEST_ASSERT(matrix.getChannel(0).submixGroup.load() == 0 &&
+                    !matrix.getChannel(0).routeEnable[0].load() &&
+                    !matrix.getChannel(0).routeEnable[1].load(),
+                "Submix assignment replaces direct master routes");
+    TEST_ASSERT(LiveBus::disconnectRoutingGraphEndpoints(matrix, channel0, submix) ==
+                    LiveBus::RoutingGraphEditResult::Updated,
+                "Submix cable can be removed");
+    TEST_ASSERT(matrix.getChannel(0).submixGroup.load() == -1 &&
+                    !matrix.getChannel(0).routeEnable[0].load() &&
+                    !matrix.getChannel(0).routeEnable[1].load(),
+                "Removing a Submix cable does not restore stale direct routes");
+}
+
+void testIndependentStreamMonitorRestore()
+{
+    RoutingMatrix matrix;
+    auto& ch = matrix.getChannel(0);
+    ch.gain.store(1.0f);
+    ch.pan.store(0.0f);
+
+    matrix.applyChannelRouteState(0, true, false);
+    TEST_ASSERT(ch.routeEnable[0].load() && !ch.routeEnable[1].load() && ch.submixGroup.load() == -1,
+                "Direct Stream route is applied without stale Monitor state");
+
+    matrix.applyChannelRouteState(0, false, true);
+    TEST_ASSERT(!ch.routeEnable[0].load() && ch.routeEnable[1].load() && ch.submixGroup.load() == -1,
+                "Direct Monitor route is applied without stale Stream state");
+
+    matrix.assignChannelToSubmix(0, 1);
+    TEST_ASSERT(ch.submixGroup.load() == 1 && !ch.routeEnable[0].load() && !ch.routeEnable[1].load(),
+                "Submix assignment clears direct route state");
+
+    ch.submixGroup.store(1);
+    ch.routeEnable[0].store(false);
+    ch.routeEnable[1].store(false);
+    matrix.applyChannelRouteState(0, true, false);
+    TEST_ASSERT(ch.routeEnable[0].load() && !ch.routeEnable[1].load() && ch.submixGroup.load() == -1,
+                "Restoring a direct route clears stale submix assignment");
+
+    juce::AudioBuffer<float> stream(2, 64);
+    juce::AudioBuffer<float> monitor(2, 64);
+    std::vector<float> input(64, 1.0f);
+    const float* ps[] = { input.data() };
+
+    matrix.applyChannelRouteState(0, true, false);
+    matrix.routeAndSum(ps, 1, stream, monitor, 64);
+    TEST_ASSERT(stream.getSample(0, 0) > 0.99f, "Stream route sends the actual signal into the Stream bus");
+    TEST_ASSERT(std::abs(monitor.getSample(0, 0)) < 1.0e-5f, "Stream route leaves the Monitor bus silent");
+
+    matrix.applyChannelRouteState(0, false, true);
+    matrix.routeAndSum(ps, 1, stream, monitor, 64);
+    TEST_ASSERT(std::abs(stream.getSample(0, 0)) < 1.0e-5f, "Monitor route does not leak into the Stream bus");
+    TEST_ASSERT(monitor.getSample(0, 0) > 0.99f, "Monitor route sends the actual signal into the Monitor bus");
+}
+
+void testRoutingGraphConnectionValidation()
+{
+    RoutingMatrix matrix;
+    using namespace LiveBus;
+
+    const RoutingGraphEndpoint channel{ RoutingGraphNodeType::Channel, 0 };
+    const RoutingGraphEndpoint submix{ RoutingGraphNodeType::Submix, 0 };
+    const auto validConnection = makeRoutingGraphConnection(channel, submix);
+    TEST_ASSERT(validateRoutingGraphConnection(matrix, validConnection) ==
+                    RoutingGraphValidationResult::Valid,
+                "Supported graph cable passes node, port, and layout validation");
+    TEST_ASSERT(validConnection.sourceNode.toStableString() == "channel:0" &&
+                    validConnection.destinationNode.toStableString() == "submix:0",
+                "Node IDs are stable and independent of canvas positions");
+    TEST_ASSERT(validConnection.sourcePort == RoutingGraphPortId::AudioOutput &&
+                    validConnection.destinationPort == RoutingGraphPortId::AudioInput &&
+                    validConnection.channelMapping == RoutingGraphChannelMapping::EngineNative,
+                "Connection persists its ports and engine-native channel mapping");
+    TEST_ASSERT(matrix.addChannel("Graph Input") &&
+                    validateRoutingGraphConnection(matrix,
+                        makeRoutingGraphConnection(
+                            { RoutingGraphNodeType::Channel, 4 },
+                            { RoutingGraphNodeType::Stream, 0 })) == RoutingGraphValidationResult::Valid,
+                "A newly activated input channel is available as a valid graph node");
+
+    matrix.updateMasterBusMeter(0, 0.25f, 0.75f);
+    matrix.updateMasterBusMeter(1, 0.4f, 0.2f);
+    TEST_ASSERT(std::abs(matrix.getMasterBusPeak(0) - 0.75f) < 1.0e-5f &&
+                    std::abs(matrix.getMasterBusPeak(1) - 0.4f) < 1.0e-5f,
+                "Stream and Monitor graph meters read their corresponding engine bus peaks");
+
+    auto invalid = validConnection;
+    invalid.destinationNode.index = maxSubmixBuses;
+    TEST_ASSERT(validateRoutingGraphConnection(matrix, invalid) ==
+                    RoutingGraphValidationResult::NodeNotFound,
+                "Unknown node IDs are rejected");
+
+    invalid = validConnection;
+    invalid.sourcePort = static_cast<RoutingGraphPortId>(255);
+    TEST_ASSERT(validateRoutingGraphConnection(matrix, invalid) ==
+                    RoutingGraphValidationResult::PortNotFound,
+                "Unknown port IDs are rejected");
+
+    invalid = validConnection;
+    invalid.sourcePort = RoutingGraphPortId::AudioInput;
+    TEST_ASSERT(validateRoutingGraphConnection(matrix, invalid) ==
+                    RoutingGraphValidationResult::DirectionMismatch,
+                "Input-to-input connections are rejected");
+
+    invalid = validConnection;
+    invalid.channelMapping = static_cast<RoutingGraphChannelMapping>(255);
+    TEST_ASSERT(validateRoutingGraphConnection(matrix, invalid) ==
+                    RoutingGraphValidationResult::ChannelLayoutUnsupported,
+                "Unsupported channel mappings are rejected");
+
+    const RoutingGraphEndpoint stream{ RoutingGraphNodeType::Stream, 0 };
+    invalid = makeRoutingGraphConnection(stream, channel);
+    invalid.sourcePort = RoutingGraphPortId::AudioOutput;
+    TEST_ASSERT(validateRoutingGraphConnection(matrix, invalid) ==
+                    RoutingGraphValidationResult::CycleUnsupported,
+                "A feedback cable from a master output is rejected");
+
+    TEST_ASSERT(connectRoutingGraphConnection(matrix, validConnection) ==
+                    RoutingGraphEditResult::Updated,
+                "Validated model connection can be applied to the engine");
+    TEST_ASSERT(connectRoutingGraphConnection(matrix, validConnection) ==
+                    RoutingGraphEditResult::AlreadyConnected,
+                "Duplicate model connection is identified without duplicate state");
+    TEST_ASSERT(disconnectRoutingGraphConnection(matrix, validConnection) ==
+                    RoutingGraphEditResult::Updated,
+                "Validated model connection can be removed from the engine");
+}
+
+void testRoutingGraphConnectionSerialization()
+{
+    using namespace LiveBus;
+    RoutingMatrix matrix;
+
+    for (int channel = 0; channel < matrix.getNumActiveChannels(); ++channel)
+    {
+        matrix.getChannel(channel).routeEnable[0].store(false);
+        matrix.getChannel(channel).routeEnable[1].store(false);
+        for (int aux = 0; aux < maxAuxBuses; ++aux)
+            matrix.getChannel(channel).auxRouteEnable[(size_t)aux].store(false);
+    }
+    for (int submix = 0; submix < maxSubmixBuses; ++submix)
+    {
+        matrix.getSubmixBus(submix).routeToStream.store(false);
+        matrix.getSubmixBus(submix).routeToMonitor.store(false);
+    }
+    for (int aux = 0; aux < maxAuxBuses; ++aux)
+    {
+        matrix.getAuxBus(aux).sendToStream.store(false);
+        matrix.getAuxBus(aux).sendToMonitor.store(false);
+    }
+
+    matrix.getChannel(0).submixGroup.store(0);
+    matrix.getChannel(1).auxRouteEnable[0].store(true);
+    matrix.getSubmixBus(0).routeToStream.store(true);
+    matrix.getAuxBus(0).sendToMonitor.store(true);
+
+    const auto connections = getRoutingGraphConnections(matrix);
+    TEST_ASSERT(connections.size() == 4,
+                "Graph snapshot includes active channel, Submix, and Aux connections");
+    TEST_ASSERT(std::none_of(connections.begin(), connections.end(),
+                    [](const RoutingGraphConnection& connection)
+                    {
+                        return connection.sourceNode ==
+                                   RoutingGraphNodeId{ RoutingGraphNodeType::Channel, 0 } &&
+                               (connection.destinationNode ==
+                                    RoutingGraphNodeId{ RoutingGraphNodeType::Stream, 0 } ||
+                                connection.destinationNode ==
+                                    RoutingGraphNodeId{ RoutingGraphNodeType::Monitor, 0 });
+                    }),
+                "Disabled direct routes are not represented as connected canvas cables");
+    auto xml = serializeRoutingGraphConnections(matrix);
+    TEST_ASSERT(xml != nullptr && xml->getNumChildElements() == 4,
+                "Saved graph metadata serializes the engine's active connection set");
+    TEST_ASSERT(xml->getChildByName("CONNECTION")->getStringAttribute("sourceType") == "channel",
+                "Serialized connection retains stable endpoint type metadata");
 }
 
 void testIndependentBusSummingAndIsolation()
@@ -186,6 +516,61 @@ void testMuteAndSoloLogic()
     TEST_ASSERT(matrix.getChannel(1).peakMeter.load() > 0.0f, "Soloed channel active");
 }
 
+void testSubmixAndAuxSoloRouting()
+{
+    RoutingMatrix matrix;
+    matrix.setNumActiveChannels(2);
+    matrix.getChannel(0).gain.store(1.0f);
+    matrix.getChannel(0).pan.store(0.0f);
+    matrix.getChannel(0).submixGroup.store(0);
+    matrix.getChannel(1).gain.store(1.0f);
+    matrix.getChannel(1).routeEnable[0].store(true);
+    matrix.getChannel(1).routeEnable[1].store(true);
+
+    auto& submix = matrix.getSubmixBus(0);
+    submix.solo.store(true);
+    submix.routeToStream.store(true);
+    submix.routeToMonitor.store(false);
+
+    std::array<juce::AudioBuffer<float>, 2> inputs;
+    inputs[0].setSize(2, 64);
+    inputs[1].setSize(2, 64);
+    inputs[0].clear();
+    inputs[1].clear();
+    inputs[0].setSample(0, 0, 1.0f);
+    inputs[0].setSample(1, 0, 1.0f);
+    inputs[1].setSample(0, 0, 0.5f);
+    inputs[1].setSample(1, 0, 0.5f);
+    juce::AudioBuffer<float> stream(2, 64);
+    juce::AudioBuffer<float> monitor(2, 64);
+    matrix.routeAndSum(inputs.data(), 2, stream, monitor, 64);
+    TEST_ASSERT(std::abs(stream.getSample(0, 0) - 1.0f) < 1.0e-4f &&
+                    std::abs(monitor.getSample(0, 0)) < 1.0e-5f,
+                "Soloed Submix keeps its Stream route while isolating Monitor and other channels");
+    TEST_ASSERT(matrix.getChannel(1).peakMeter.load() == 0.0f,
+                "Submix solo excludes unrelated input channels");
+
+    submix.solo.store(false);
+    matrix.getChannel(0).submixGroup.store(-1);
+    matrix.getChannel(0).auxRouteEnable[0].store(true);
+    matrix.getChannel(0).auxSendLevel[0].store(1.0f);
+    auto& aux = matrix.getAuxBus(0);
+    aux.fxType.store(0);
+    aux.returnLevel.store(1.0f);
+    aux.sendToStream.store(true);
+    aux.sendToMonitor.store(false);
+    aux.solo.store(true);
+
+    const float* monoInputs[2] = { inputs[0].getReadPointer(0), inputs[1].getReadPointer(0) };
+    matrix.routeAndSum(monoInputs, 2, stream, monitor, 64);
+    TEST_ASSERT(std::abs(stream.getSample(0, 0) - 1.0f) < 1.0e-4f &&
+                    std::abs(monitor.getSample(0, 0)) < 1.0e-5f,
+                "Soloed Aux return preserves only its enabled Stream destination");
+    TEST_ASSERT(matrix.getChannel(1).peakMeter.load() == 0.0f &&
+                    aux.peakMeterL.load() > 0.99f,
+                "Aux solo isolates unrelated channels and meters the actual return");
+}
+
 void testDSPProcessorNumericalPerformance()
 {
     BusDSPProcessor dsp;
@@ -255,6 +640,10 @@ void testSceneSerializationAndDeserialization()
     original.buses[0].compThresholdDb = -14.0f;
     original.buses[0].reverbEnabled = true;
     original.buses[0].reverbRoomSize = 0.75f;
+    original.routingGraphLayoutXml =
+        "<ROUTING_GRAPH_LAYOUT version=\"1\" zoom=\"0.75\" viewX=\"120\" viewY=\"48\">"
+        "<NODES><NODE type=\"channel\" index=\"0\" x=\"48\" y=\"64\"/></NODES>"
+        "</ROUTING_GRAPH_LAYOUT>";
 
     // Add simulated plugin state blob
     VST3SceneState p;
@@ -280,6 +669,8 @@ void testSceneSerializationAndDeserialization()
     TEST_ASSERT(restored.channels[0].name == "Lead Vocal", "Channel name preserved");
     TEST_ASSERT(std::abs(restored.channels[0].gain - 1.25f) < 1e-4f, "Channel gain preserved");
     TEST_ASSERT(restored.channels[0].solo == true, "Solo state preserved");
+    TEST_ASSERT(restored.routingGraphLayoutXml == original.routingGraphLayoutXml,
+                "Routing graph layout preserved");
     TEST_ASSERT(std::abs(restored.buses[0].eqFreq - 3200.0f) < 1e-4f, "EQ frequency preserved");
     TEST_ASSERT(restored.plugins.size() == 1, "Plugin chain preserved");
     TEST_ASSERT(restored.plugins[0].pluginName == "StudioComp", "Plugin name preserved");
@@ -323,7 +714,7 @@ void testSceneFileCorruptionRecovery()
 void testIPCProtocolAndConstants()
 {
     TEST_ASSERT(LiveBusIPC::magicNumber == 0x4C495645, "Magic number is LIVE");
-    TEST_ASSERT(LiveBusIPC::protocolVersion == 3, "Protocol version 3");
+    TEST_ASSERT(LiveBusIPC::protocolVersion == 4, "Protocol version 4");
     TEST_ASSERT(sizeof(LiveBusIPC::SharedMemoryData) > 0, "Shared memory struct valid");
     TEST_ASSERT(LiveBusIPC::maxChannels == 2, "Stereo channels");
     TEST_ASSERT(LiveBusIPC::maxFrames == 8192, "Max frames 8192");
@@ -331,6 +722,39 @@ void testIPCProtocolAndConstants()
     TEST_ASSERT(LiveBusIPC::isSupportedFrameCount(1), "Single-frame requests are supported");
     TEST_ASSERT(LiveBusIPC::isSupportedFrameCount(LiveBusIPC::maxFrames), "Maximum-sized requests are supported");
     TEST_ASSERT(!LiveBusIPC::isSupportedFrameCount(LiveBusIPC::maxFrames + 1), "Oversized requests are rejected");
+
+    char boundedText[5] = { 'x', 'x', 'x', 'x', 'x' };
+    LiveBusIPC::copyNullTerminatedString(boundedText, sizeof(boundedText), "123456");
+    TEST_ASSERT(std::strcmp(boundedText, "1234") == 0, "IPC strings truncate safely and always terminate");
+}
+
+void testIsolatedPluginDryPathKeepsFixedBlockLatency()
+{
+    LiveBusIPC::FixedBlockAudioDelay delay;
+    std::array<float, 4> leftInput{ 1.0f, 2.0f, 3.0f, 4.0f };
+    std::array<float, 4> rightInput{ -1.0f, -2.0f, -3.0f, -4.0f };
+    const float* firstInput[] = { leftInput.data(), rightInput.data() };
+    std::array<float, 4> leftOutput{};
+    std::array<float, 4> rightOutput{};
+    float* output[] = { leftOutput.data(), rightOutput.data() };
+
+    delay.storeCurrent(firstInput, 2, 4);
+    TEST_ASSERT(!delay.copyPrevious(output, 2, 4),
+                "First isolated block has no prior audio and must produce latency-fill silence");
+
+    leftInput.fill(5.0f);
+    rightInput.fill(-5.0f);
+    const float* secondInput[] = { leftInput.data(), rightInput.data() };
+    delay.storeCurrent(secondInput, 2, 4);
+    TEST_ASSERT(delay.copyPrevious(output, 2, 4) &&
+                    leftOutput[0] == 1.0f && rightOutput[0] == -1.0f,
+                "A delayed dry block preserves the previous block's exact audio");
+    TEST_ASSERT(!delay.copyPrevious(output, 2, 2),
+                "A delayed block with a different frame count is rejected");
+
+    delay.storeCurrent(secondInput, 2, 4);
+    TEST_ASSERT(delay.copyPrevious(output, 2, 4) && leftOutput[0] == 5.0f,
+                "Dry fallback advances continuously while isolated processing is late");
 }
 
 void testIPCCompletionPublication()
@@ -624,6 +1048,45 @@ void testZipPresetPackaging()
     tempDir.deleteRecursively();
 }
 
+void testZipPresetImportRejectsTraversalWithoutReplacingExistingFiles()
+{
+    const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+        .getChildFile("LiveBusZipTraversal_" + juce::String(juce::Random::getSystemRandom().nextInt()));
+    const auto scenesDirectory = tempDir.getChildFile("Scenes");
+    const bool directoriesCreated = scenesDirectory.createDirectory();
+    auto existingScene = scenesDirectory.getChildFile("Existing.xml");
+    const bool existingSceneWritten = existingScene.replaceWithText("<Scene><Name>Keep</Name></Scene>");
+
+    const auto safeSource = tempDir.getChildFile("Safe.xml");
+    const auto traversalSource = tempDir.getChildFile("Traversal.xml");
+    const bool sourcesWritten = safeSource.replaceWithText("<Scene><Name>New</Name></Scene>") &&
+                                traversalSource.replaceWithText("<Scene><Name>Bad</Name></Scene>");
+    const auto archiveFile = tempDir.getChildFile("Malicious.zip");
+    juce::ZipFile::Builder builder;
+    builder.addFile(safeSource, 9, "Existing.xml");
+    builder.addFile(traversalSource, 9, "../escape.xml");
+    bool archiveWritten = false;
+    {
+        juce::FileOutputStream stream(archiveFile);
+        archiveWritten = stream.openedOk() && builder.writeToStream(stream, nullptr);
+        stream.flush();
+        archiveWritten = archiveWritten && stream.getStatus().wasOk();
+    }
+
+    const bool imported = archiveWritten &&
+                          PresetZipManager::importPresetsFromZip(archiveFile, scenesDirectory);
+    const auto existingContents = existingScene.loadFileAsString();
+    const bool escapedFileCreated = tempDir.getChildFile("escape.xml").exists();
+    tempDir.deleteRecursively();
+
+    TEST_ASSERT(directoriesCreated && existingSceneWritten && sourcesWritten && archiveWritten,
+                "Traversal test fixture was created");
+    TEST_ASSERT(!imported, "ZIP entry with a traversal path is rejected");
+    TEST_ASSERT(existingContents == "<Scene><Name>Keep</Name></Scene>",
+                "Rejected archive leaves existing scene content untouched");
+    TEST_ASSERT(!escapedFileCreated, "Rejected archive does not create files outside the scene directory");
+}
+
 void testSessionPersistenceAndFullState()
 {
     SceneManager manager;
@@ -772,6 +1235,72 @@ void testEightBandEQFilterTypesAndAcousticResponse()
     float magPass = eq.getBandMagnitudeForFrequency(7, 200.0f);
     TEST_ASSERT(magStopband < -10.0f, "Low-Pass strongly attenuates ultra-highs (18kHz)");
     TEST_ASSERT(std::abs(magPass - 0.0f) < 0.2f, "Low-Pass passes 200Hz with 0dB attenuation");
+}
+
+void testDSPEightBandEQProcessingAndAnalyzerFeed()
+{
+    using namespace LiveBus;
+
+    BusDSPProcessor processor;
+    processor.prepare(48000.0, 512);
+    processor.params.eqEnabled.store(false);
+    processor.eightBandEQ.params.setToFlat();
+    processor.eightBandEQ.params.bands[3].type.store(EQFilterType::Bell);
+    processor.eightBandEQ.params.bands[3].freq.store(1000.0f);
+    processor.eightBandEQ.params.bands[3].gainDb.store(12.0f);
+    processor.eightBandEQ.params.bands[3].q.store(1.0f);
+    processor.eightBandEQ.params.bands[3].enabled.store(true);
+    processor.eightBandEQ.updateCoefficients();
+
+    juce::AudioBuffer<float> buffer(2, 512);
+    float inputRms = 0.0f;
+    float outputRms = 0.0f;
+    int samplePosition = 0;
+    for (int block = 0; block < 8; ++block)
+    {
+        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                (float)(samplePosition++) * 1000.0f * juce::MathConstants<float>::twoPi / 48000.0f);
+            buffer.setSample(0, sample, value);
+            buffer.setSample(1, sample, value);
+        }
+
+        processor.process(buffer, buffer.getNumSamples());
+        if (block == 7)
+        {
+            inputRms = 0.1f / std::sqrt(2.0f);
+            outputRms = buffer.getRMSLevel(0, 0, buffer.getNumSamples());
+        }
+    }
+
+    TEST_ASSERT(outputRms > inputRms * 2.0f,
+                "8-band EQ applies its gain even when the legacy EQ is disabled");
+
+    std::array<float, fftSize> analyzerSamples{};
+    TEST_ASSERT(processor.eightBandEQ.pullFromAnalyzer(analyzerSamples.data(), fftSize),
+                "DSP analyzer receives post-EQ audio");
+    TEST_ASSERT(std::any_of(analyzerSamples.begin(), analyzerSamples.end(),
+                            [](float value) { return std::abs(value) > 0.001f; }),
+                "DSP analyzer data contains the processed signal");
+
+    processor.eightBandEQ.params.masterEnabled.store(false);
+    processor.eightBandEQ.setAnalyzerPost(false);
+    for (int block = 0; block < 8; ++block)
+    {
+        buffer.clear();
+        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                (float)(samplePosition++) * 1000.0f * juce::MathConstants<float>::twoPi / 48000.0f);
+            buffer.setSample(0, sample, value);
+            buffer.setSample(1, sample, value);
+        }
+        processor.process(buffer, buffer.getNumSamples());
+    }
+
+    TEST_ASSERT(processor.eightBandEQ.pullFromAnalyzer(analyzerSamples.data(), fftSize),
+                "DSP analyzer continues receiving pre-EQ audio when EQ is bypassed");
 }
 
 void testEightBandEQBypassAndBitTransparency()
@@ -1819,7 +2348,9 @@ void testSceneSaveLoadAndMetadata()
     SceneData data;
     data.sceneName = sceneName;
     data.description = "Professional Broadcast Master configuration";
+    data.numActiveChannels = maxInputs;
     data.channels[0].name = "Lead Host";
+    data.channels[0].accentColour = 0xff06b6d4;
     data.channels[0].gain = 0.82f;
     data.channels[0].pan = -0.25f;
     data.channels[0].mute = true;
@@ -1827,6 +2358,7 @@ void testSceneSaveLoadAndMetadata()
     data.channels[0].monitorRoute = false;
     data.channels[0].streamSend = 0.95f;
     data.channels[0].monitorSend = 0.70f;
+    data.channels[maxInputs - 1].accentColour = 0xff9333ea;
 
     // 8-Band EQ on target 2 (Mic)
     data.eightBandEQs[2].bands[3].freq = 2400.0f;
@@ -1849,6 +2381,9 @@ void testSceneSaveLoadAndMetadata()
     TEST_ASSERT(loaded.description == "Professional Broadcast Master configuration", "Description metadata preserved");
     TEST_ASSERT(loaded.timestamp > 0, "Valid timestamp recorded");
     TEST_ASSERT(loaded.channels[0].name == "Lead Host", "Channel name preserved");
+    TEST_ASSERT(loaded.channels[0].accentColour == 0xff06b6d4, "Channel accent color preserved");
+    TEST_ASSERT(loaded.channels[maxInputs - 1].accentColour == 0xff9333ea,
+                "Sixteenth channel accent color preserved");
     TEST_ASSERT(std::abs(loaded.channels[0].gain - 0.82f) < 1e-4f, "Channel gain preserved");
     TEST_ASSERT(std::abs(loaded.channels[0].pan - -0.25f) < 1e-4f, "Channel pan preserved");
     TEST_ASSERT(loaded.channels[0].mute == true, "Channel mute preserved");
@@ -2196,6 +2731,229 @@ void testOBSVirtualDeviceDetectionAndPatternRecognition()
     TEST_ASSERT(OBSIntegrationService::identifyVirtualDriverType("Realtek Audio") == "Physical Hardware", "Classifies Realtek as Physical");
 }
 
+void testOBSNativeDriverReadinessIsHonest()
+{
+    using namespace LiveBus;
+    juce::AudioDeviceManager dummyMgr;
+    OBSIntegrationService obs(dummyMgr);
+
+    TEST_ASSERT(obs.hasNativeVirtualAudioDriver() == false, "Native LiveBus virtual driver is disabled by default");
+    TEST_ASSERT(obs.getDriverReadinessSummary().contains("not installed") ||
+                    obs.getDriverReadinessSummary().contains("required for endpoint routing"),
+                "Driver readiness summary honestly states the native driver is unavailable");
+
+    obs.setNativeVirtualAudioDriverInstalled(true);
+    TEST_ASSERT(obs.hasNativeVirtualAudioDriver() == true, "Native driver flag can be enabled explicitly");
+    TEST_ASSERT(obs.getDriverReadinessSummary().contains("Native") || obs.getDriverReadinessSummary().contains("active"),
+                "Enabled native driver changes the status summary");
+}
+
+void testOBSWebSocketV5HandshakeAndAuthentication()
+{
+#if defined(_WIN32)
+    using namespace LiveBus;
+    juce::StreamingSocket listener;
+    TEST_ASSERT(listener.createListener(0), "Local OBS WebSocket mock listener created");
+    const int port = listener.getBoundPort();
+    TEST_ASSERT(port > 0, "Mock listener received an ephemeral port");
+
+    std::atomic<bool> stopServer{false};
+    std::atomic<bool> identifyWasValid{false};
+    std::string receivedIdentifyText;
+    std::thread mockServer([&]()
+    {
+        std::unique_ptr<juce::StreamingSocket> connection(listener.waitForNextConnection());
+        if (connection == nullptr)
+            return;
+
+        auto readExactFromClient = [&](void* destination, int size)
+        {
+            auto* output = static_cast<char*>(destination);
+            int received = 0;
+            while (received < size)
+            {
+                if (connection->waitUntilReady(true, 3000) <= 0)
+                    return false;
+                const int count = connection->read(output + received, size - received, false);
+                if (count <= 0)
+                    return false;
+                received += count;
+            }
+            return true;
+        };
+        auto writeToClient = [&](const void* data, int size)
+        {
+            const auto* input = static_cast<const char*>(data);
+            int sent = 0;
+            while (sent < size)
+            {
+                if (connection->waitUntilReady(false, 3000) <= 0)
+                    return false;
+                const int count = connection->write(input + sent, size - sent);
+                if (count <= 0)
+                    return false;
+                sent += count;
+            }
+            return true;
+        };
+        auto sendTextFrame = [&](const juce::String& text)
+        {
+            const char* utf8 = text.toRawUTF8();
+            const auto payloadSize = (int)std::strlen(utf8);
+            if (payloadSize < 2 || payloadSize >= 252)
+                return false;
+            const int firstSize = payloadSize / 2;
+            const int secondSize = payloadSize - firstSize;
+            const unsigned char firstHeader[2] = { 0x01, (unsigned char)firstSize };
+            const unsigned char continuationHeader[2] = { 0x80, (unsigned char)secondSize };
+            return writeToClient(firstHeader, 2) && writeToClient(utf8, firstSize) &&
+                   writeToClient(continuationHeader, 2) && writeToClient(utf8 + firstSize, secondSize);
+        };
+
+        std::string request;
+        while (request.size() < 16384 && request.find("\r\n\r\n") == std::string::npos)
+        {
+            char c = 0;
+            if (!readExactFromClient(&c, 1))
+                return;
+            request.push_back(c);
+        }
+        const std::string keyHeader = "Sec-WebSocket-Key: ";
+        const auto keyStart = request.find(keyHeader);
+        if (keyStart == std::string::npos)
+            return;
+        const auto keyEnd = request.find("\r\n", keyStart);
+        const auto key = request.substr(keyStart + keyHeader.size(), keyEnd - keyStart - keyHeader.size());
+        const auto acceptInput = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        DWORD objectSize = 0;
+        DWORD resultSize = 0;
+        std::array<UCHAR, 20> digest{};
+        std::vector<UCHAR> hashObject;
+        bool hashOk = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA1_ALGORITHM, nullptr, 0) >= 0 &&
+                      BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
+                                        sizeof(objectSize), &resultSize, 0) >= 0;
+        if (hashOk)
+        {
+            hashObject.resize(objectSize);
+            hashOk = BCryptCreateHash(algorithm, &hash, hashObject.data(), objectSize, nullptr, 0, 0) >= 0 &&
+                     BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(acceptInput.data())),
+                                    (ULONG)acceptInput.size(), 0) >= 0 &&
+                     BCryptFinishHash(hash, digest.data(), (ULONG)digest.size(), 0) >= 0;
+        }
+        if (hash != nullptr)
+            BCryptDestroyHash(hash);
+        if (algorithm != nullptr)
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+        if (!hashOk)
+            return;
+
+        const auto accept = juce::Base64::toBase64(digest.data(), digest.size());
+        const juce::String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                                      "Upgrade: websocket\r\n"
+                                      "Connection: Upgrade\r\n"
+                                      "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+        const char* responseUtf8 = response.toRawUTF8();
+        if (!writeToClient(responseUtf8, (int)response.getNumBytesAsUTF8()))
+            return;
+
+        const unsigned char pingHeader[2] = { 0x89, 4 };
+        const unsigned char pingPayload[4] = { 0x41, 0x00, 0xff, 0x5a };
+        if (!writeToClient(pingHeader, 2) || !writeToClient(pingPayload, 4))
+            return;
+
+        std::array<unsigned char, 2> pongHeader{};
+        if (!readExactFromClient(pongHeader.data(), (int)pongHeader.size()) ||
+            (pongHeader[0] & 0x0f) != 0x0a || (pongHeader[1] & 0x80) == 0 ||
+            (pongHeader[1] & 0x7f) != 4)
+            return;
+        std::array<unsigned char, 4> pongMask{};
+        std::array<unsigned char, 4> pongPayload{};
+        if (!readExactFromClient(pongMask.data(), (int)pongMask.size()) ||
+            !readExactFromClient(pongPayload.data(), (int)pongPayload.size()))
+            return;
+        for (size_t i = 0; i < pongPayload.size(); ++i)
+            pongPayload[i] ^= pongMask[i];
+        if (!std::equal(pongPayload.begin(), pongPayload.end(), std::begin(pingPayload)))
+            return;
+
+        if (!sendTextFrame("{\"op\":0,\"d\":{\"obsWebSocketVersion\":\"5.0.0\",\"rpcVersion\":1,"
+                           "\"authentication\":{\"salt\":\"salt\",\"challenge\":\"challenge\"}}}"))
+            return;
+
+        std::array<unsigned char, 2> frameHeader{};
+        if (!readExactFromClient(frameHeader.data(), (int)frameHeader.size()) ||
+            (frameHeader[0] & 0x0f) != 0x1 || (frameHeader[1] & 0x80) == 0)
+            return;
+
+        std::uint64_t payloadLength = frameHeader[1] & 0x7f;
+        if (payloadLength == 126)
+        {
+            std::array<unsigned char, 2> extended{};
+            if (!readExactFromClient(extended.data(), (int)extended.size()))
+                return;
+            payloadLength = ((std::uint64_t)extended[0] << 8) | extended[1];
+        }
+        if (payloadLength > 4096)
+            return;
+
+        std::array<unsigned char, 4> mask{};
+        std::vector<char> identifyPayload((size_t)payloadLength);
+        if (!readExactFromClient(mask.data(), (int)mask.size()) ||
+            (payloadLength > 0 && !readExactFromClient(identifyPayload.data(), (int)payloadLength)))
+            return;
+        for (size_t i = 0; i < identifyPayload.size(); ++i)
+            identifyPayload[i] ^= (char)mask[i % mask.size()];
+
+        const auto identifyText = juce::String::fromUTF8(identifyPayload.data(), (int)identifyPayload.size());
+        receivedIdentifyText = identifyText.toStdString();
+        const auto identify = juce::JSON::parse(identifyText);
+        auto* identifyData = identify.getProperty("d", juce::var()).getDynamicObject();
+        const juce::String expectedAuthentication = "39cfhx7et2iyoMZvoQ6o3OPLNSKgtMmy48GQ7jnvsdE=";
+
+        identifyWasValid.store(identify.isObject() && (int)identify.getProperty("op", -1) == 1 &&
+                               identifyData != nullptr &&
+                               (int)identifyData->getProperty("rpcVersion") == 1 &&
+                               identifyData->getProperty("authentication").toString() == expectedAuthentication);
+        if (!identifyWasValid.load() || !sendTextFrame("{\"op\":2,\"d\":{\"negotiatedRpcVersion\":1}}"))
+            return;
+
+        while (!stopServer.load())
+            juce::Thread::sleep(10);
+    });
+
+    OBSWebSocketClient client;
+    client.configure("127.0.0.1", port, "secret");
+    client.connectAsync();
+
+    const auto deadline = juce::Time::getMillisecondCounter() + 5000;
+    while (!client.isConnected() && juce::Time::getMillisecondCounter() < deadline)
+    {
+        if (client.getState() == OBSWebSocketState::ConnectionFailed ||
+            client.getState() == OBSWebSocketState::AuthenticationFailed)
+            break;
+        juce::Thread::sleep(10);
+    }
+
+    const bool connected = client.isConnected();
+    const auto clientStatus = client.getStatusString();
+    client.disconnect();
+    stopServer.store(true);
+    mockServer.join();
+    listener.close();
+
+    if (!identifyWasValid.load())
+        std::cerr << "OBS mock received Identify: " << receivedIdentifyText
+                  << " | client status: " << clientStatus << std::endl;
+    TEST_ASSERT(identifyWasValid.load(), "Client sent a masked OBS v5 Identify with the expected authentication proof");
+    TEST_ASSERT(connected, "Client reports ready only after OBS Identify succeeds");
+#else
+    TEST_ASSERT(true, "OBS WebSocket mock integration test requires Windows BCrypt");
+#endif
+}
+
 void testOBSStreamRoutingAndMeterBallistics()
 {
     using namespace LiveBus;
@@ -2380,6 +3138,11 @@ void testOBSMonitorMuteDoesNotMuteStream()
 
 void testOBSChannelMappingAndStereoIsolation()
 {
+    juce::AudioDeviceManager primaryDeviceManager;
+    LiveBus::OBSIntegrationService obsService(primaryDeviceManager);
+    TEST_ASSERT(obsService.getRoutingMode() == LiveBus::OBSRoutingMode::DedicatedSecondaryDevice,
+                "Stereo primary defaults to Monitor Bus output when no secondary endpoint is selected");
+
     const int numSamples = 128;
     juce::AudioBuffer<float> streamBuf(2, numSamples);
     juce::AudioBuffer<float> monitorBuf(2, numSamples);
@@ -2393,26 +3156,36 @@ void testOBSChannelMappingAndStereoIsolation()
         monitorBuf.setSample(1, i, 0.8f);
     }
 
-    // 1. 4-Channel Interface Hardware Mapping:
-    // Out Ch 0-1 = Stream Bus, Out Ch 2-3 = Monitor Bus
+    // 1. Multi-channel mode maps Stream to outputs 1-2 and Monitor to 3-4.
     juce::AudioBuffer<float> hardware4Ch(4, numSamples);
-    hardware4Ch.clear();
-
-    juce::FloatVectorOperations::copy(hardware4Ch.getWritePointer(0), streamBuf.getReadPointer(0), numSamples);
-    juce::FloatVectorOperations::copy(hardware4Ch.getWritePointer(1), streamBuf.getReadPointer(1), numSamples);
-    juce::FloatVectorOperations::copy(hardware4Ch.getWritePointer(2), monitorBuf.getReadPointer(0), numSamples);
-    juce::FloatVectorOperations::copy(hardware4Ch.getWritePointer(3), monitorBuf.getReadPointer(1), numSamples);
+    auto hardware4ChOutputs = hardware4Ch.getArrayOfWritePointers();
+    LiveBus::routeMasterBusesToDevice(hardware4ChOutputs, 4, streamBuf, monitorBuf, numSamples,
+                                      LiveBus::OBSRoutingMode::PrimaryMultiChannel);
 
     TEST_ASSERT(std::abs(hardware4Ch.getMagnitude(0, 0, numSamples) - 0.5f) < 1e-4f, "Hardware Ch 0 carries Stream Bus L");
     TEST_ASSERT(std::abs(hardware4Ch.getMagnitude(1, 0, numSamples) - 0.5f) < 1e-4f, "Hardware Ch 1 carries Stream Bus R");
     TEST_ASSERT(std::abs(hardware4Ch.getMagnitude(2, 0, numSamples) - 0.8f) < 1e-4f, "Hardware Ch 2 carries Monitor Bus L");
     TEST_ASSERT(std::abs(hardware4Ch.getMagnitude(3, 0, numSamples) - 0.8f) < 1e-4f, "Hardware Ch 3 carries Monitor Bus R");
 
-    // 2. Dedicated Secondary Device Mode on 2-Channel Hardware:
-    // Primary hardware carries Monitor Bus ONLY (headphones), secondary carries Stream Bus ONLY (OBS)
+    // Dedicated endpoint mode must put Monitor on the primary stereo pair even on a
+    // multichannel interface; the stream bus is delivered by the secondary endpoint.
+    hardware4Ch.clear();
+    hardware4ChOutputs = hardware4Ch.getArrayOfWritePointers();
+    LiveBus::routeMasterBusesToDevice(hardware4ChOutputs, 4, streamBuf, monitorBuf, numSamples,
+                                      LiveBus::OBSRoutingMode::DedicatedSecondaryDevice);
+    TEST_ASSERT(std::abs(hardware4Ch.getMagnitude(0, 0, numSamples) - 0.8f) < 1e-4f,
+                "Dedicated endpoint mode routes Monitor to primary output 1");
+    TEST_ASSERT(std::abs(hardware4Ch.getMagnitude(1, 0, numSamples) - 0.8f) < 1e-4f,
+                "Dedicated endpoint mode routes Monitor to primary output 2");
+    TEST_ASSERT(hardware4Ch.getMagnitude(2, 0, numSamples) == 0.0f
+                && hardware4Ch.getMagnitude(3, 0, numSamples) == 0.0f,
+                "Dedicated endpoint mode does not place Monitor on unconnected outputs 3-4");
+
+    // The same mode also maps Monitor onto a stereo primary output device.
     juce::AudioBuffer<float> primary2Ch(2, numSamples);
-    juce::FloatVectorOperations::copy(primary2Ch.getWritePointer(0), monitorBuf.getReadPointer(0), numSamples);
-    juce::FloatVectorOperations::copy(primary2Ch.getWritePointer(1), monitorBuf.getReadPointer(1), numSamples);
+    auto primary2ChOutputs = primary2Ch.getArrayOfWritePointers();
+    LiveBus::routeMasterBusesToDevice(primary2ChOutputs, 2, streamBuf, monitorBuf, numSamples,
+                                      LiveBus::OBSRoutingMode::DedicatedSecondaryDevice);
 
     TEST_ASSERT(std::abs(primary2Ch.getMagnitude(0, 0, numSamples) - 0.8f) < 1e-4f, "Primary hardware outputs Monitor Bus only in Dedicated Secondary mode");
     TEST_ASSERT(primary2Ch.getMagnitude(0, 0, numSamples) != 0.5f, "Zero stream bleed into primary headphone monitor");
@@ -2464,6 +3237,21 @@ void testOBSDeviceRecoveryAndStateSafety()
     using namespace LiveBus;
     juce::AudioDeviceManager dummyMgr;
     OBSIntegrationService obs(dummyMgr);
+
+    obs.setSecondaryOutputBus(SecondaryOutputBus::Monitor);
+    TEST_ASSERT(obs.getSecondaryOutputBus() == SecondaryOutputBus::Monitor,
+                "Secondary endpoint can select the Monitor Bus");
+    obs.setSecondaryOutputBus(SecondaryOutputBus::StreamAndMonitor);
+    TEST_ASSERT(obs.getSecondaryOutputBus() == SecondaryOutputBus::StreamAndMonitor,
+                "Secondary endpoint can select a combined audition mix");
+    obs.setSecondaryOutputGain(3.0f);
+    TEST_ASSERT(std::abs(obs.getSecondaryOutputGain() - 2.0f) < 1e-6f,
+                "Endpoint output gain is safely clamped");
+    obs.setSecondaryOutputMuted(true);
+    TEST_ASSERT(obs.isSecondaryOutputMuted(), "Endpoint output mute is independently controllable");
+    obs.setSecondaryOutputGain(1.0f);
+    obs.setSecondaryOutputMuted(false);
+    obs.setSecondaryOutputBus(SecondaryOutputBus::Stream);
 
     // 1. Attempt to open non-existent virtual device
     juce::String err = obs.openSecondaryVirtualDevice("NonExistent_Virtual_Audio_Cable_9999");
@@ -3475,6 +4263,28 @@ void testVST3MissingPluginPlaceholderGracefulHandling()
     TEST_ASSERT(engine.getNumPluginsInTarget(1) == 0, "Placeholder slot cleanly removed");
 }
 
+void testVST3FailedBinaryLoadDoesNotCreateActiveSlot()
+{
+    PluginHostClient client;
+    LiveBus::VST3HostEngine engine(client);
+
+    auto invalidPlugin = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                             .getChildFile("LiveBusInvalidPlugin-" + juce::Uuid().toString() + ".vst3");
+    TEST_ASSERT(invalidPlugin.create().wasOk(), "Temporary invalid plugin fixture created");
+    invalidPlugin.replaceWithText("not a VST3 binary");
+
+    juce::PluginDescription desc;
+    desc.name = "Invalid test plugin";
+    desc.fileOrIdentifier = invalidPlugin.getFullPathName();
+    desc.pluginFormatName = "VST3";
+
+    TEST_ASSERT(!engine.loadPluginToTarget(0, desc, false), "Invalid existing plugin binary is reported as a load failure");
+    TEST_ASSERT(engine.getNumPluginsInTarget(0) == 0, "Failed plugin load does not leave a phantom chain slot");
+    TEST_ASSERT(engine.getLastLoadError().isNotEmpty(), "Plugin load failure exposes a diagnostic message");
+
+    invalidPlugin.deleteFile();
+}
+
 void testVST3AudioProcessingFormatAndDryFallbackSafety()
 {
     PluginHostClient client;
@@ -3535,6 +4345,27 @@ void testVST3OutOfProcessWorkerTimeoutAndWatchdog()
     client.processBlock(buf, 256);
     // Since worker is not launched, client should safely retain audio without crashing or blocking
     TEST_ASSERT(std::abs(buf.getSample(0, 100) - 0.75f) < 1e-6f, "OutOfProcess client safely executes non-blocking audio fallback");
+}
+
+void testMidiPresetImportRejectsPathTraversalName()
+{
+    LiveBus::MidiParameterRegistry registry;
+    LiveBus::MidiManager manager(registry);
+
+    const auto sourceFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                                .getChildFile("LiveBusMidiTraversal-" + juce::Uuid().toString() + ".xml");
+    juce::XmlElement maliciousPreset("LiveBusMidiMappingPreset");
+    maliciousPreset.setAttribute("name", "..\\..\\outside");
+    TEST_ASSERT(maliciousPreset.writeTo(sourceFile), "Malicious MIDI preset fixture written");
+
+    const auto originalPresetName = manager.getCurrentPresetName();
+    const auto presetsBeforeImport = manager.getAvailablePresets();
+    TEST_ASSERT(!manager.importPreset(sourceFile), "MIDI preset import rejects path traversal in XML name");
+    TEST_ASSERT(manager.getCurrentPresetName() == originalPresetName, "Rejected MIDI preset import leaves active preset unchanged");
+    TEST_ASSERT(manager.getAvailablePresets().size() == presetsBeforeImport.size(),
+                "Rejected MIDI preset import does not create a preset");
+
+    sourceFile.deleteFile();
 }
 
 void testVST3SceneManagerPluginIntegration()
@@ -3973,6 +4804,57 @@ void testHighPassFilterFrequencyResponseAndSlope()
     TEST_ASSERT(std::abs(bypassBuffer.getSample(0, 256) - 0.75f) < 1e-6f, "HPF disabled passes audio bit-exact");
 }
 
+void testLowPassFilterFrequencyResponseAndSlope()
+{
+    const double sampleRate = 48000.0;
+    const int numSamples = 9600;
+    const std::array<float, 4> maximumHighFrequencyRms{ 0.12f, 0.03f, 0.005f, 0.001f };
+
+    for (int slope = 1; slope <= 4; ++slope)
+    {
+        BusDSPProcessor proc;
+        proc.params.lpfEnabled.store(true);
+        proc.params.lpfFreq.store(1000.0f);
+        proc.params.lpfSlope.store(slope);
+        proc.prepare(sampleRate, 512);
+
+        juce::AudioBuffer<float> lowBuffer(2, numSamples);
+        juce::AudioBuffer<float> highBuffer(2, numSamples);
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const float low = std::sin(2.0f * juce::MathConstants<float>::pi *
+                                       100.0f * (float)sample / (float)sampleRate);
+            const float high = std::sin(2.0f * juce::MathConstants<float>::pi *
+                                        8000.0f * (float)sample / (float)sampleRate);
+            for (int channel = 0; channel < 2; ++channel)
+            {
+                lowBuffer.setSample(channel, sample, low);
+                highBuffer.setSample(channel, sample, high);
+            }
+        }
+
+        proc.process(lowBuffer, numSamples);
+        proc.process(highBuffer, numSamples);
+        const int settledStart = numSamples - 2400;
+        const float lowRms = lowBuffer.getRMSLevel(0, settledStart, 2400);
+        const float highRms = highBuffer.getRMSLevel(0, settledStart, 2400);
+        TEST_ASSERT(lowRms > 0.65f, "LPF passes frequencies well below the cutoff");
+        TEST_ASSERT(highRms < maximumHighFrequencyRms[(size_t)(slope - 1)],
+                    "LPF attenuates high frequencies according to the selected slope");
+    }
+
+    BusDSPProcessor bypass;
+    bypass.params.lpfEnabled.store(true);
+    bypass.params.lpfSlope.store(0);
+    bypass.prepare(sampleRate, 512);
+    juce::AudioBuffer<float> bypassBuffer(2, 512);
+    for (int sample = 0; sample < bypassBuffer.getNumSamples(); ++sample)
+        bypassBuffer.setSample(0, sample, 0.75f);
+    bypass.process(bypassBuffer, bypassBuffer.getNumSamples());
+    TEST_ASSERT(std::abs(bypassBuffer.getSample(0, 256) - 0.75f) < 1.0e-6f,
+                "LPF slope off passes audio unchanged");
+}
+
 void testNoiseGateEnvelopeAndGainReduction()
 {
     BusDSPProcessor proc;
@@ -4268,6 +5150,25 @@ void testDSPTargetIndependenceAndBypassBitTransparency()
     TEST_ASSERT(streamRMS < monitorRMS * 0.2f, "Stream Bus processed audio independently with distinct acoustic profile");
 }
 
+void testMasterDimAttenuatesBusWithoutChangingFaderGain()
+{
+    BusDSPProcessor processor;
+    processor.prepare(48000.0, 256);
+    processor.params.masterGain.store(1.0f);
+    processor.params.masterDim.store(true);
+
+    juce::AudioBuffer<float> buffer(2, 4096);
+    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+        std::fill_n(buffer.getWritePointer(channel), buffer.getNumSamples(), 0.5f);
+    processor.process(buffer, buffer.getNumSamples());
+
+    const float dimmedRms = buffer.getRMSLevel(0, 2048, 2048);
+    TEST_ASSERT(std::abs(dimmedRms - 0.05f) < 0.002f,
+                "Master Dim applies 20 dB attenuation after the fade ramp");
+    TEST_ASSERT(std::abs(processor.params.masterGain.load() - 1.0f) < 1e-6f,
+                "Master Dim does not overwrite the master fader gain");
+}
+
 void testDSPSceneSaveLoadConsistency()
 {
     BusDSPProcessor proc;
@@ -4513,6 +5414,41 @@ void testAudioSafetyPeakAndClipWarning()
     TEST_ASSERT(safety.getStreamClipCount() == 0, "Clip counter reset");
 }
 
+void testAudioSafetySanitizesNonFiniteSamples()
+{
+    LiveBus::AudioSafetyProcessor safety;
+    safety.prepare(48000.0, 4);
+    safety.setStreamLimiterEnabled(false);
+    safety.setMonitorLimiterEnabled(false);
+
+    juce::AudioBuffer<float> stream(2, 4);
+    juce::AudioBuffer<float> monitor(2, 4);
+    stream.clear();
+    monitor.clear();
+    stream.setSample(0, 0, std::numeric_limits<float>::quiet_NaN());
+    stream.setSample(1, 1, std::numeric_limits<float>::infinity());
+    monitor.setSample(0, 2, -std::numeric_limits<float>::infinity());
+    monitor.setSample(1, 3, std::numeric_limits<float>::quiet_NaN());
+
+    safety.processStreamBus(stream, 4);
+    safety.processMonitorBus(monitor, 4);
+    bool allSamplesFinite = true;
+    bool sanitizedSamplesAreSilent = true;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int sample = 0; sample < 4; ++sample)
+        {
+            allSamplesFinite = allSamplesFinite && std::isfinite(stream.getSample(ch, sample)) &&
+                               std::isfinite(monitor.getSample(ch, sample));
+            if ((ch == 0 && sample == 0) || (ch == 1 && sample == 1))
+                sanitizedSamplesAreSilent = sanitizedSamplesAreSilent && stream.getSample(ch, sample) == 0.0f;
+            if ((ch == 0 && sample == 2) || (ch == 1 && sample == 3))
+                sanitizedSamplesAreSilent = sanitizedSamplesAreSilent && monitor.getSample(ch, sample) == 0.0f;
+        }
+
+    TEST_ASSERT(allSamplesFinite, "Audio safety stage prevents NaN or infinity from reaching output");
+    TEST_ASSERT(sanitizedSamplesAreSilent, "Non-finite audio samples are replaced with silence");
+}
+
 void testAudioSafetyEmergencyMuteInstantZero()
 {
     LiveBus::AudioSafetyProcessor safety;
@@ -4550,6 +5486,36 @@ void testAudioSafetyEmergencyMuteInstantZero()
         safety.processMonitorBus(mBuf, 512);
     }
     TEST_ASSERT(sBuf.getMagnitude(0, 512) > 0.6f, "Audio smoothly restored on unmute");
+}
+
+void testAudioSafetyProtectsFinalHardwareOutputs()
+{
+    LiveBus::AudioSafetyProcessor safety;
+    safety.prepare(48000.0, 512);
+    safety.setStreamCeilingDb(-6.0f);
+    safety.setMonitorCeilingDb(-6.0f);
+
+    std::array<std::vector<float>, 2> outputStorage{
+        std::vector<float>(512, 2.0f), std::vector<float>(512, -2.0f)
+    };
+    float* outputs[] = { outputStorage[0].data(), outputStorage[1].data() };
+    safety.processHardwareOutputs(outputs, 2, 512);
+
+    const float ceiling = std::pow(10.0f, -6.0f / 20.0f);
+    TEST_ASSERT(std::abs(outputStorage[0][0]) <= ceiling + 1.0e-5f &&
+                    std::abs(outputStorage[1][0]) <= ceiling + 1.0e-5f,
+                "Final hardware limiter keeps direct outputs below configured ceiling");
+
+    safety.setEmergencyMute(LiveBus::EmergencyMuteMode::Both);
+    for (int block = 0; block < 4; ++block)
+    {
+        std::fill(outputStorage[0].begin(), outputStorage[0].end(), 0.8f);
+        std::fill(outputStorage[1].begin(), outputStorage[1].end(), -0.8f);
+        safety.processHardwareOutputs(outputs, 2, 512);
+    }
+
+    TEST_ASSERT(outputStorage[0][511] == 0.0f && outputStorage[1][511] == 0.0f,
+                "Emergency mute silences final hardware outputs including direct routes");
 }
 
 void testAudioSafetyRoutingLoopDetection()
@@ -4764,6 +5730,7 @@ void testPerChannelStreamAndMonitorSendsIndependent()
     ch0.sendLevel[1].store(0.2f);     // Monitor send 0.2
     ch0.gain.store(1.0f);
     ch0.pan.store(0.0f);
+    ch0.stereoMode.store(ChannelStereoMode::Mono);
 
     juce::AudioBuffer<float> bufs[4];
     for (int i = 0; i < 4; ++i) { bufs[i].setSize(2, 64); bufs[i].clear(); }
@@ -4886,6 +5853,14 @@ void testRoutingMatrixXmlPersistence()
     m1.getChannel(0).preFaderSendStream.store(true);
     m1.getChannel(0).preFaderSendMonitor.store(false);
     m1.getChannel(0).stereoMode.store(LiveBus::ChannelStereoMode::Mono);
+    m1.getChannel(0).submixGroup.store(1);
+    m1.getSubmixBus(1).routeToStream.store(true);
+    m1.getSubmixBus(1).routeToMonitor.store(false);
+    for (int channel = 1; channel < 4; ++channel)
+    {
+        m1.getChannel(channel).routeEnable[0].store(false);
+        m1.getChannel(channel).routeEnable[1].store(false);
+    }
 
     m1.getChannel(2).name = "BGM Player";
     m1.getChannel(2).inputSource.store(LiveBus::ChannelInputSource::Playback);
@@ -4905,6 +5880,25 @@ void testRoutingMatrixXmlPersistence()
     TEST_ASSERT(m2.getChannel(2).inputSource.load() == LiveBus::ChannelInputSource::Playback, "Ch 2 playback source restored");
     TEST_ASSERT(m2.getChannel(2).stereoMode.load() == LiveBus::ChannelStereoMode::StereoPair, "Ch 2 stereo pair restored");
     TEST_ASSERT(m2.getChannel(3).inputSource.load() == LiveBus::ChannelInputSource::YouTube, "Ch 3 YouTube source restored");
+    TEST_ASSERT(m2.getChannel(0).submixGroup.load() == 1 &&
+                    m2.getSubmixBus(1).routeToStream.load() &&
+                    !m2.getSubmixBus(1).routeToMonitor.load(),
+                "Scene routing state restores the Submix-to-Stream connection and independent bus routing");
+
+    juce::AudioBuffer<float> buffers[4];
+    for (auto& buffer : buffers)
+    {
+        buffer.setSize(2, 64);
+        buffer.clear();
+    }
+    buffers[0].clear();
+    for (int sample = 0; sample < 64; ++sample)
+        buffers[0].setSample(0, sample, 0.5f);
+    juce::AudioBuffer<float> stream(2, 64), monitor(2, 64);
+    m2.routeAndSum(buffers, 4, stream, monitor, 64);
+    TEST_ASSERT(stream.getMagnitude(0, 0, 64) > 0.34f &&
+                    monitor.getMagnitude(0, 0, 64) == 0.0f,
+                "Restored Scene routing produces the expected independent audio output");
 }
 
 void testRoutingMatrixPresets()
@@ -5341,6 +6335,8 @@ void testAuxSendReturnReverbDelayRouting()
 {
     RoutingMatrix matrix;
     matrix.prepare(48000.0, 128);
+    TEST_ASSERT(matrix.getAuxBus(2).name == "Aux 3", "Aux 3 name does not promise an unavailable Chorus effect");
+    TEST_ASSERT(matrix.getAuxBus(3).name == "Aux 4", "Aux 4 name does not promise an unavailable FX effect");
 
     // Disable ALL direct stream/monitor sends — only Aux Return should contribute signal
     for (int i = 0; i < 4; ++i)
@@ -5475,6 +6471,78 @@ void testSubmixGroupFaderRouting()
     TEST_ASSERT(matrix.getChannel(0).auxRouteEnable[0].load() == true, "Preset 4 enables Vocal Reverb Aux Send");
 }
 
+void testDuckingSubmixAndAuxDestinationIsolation()
+{
+    RoutingMatrix matrix;
+    matrix.prepare(48000.0, 64);
+    matrix.setActiveChannels(4);
+
+    auto& ch0 = matrix.getChannel(0);
+    ch0.gain.store(1.0f);
+    ch0.pan.store(0.0f);
+    ch0.routeEnable[0].store(false);
+    ch0.routeEnable[1].store(false);
+    ch0.submixGroup.store(0);
+
+    auto& submix = matrix.getSubmixBus(0);
+    submix.gain.store(1.0f);
+    submix.routeToStream.store(true);
+    submix.routeToMonitor.store(true);
+    submix.sendLevelStream.store(1.0f);
+    submix.sendLevelMonitor.store(1.0f);
+
+    juce::AudioBuffer<float> channelBuffers[4];
+    for (auto& buffer : channelBuffers)
+    {
+        buffer.setSize(2, 64);
+        buffer.clear();
+    }
+    channelBuffers[0].setSample(0, 0, 0.5f);
+    channelBuffers[0].setSample(1, 0, 0.5f);
+
+    juce::AudioBuffer<float> stream(2, 64);
+    juce::AudioBuffer<float> monitor(2, 64);
+    matrix.routeAndSum(channelBuffers, 4, stream, monitor, 64, 0.25f, 0.5f, 0x0001, 3);
+
+    TEST_ASSERT(std::abs(stream.getSample(0, 0) - 0.125f) < 1e-5f,
+                "Submix applies Stream ducking to its Stream destination");
+    TEST_ASSERT(std::abs(monitor.getSample(0, 0) - 0.25f) < 1e-5f,
+                "Submix applies independent Monitor ducking to its Monitor destination");
+
+    ch0.submixGroup.store(-1);
+    ch0.auxRouteEnable[2].store(true);
+    ch0.preFaderAuxSend[2].store(true);
+    ch0.gain.store(0.0f);
+    ch0.auxSendLevel[2].store(1.0f);
+
+    auto& aux = matrix.getAuxBus(2);
+    aux.fxType.store(0);
+    aux.returnLevel.store(1.0f);
+    aux.sendToStream.store(true);
+    aux.sendToMonitor.store(true);
+    aux.sendLevelStream.store(1.0f);
+    aux.sendLevelMonitor.store(1.0f);
+
+    matrix.routeAndSum(channelBuffers, 4, stream, monitor, 64, 0.25f, 0.5f, 0x0001, 3);
+
+    TEST_ASSERT(std::abs(stream.getSample(0, 0) - 0.125f) < 1e-5f,
+                "Pre-fader Aux send is ducked at the Stream return destination");
+    TEST_ASSERT(std::abs(monitor.getSample(0, 0) - 0.25f) < 1e-5f,
+                "Aux return applies independent Monitor ducking");
+
+    ch0.preFaderAuxSend[2].store(false);
+    matrix.routeAndSum(channelBuffers, 4, stream, monitor, 64, 0.25f, 0.5f, 0x0001, 3);
+    TEST_ASSERT(stream.getSample(0, 0) == 0.0f && monitor.getSample(0, 0) == 0.0f,
+                "Post-fader Aux send follows the channel fader");
+
+    ch0.preFaderAuxSend[2].store(true);
+    ch0.gain.store(1.0f);
+    matrix.routeAndSum(channelBuffers, 4, stream, monitor, 64, 0.25f, 0.5f, 0x0000, 3);
+    TEST_ASSERT(std::abs(stream.getSample(0, 0) - 0.5f) < 1e-5f
+                && std::abs(monitor.getSample(0, 0) - 0.5f) < 1e-5f,
+                "Aux return is not ducked when no targeted channel sends to it");
+}
+
 int main()
 {
     std::cout << "==========================================" << std::endl;
@@ -5484,22 +6552,31 @@ int main()
     int prevFailed = 0;
     // Six Repaired DSP Modules Tests
     RUN_TEST(testHighPassFilterFrequencyResponseAndSlope);
+    RUN_TEST(testLowPassFilterFrequencyResponseAndSlope);
     RUN_TEST(testNoiseGateEnvelopeAndGainReduction);
     RUN_TEST(testCompressorRatioKneeAndMakeupGain);
     RUN_TEST(testLimiterCeilingEnforcementAndClippingProtection);
     RUN_TEST(testReverbWetDryAndDecayTailResponse);
     RUN_TEST(testDelayBufferEchoTimeAndFeedbackDecay);
     RUN_TEST(testDSPTargetIndependenceAndBypassBitTransparency);
+    RUN_TEST(testMasterDimAttenuatesBusWithoutChangingFaderGain);
     RUN_TEST(testDSPSceneSaveLoadConsistency);
 
     RUN_TEST(testRoutingMatrixAndPanLaw);
+    RUN_TEST(testAudioDelayCompensatorImpulseAlignment);
+    RUN_TEST(testRoutingGraphEditsUpdateAudioEngine);
+    RUN_TEST(testIndependentStreamMonitorRestore);
+    RUN_TEST(testRoutingGraphConnectionValidation);
+    RUN_TEST(testRoutingGraphConnectionSerialization);
     RUN_TEST(testIndependentBusSummingAndIsolation);
     RUN_TEST(testGainAndSendLevels);
     RUN_TEST(testMuteAndSoloLogic);
+    RUN_TEST(testSubmixAndAuxSoloRouting);
     RUN_TEST(testDSPProcessorNumericalPerformance);
     RUN_TEST(testSceneSerializationAndDeserialization);
     RUN_TEST(testSceneFileCorruptionRecovery);
     RUN_TEST(testIPCProtocolAndConstants);
+    RUN_TEST(testIsolatedPluginDryPathKeepsFixedBlockLatency);
     RUN_TEST(testIPCCompletionPublication);
     RUN_TEST(testPendingAudioBlockState);
     RUN_TEST(testPluginDryFallbackOnCrash);
@@ -5511,11 +6588,13 @@ int main()
     RUN_TEST(testMidiInputBufferThreadSafety);
     RUN_TEST(testAudioFilePlaybackAndBuffering);
     RUN_TEST(testZipPresetPackaging);
+    RUN_TEST(testZipPresetImportRejectsTraversalWithoutReplacingExistingFiles);
     RUN_TEST(testSessionPersistenceAndFullState);
 
     // 8-Band Parametric Equalizer Tests
     RUN_TEST(testEightBandEQParameterValidationAndClamping);
     RUN_TEST(testEightBandEQFilterTypesAndAcousticResponse);
+    RUN_TEST(testDSPEightBandEQProcessingAndAnalyzerFeed);
     RUN_TEST(testEightBandEQBypassAndBitTransparency);
     RUN_TEST(testEightBandEQStereoConsistencyAndNumericalStability);
     RUN_TEST(testEightBandEQTargetIsolation);
@@ -5557,6 +6636,7 @@ int main()
 
     // OBS Studio Integration & Virtual Audio Routing Tests
     RUN_TEST(testOBSVirtualDeviceDetectionAndPatternRecognition);
+    RUN_TEST(testOBSWebSocketV5HandshakeAndAuthentication);
     RUN_TEST(testOBSStreamRoutingAndMeterBallistics);
     RUN_TEST(testOBSStreamAndMonitorGainIndependence);
     RUN_TEST(testOBSStreamMuteDoesNotMuteMonitor);
@@ -5600,10 +6680,12 @@ int main()
     RUN_TEST(testVST3PluginScanSettingsAndPaths);
     RUN_TEST(testVST3CatalogSearchAndFiltering);
     RUN_TEST(testVST3PluginChainSlotManagementAndLifecycle);
+    RUN_TEST(testVST3FailedBinaryLoadDoesNotCreateActiveSlot);
     RUN_TEST(testVST3PluginChainXMLSerializationAndStateRestore);
     RUN_TEST(testVST3MissingPluginPlaceholderGracefulHandling);
     RUN_TEST(testVST3AudioProcessingFormatAndDryFallbackSafety);
     RUN_TEST(testVST3OutOfProcessWorkerTimeoutAndWatchdog);
+    RUN_TEST(testMidiPresetImportRejectsPathTraversalName);
     RUN_TEST(testVST3SceneManagerPluginIntegration);
 
     // Professional Performance & Diagnostics Tests
@@ -5626,7 +6708,9 @@ int main()
     // Audio Safety & Anti-Feedback Tests (M4)
     RUN_TEST(testAudioSafetyLimiterCeilingAndGR);
     RUN_TEST(testAudioSafetyPeakAndClipWarning);
+    RUN_TEST(testAudioSafetySanitizesNonFiniteSamples);
     RUN_TEST(testAudioSafetyEmergencyMuteInstantZero);
+    RUN_TEST(testAudioSafetyProtectsFinalHardwareOutputs);
     RUN_TEST(testAudioSafetyRoutingLoopDetection);
 
     // Macro Engine & Quick Actions Tests (M6/M8)
@@ -5652,6 +6736,7 @@ int main()
     RUN_TEST(testHardwareDirectOutputXmlPersistence);
     RUN_TEST(testAuxSendReturnReverbDelayRouting);
     RUN_TEST(testSubmixGroupFaderRouting);
+    RUN_TEST(testDuckingSubmixAndAuxDestinationIsolation);
 
     // Embedded YouTube Player & Audio Capture Bridge Tests
     RUN_TEST(testYouTubeURLParsing);

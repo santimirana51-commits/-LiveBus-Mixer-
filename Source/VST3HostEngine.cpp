@@ -1,4 +1,6 @@
 #include "VST3HostEngine.h"
+#include <algorithm>
+#include <thread>
 
 namespace LiveBus
 {
@@ -6,6 +8,9 @@ namespace LiveBus
 VST3HostEngine::VST3HostEngine(PluginHostClient& isolatedClient)
     : outOfProcessClient(isolatedClient)
 {
+    for (int target = 0; target < NumTargets; ++target)
+        publishTargetChainLocked(target);
+
     // Register VST3 format in JUCE format manager
     formatManager.addDefaultFormats();
 
@@ -20,36 +25,131 @@ VST3HostEngine::~VST3HostEngine()
 {
     cancelScan();
     releaseResources();
+    std::lock_guard<std::mutex> lock(chainMutex);
+    for (auto& published : publishedChains)
+        delete published.exchange(nullptr, std::memory_order_seq_cst);
+    retiredSnapshots.clear();
+    for (auto& retired : retiredInstances)
+    {
+        if (retired.instance && retired.instance->isolatedClient)
+            retired.instance->isolatedClient->releasePlugin();
+    }
+    retiredInstances.clear();
+}
+
+void VST3HostEngine::publishTargetChainLocked(int targetIndex)
+{
+    auto next = std::make_unique<ChainSnapshot>(targetChains[(size_t)targetIndex]);
+    const auto* previous = publishedChains[(size_t)targetIndex].exchange(
+        next.get(), std::memory_order_seq_cst);
+    if (previous != nullptr)
+        retiredSnapshots.emplace_back(const_cast<ChainSnapshot*>(previous));
+    next.release();
+}
+
+void VST3HostEngine::cleanupRetiredChains()
+{
+    std::vector<std::shared_ptr<ActiveInstance>> readyToRelease;
+    {
+        std::lock_guard<std::mutex> lock(chainMutex);
+        if (audioReaders.load(std::memory_order_seq_cst) != 0)
+            return;
+
+        retiredSnapshots.clear();
+        for (auto it = retiredInstances.begin(); it != retiredInstances.end();)
+        {
+            const auto targetIndex = it->targetIndex;
+            const auto* published = targetIndex >= 0 && targetIndex < NumTargets
+                ? publishedChains[(size_t)targetIndex].load(std::memory_order_seq_cst)
+                : nullptr;
+            const bool stillActive = targetIndex >= 0 && targetIndex < NumTargets &&
+                (chainPublishingSuspended[(size_t)targetIndex] ||
+                 std::find(targetChains[(size_t)targetIndex].begin(),
+                           targetChains[(size_t)targetIndex].end(), it->instance) !=
+                     targetChains[(size_t)targetIndex].end() ||
+                 (published != nullptr &&
+                  std::find(published->begin(), published->end(), it->instance) !=
+                      published->end()));
+            if (stillActive)
+            {
+                ++it;
+                continue;
+            }
+            readyToRelease.push_back(std::move(it->instance));
+            it = retiredInstances.erase(it);
+        }
+    }
+
+    for (auto& instance : readyToRelease)
+    {
+        if (instance && instance->pluginInstance)
+            instance->pluginInstance->releaseResources();
+        if (instance && instance->isolatedClient)
+            instance->isolatedClient->releasePlugin();
+    }
+}
+
+void VST3HostEngine::pauseAudioProcessing()
+{
+    isPrepared.store(false, std::memory_order_seq_cst);
+    while (audioReaders.load(std::memory_order_seq_cst) != 0)
+        std::this_thread::yield();
+}
+
+void VST3HostEngine::resumeAudioProcessing(bool wasPrepared)
+{
+    isPrepared.store(wasPrepared, std::memory_order_seq_cst);
 }
 
 void VST3HostEngine::prepareToPlay(double sampleRate, int maxBlockSize)
 {
-    currentSampleRate = sampleRate;
-    currentBlockSize = maxBlockSize;
+    pauseAudioProcessing();
+    currentSampleRate.store(sampleRate, std::memory_order_relaxed);
+    currentBlockSize.store(maxBlockSize, std::memory_order_relaxed);
 
     tempChainBuffer.setSize(2, maxBlockSize, false, false, true);
 
-    std::lock_guard<std::mutex> lock(chainMutex);
-    for (int t = 0; t < NumTargets; ++t)
     {
-        for (auto& inst : targetChains[t])
+        std::lock_guard<std::mutex> lock(chainMutex);
+        for (int t = 0; t < NumTargets; ++t)
         {
-            if (inst->pluginInstance)
+            for (auto& inst : targetChains[(size_t)t])
             {
-                inst->pluginInstance->setPlayConfigDetails(2, 2, sampleRate, maxBlockSize);
-                inst->pluginInstance->prepareToPlay(sampleRate, maxBlockSize);
-                inst->latency.store(inst->pluginInstance->getLatencySamples(), std::memory_order_relaxed);
+                if (inst->pluginInstance)
+                {
+                    inst->pluginInstance->setPlayConfigDetails(2, 2, sampleRate, maxBlockSize);
+                    inst->pluginInstance->prepareToPlay(sampleRate, maxBlockSize);
+                    inst->latency.store(inst->pluginInstance->getLatencySamples(), std::memory_order_relaxed);
+                    inst->slotInfo.latencySamples = inst->latency.load(std::memory_order_relaxed);
+                }
+                if (inst->isolatedClient)
+                {
+                    const auto pluginPath = inst->slotInfo.fileOrIdentifier;
+                    juce::MemoryBlock savedState;
+                    inst->isolatedClient->saveState(savedState);
+                    inst->isolatedClient->prepare(sampleRate, maxBlockSize);
+                    if (inst->isolatedClient->loadPlugin(pluginPath, sampleRate, maxBlockSize) && savedState.getSize() > 0)
+                        inst->isolatedClient->restoreState(savedState.getData(), savedState.getSize());
+                    if (inst->isolatedClient->isPluginLoaded())
+                    {
+                        const int totalLatency = maxBlockSize +
+                            inst->isolatedClient->getPluginLatencySamples();
+                        inst->latency.store(totalLatency, std::memory_order_relaxed);
+                        inst->slotInfo.latencySamples = totalLatency;
+                    }
+                }
             }
         }
     }
 
     outOfProcessClient.prepare(sampleRate, maxBlockSize);
-    isPrepared.store(true);
+    resumeAudioProcessing(true);
+    cleanupRetiredChains();
 }
 
 void VST3HostEngine::releaseResources()
 {
-    isPrepared.store(false);
+    pauseAudioProcessing();
     std::lock_guard<std::mutex> lock(chainMutex);
     for (int t = 0; t < NumTargets; ++t)
     {
@@ -58,6 +158,11 @@ void VST3HostEngine::releaseResources()
             if (inst->pluginInstance)
                 inst->pluginInstance->releaseResources();
         }
+    }
+    for (auto& retired : retiredInstances)
+    {
+        if (retired.instance && retired.instance->pluginInstance)
+            retired.instance->pluginInstance->releaseResources();
     }
 }
 
@@ -388,6 +493,11 @@ bool VST3HostEngine::loadPluginToTarget(int targetIndex, const juce::PluginDescr
     if (targetIndex < 0 || targetIndex >= NumTargets)
         return false;
 
+    {
+        std::lock_guard<std::mutex> errorLock(loadErrorMutex);
+        lastLoadError.clear();
+    }
+
     auto activeInst = std::make_shared<ActiveInstance>();
     activeInst->slotInfo.instanceId = juce::Uuid().toString();
     activeInst->slotInfo.pluginName = desc.name;
@@ -404,27 +514,50 @@ bool VST3HostEngine::loadPluginToTarget(int targetIndex, const juce::PluginDescr
     {
         if (isolated)
         {
-            // Load in separate worker process
-            if (outOfProcessClient.loadPlugin(pluginFile.getFullPathName(), currentSampleRate, currentBlockSize))
+            activeInst->isolatedClient = std::make_unique<PluginHostClient>();
+            activeInst->isolatedClient->prepare(currentSampleRate.load(std::memory_order_relaxed),
+                                                currentBlockSize.load(std::memory_order_relaxed));
+            if (activeInst->isolatedClient->loadPlugin(pluginFile.getFullPathName(),
+                                                       currentSampleRate.load(std::memory_order_relaxed),
+                                                       currentBlockSize.load(std::memory_order_relaxed)))
             {
-                activeInst->slotInfo.latencySamples = 0;
+                const int pipelineLatency = currentBlockSize.load(std::memory_order_relaxed) +
+                    activeInst->isolatedClient->getPluginLatencySamples();
+                activeInst->latency.store(pipelineLatency, std::memory_order_relaxed);
+                activeInst->slotInfo.latencySamples = pipelineLatency;
             }
             else
             {
-                errorMsg = outOfProcessClient.getLastError();
+                errorMsg = activeInst->isolatedClient->getLastError();
             }
         }
         else
         {
             // In-Process Hosting
-            activeInst->pluginInstance = formatManager.createPluginInstance(desc, currentSampleRate, currentBlockSize, errorMsg);
+            activeInst->pluginInstance = formatManager.createPluginInstance(desc,
+                                                                             currentSampleRate.load(std::memory_order_relaxed),
+                                                                             currentBlockSize.load(std::memory_order_relaxed),
+                                                                             errorMsg);
             if (activeInst->pluginInstance)
             {
-                activeInst->pluginInstance->setPlayConfigDetails(2, 2, currentSampleRate, currentBlockSize);
-                activeInst->pluginInstance->prepareToPlay(currentSampleRate, currentBlockSize);
+                activeInst->pluginInstance->setPlayConfigDetails(2, 2,
+                                                                 currentSampleRate.load(std::memory_order_relaxed),
+                                                                 currentBlockSize.load(std::memory_order_relaxed));
+                activeInst->pluginInstance->prepareToPlay(currentSampleRate.load(std::memory_order_relaxed),
+                                                         currentBlockSize.load(std::memory_order_relaxed));
                 activeInst->latency.store(activeInst->pluginInstance->getLatencySamples(), std::memory_order_relaxed);
                 activeInst->slotInfo.latencySamples = activeInst->latency.load();
             }
+        }
+
+        if ((isolated && !activeInst->isolatedClient->isPluginLoaded()) ||
+            (!isolated && activeInst->pluginInstance == nullptr))
+        {
+            if (errorMsg.isEmpty())
+                errorMsg = "The plug-in binary exists, but the plug-in could not be loaded.";
+            std::lock_guard<std::mutex> errorLock(loadErrorMutex);
+            lastLoadError = desc.name + ": " + errorMsg;
+            return false;
         }
     }
     else
@@ -433,12 +566,20 @@ bool VST3HostEngine::loadPluginToTarget(int targetIndex, const juce::PluginDescr
         activeInst->slotInfo.latencySamples = 0;
     }
 
+    bool publishChange = false;
     {
         std::lock_guard<std::mutex> lock(chainMutex);
         targetChains[targetIndex].push_back(activeInst);
+        publishChange = !chainPublishingSuspended[(size_t)targetIndex];
+        if (publishChange)
+            publishTargetChainLocked(targetIndex);
     }
 
-    sendChangeMessage();
+    if (publishChange)
+    {
+        cleanupRetiredChains();
+        sendChangeMessage();
+    }
     return true;
 }
 
@@ -447,22 +588,19 @@ bool VST3HostEngine::removePluginFromTarget(int targetIndex, int slotIndex)
     if (targetIndex < 0 || targetIndex >= NumTargets)
         return false;
 
-    std::shared_ptr<ActiveInstance> removedInst;
-
     {
         std::lock_guard<std::mutex> lock(chainMutex);
         if (slotIndex < 0 || slotIndex >= (int)targetChains[targetIndex].size())
             return false;
 
-        removedInst = targetChains[targetIndex][slotIndex];
+        auto removedInst = targetChains[targetIndex][(size_t)slotIndex];
         targetChains[targetIndex].erase(targetChains[targetIndex].begin() + slotIndex);
+        retiredInstances.push_back({ targetIndex, std::move(removedInst) });
+        if (!chainPublishingSuspended[(size_t)targetIndex])
+            publishTargetChainLocked(targetIndex);
     }
 
-    if (removedInst && removedInst->pluginInstance)
-    {
-        removedInst->pluginInstance->releaseResources();
-    }
-
+    cleanupRetiredChains();
     sendChangeMessage();
     return true;
 }
@@ -472,15 +610,20 @@ bool VST3HostEngine::movePluginInTarget(int targetIndex, int fromSlot, int toSlo
     if (targetIndex < 0 || targetIndex >= NumTargets)
         return false;
 
-    std::lock_guard<std::mutex> lock(chainMutex);
-    int count = (int)targetChains[targetIndex].size();
-    if (fromSlot < 0 || fromSlot >= count || toSlot < 0 || toSlot >= count)
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(chainMutex);
+        int count = (int)targetChains[targetIndex].size();
+        if (fromSlot < 0 || fromSlot >= count || toSlot < 0 || toSlot >= count)
+            return false;
 
-    auto item = targetChains[targetIndex][fromSlot];
-    targetChains[targetIndex].erase(targetChains[targetIndex].begin() + fromSlot);
-    targetChains[targetIndex].insert(targetChains[targetIndex].begin() + toSlot, item);
+        auto item = targetChains[targetIndex][(size_t)fromSlot];
+        targetChains[targetIndex].erase(targetChains[targetIndex].begin() + fromSlot);
+        targetChains[targetIndex].insert(targetChains[targetIndex].begin() + toSlot, item);
+        if (!chainPublishingSuspended[(size_t)targetIndex])
+            publishTargetChainLocked(targetIndex);
+    }
 
+    cleanupRetiredChains();
     sendChangeMessage();
     return true;
 }
@@ -516,20 +659,22 @@ void VST3HostEngine::clearTargetChain(int targetIndex)
     if (targetIndex < 0 || targetIndex >= NumTargets)
         return;
 
-    std::vector<std::shared_ptr<ActiveInstance>> toRelease;
+    bool publishChange = false;
     {
         std::lock_guard<std::mutex> lock(chainMutex);
-        toRelease = std::move(targetChains[targetIndex]);
+        for (auto& instance : targetChains[(size_t)targetIndex])
+            retiredInstances.push_back({ targetIndex, std::move(instance) });
         targetChains[targetIndex].clear();
+        publishChange = !chainPublishingSuspended[(size_t)targetIndex];
+        if (publishChange)
+            publishTargetChainLocked(targetIndex);
     }
 
-    for (auto& inst : toRelease)
+    if (publishChange)
     {
-        if (inst && inst->pluginInstance)
-            inst->pluginInstance->releaseResources();
+        cleanupRetiredChains();
+        sendChangeMessage();
     }
-
-    sendChangeMessage();
 }
 
 int VST3HostEngine::getNumPluginsInTarget(int targetIndex) const
@@ -580,6 +725,73 @@ int VST3HostEngine::getTargetTotalLatency(int targetIndex) const
     return total;
 }
 
+juce::String VST3HostEngine::getLastLoadError() const
+{
+    std::lock_guard<std::mutex> errorLock(loadErrorMutex);
+    return lastLoadError;
+}
+
+PluginHostClient::PluginState VST3HostEngine::getTargetIsolatedState(int targetIndex) const
+{
+    if (targetIndex < 0 || targetIndex >= NumTargets)
+        return PluginHostClient::PluginState::NoPluginLoaded;
+
+    std::lock_guard<std::mutex> lock(chainMutex);
+    for (const auto& inst : targetChains[targetIndex])
+    {
+        if (inst && inst->isolatedClient)
+            return inst->isolatedClient->getPluginState();
+    }
+    return PluginHostClient::PluginState::NoPluginLoaded;
+}
+
+bool VST3HostEngine::simulateTargetIsolatedCrash(int targetIndex)
+{
+    if (targetIndex < 0 || targetIndex >= NumTargets)
+        return false;
+
+    const bool wasPrepared = isPrepared.load(std::memory_order_seq_cst);
+    pauseAudioProcessing();
+    bool simulated = false;
+    {
+        std::lock_guard<std::mutex> lock(chainMutex);
+        for (const auto& inst : targetChains[(size_t)targetIndex])
+        {
+            if (inst && inst->isolatedClient)
+            {
+                simulated = inst->isolatedClient->simulateCrash();
+                break;
+            }
+        }
+    }
+    resumeAudioProcessing(wasPrepared);
+    return simulated;
+}
+
+void VST3HostEngine::checkIsolatedClientsHealthAndRecover()
+{
+    const bool wasPrepared = isPrepared.load(std::memory_order_seq_cst);
+    pauseAudioProcessing();
+    std::vector<std::shared_ptr<ActiveInstance>> instances;
+    {
+        std::lock_guard<std::mutex> lock(chainMutex);
+        for (const auto& target : targetChains)
+        {
+            for (const auto& inst : target)
+            {
+                if (inst && inst->isolatedClient)
+                    instances.push_back(inst);
+            }
+        }
+    }
+
+    const auto sampleRate = currentSampleRate.load(std::memory_order_relaxed);
+    const auto blockSize = currentBlockSize.load(std::memory_order_relaxed);
+    for (const auto& inst : instances)
+        inst->isolatedClient->checkHealthAndRecover(sampleRate, blockSize);
+    resumeAudioProcessing(wasPrepared);
+}
+
 // =============================================================================
 // Real-Time Audio Processing
 // Zero heap allocations, real-time safe
@@ -587,26 +799,32 @@ int VST3HostEngine::getTargetTotalLatency(int targetIndex) const
 
 void VST3HostEngine::processTarget(int targetIndex, juce::AudioBuffer<float>& buffer, int numSamples)
 {
-    if (targetIndex < 0 || targetIndex >= NumTargets || !isPrepared.load(std::memory_order_relaxed))
+    if (targetIndex < 0 || targetIndex >= NumTargets)
         return;
 
-    // Use try_lock or atomic check to guarantee zero blocking in audio thread
-    if (!chainMutex.try_lock())
-        return; // Safe dry fallback if chain is currently being reconfigured on UI thread
-
-    const auto& chain = targetChains[targetIndex];
-    int numSlots = (int)chain.size();
-
-    for (int i = 0; i < numSlots; ++i)
+    audioReaders.fetch_add(1, std::memory_order_seq_cst);
+    struct AudioReaderGuard
     {
-        const auto& inst = chain[i];
+        std::atomic<unsigned int>& readers;
+        ~AudioReaderGuard() { readers.fetch_sub(1, std::memory_order_seq_cst); }
+    } readerGuard{ audioReaders };
+    if (!isPrepared.load(std::memory_order_seq_cst) || numSamples <= 0 ||
+        numSamples > buffer.getNumSamples())
+        return;
+
+    const auto* chain = publishedChains[(size_t)targetIndex].load(std::memory_order_seq_cst);
+    if (chain == nullptr)
+        return;
+
+    for (const auto& inst : *chain)
+    {
         if (!inst || inst->isBypassed.load(std::memory_order_relaxed))
             continue;
 
         if (inst->slotInfo.isIsolatedMode)
         {
-            // Process via Out-of-Process Helper
-            outOfProcessClient.processBlock(buffer, numSamples);
+            if (inst->isolatedClient)
+                inst->isolatedClient->processBlock(buffer, numSamples);
         }
         else if (inst->pluginInstance != nullptr)
         {
@@ -615,8 +833,6 @@ void VST3HostEngine::processTarget(int targetIndex, juce::AudioBuffer<float>& bu
             inst->pluginInstance->processBlock(buffer, emptyMidiBuffer);
         }
     }
-
-    chainMutex.unlock();
 }
 
 // =============================================================================
@@ -628,23 +844,33 @@ std::unique_ptr<juce::XmlElement> VST3HostEngine::exportTargetChainXml(int targe
     if (targetIndex < 0 || targetIndex >= NumTargets)
         return nullptr;
 
+    auto* self = const_cast<VST3HostEngine*>(this);
+    const bool wasPrepared = isPrepared.load(std::memory_order_seq_cst);
+    self->pauseAudioProcessing();
     auto xml = std::make_unique<juce::XmlElement>("TargetChain");
     xml->setAttribute("targetIndex", targetIndex);
     xml->setAttribute("targetName", getTargetName(targetIndex));
 
-    std::lock_guard<std::mutex> lock(chainMutex);
-    for (const auto& inst : targetChains[targetIndex])
     {
-        auto slot = inst->slotInfo;
-        slot.isBypassed = inst->isBypassed.load(std::memory_order_relaxed);
-
-        if (inst->pluginInstance != nullptr)
+        std::lock_guard<std::mutex> lock(chainMutex);
+        for (const auto& inst : targetChains[(size_t)targetIndex])
         {
-            inst->pluginInstance->getStateInformation(slot.savedState);
+            auto slot = inst->slotInfo;
+            slot.isBypassed = inst->isBypassed.load(std::memory_order_relaxed);
+
+            if (inst->pluginInstance != nullptr)
+            {
+                inst->pluginInstance->getStateInformation(slot.savedState);
+            }
+            else if (inst->isolatedClient)
+            {
+                inst->isolatedClient->saveState(slot.savedState);
+            }
+            xml->addChildElement(slot.toXml().release());
         }
-        xml->addChildElement(slot.toXml().release());
     }
 
+    self->resumeAudioProcessing(wasPrepared);
     return xml;
 }
 
@@ -653,6 +879,10 @@ bool VST3HostEngine::importTargetChainXml(int targetIndex, const juce::XmlElemen
     if (targetIndex < 0 || targetIndex >= NumTargets)
         return false;
 
+    {
+        std::lock_guard<std::mutex> lock(chainMutex);
+        chainPublishingSuspended[(size_t)targetIndex] = true;
+    }
     clearTargetChain(targetIndex);
 
     for (auto* c = xml.getFirstChildElement(); c != nullptr; c = c->getNextElement())
@@ -665,7 +895,8 @@ bool VST3HostEngine::importTargetChainXml(int targetIndex, const juce::XmlElemen
             desc.fileOrIdentifier = slot.fileOrIdentifier;
             desc.pluginFormatName = "VST3";
 
-            loadPluginToTarget(targetIndex, desc, slot.isIsolatedMode);
+            if (!loadPluginToTarget(targetIndex, desc, slot.isIsolatedMode))
+                continue;
 
             int slotIdx = getNumPluginsInTarget(targetIndex) - 1;
             setSlotBypassed(targetIndex, slotIdx, slot.isBypassed);
@@ -675,9 +906,25 @@ bool VST3HostEngine::importTargetChainXml(int targetIndex, const juce::XmlElemen
                 if (slot.savedState.getSize() > 0)
                     inst->setStateInformation(slot.savedState.getData(), (int)slot.savedState.getSize());
             }
+            else if (slot.savedState.getSize() > 0)
+            {
+                std::lock_guard<std::mutex> lock(chainMutex);
+                if (slotIdx >= 0 && slotIdx < (int)targetChains[targetIndex].size())
+                {
+                    auto& isolatedClient = targetChains[targetIndex][(size_t)slotIdx]->isolatedClient;
+                    if (isolatedClient)
+                        isolatedClient->restoreState(slot.savedState.getData(), slot.savedState.getSize());
+                }
+            }
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(chainMutex);
+        chainPublishingSuspended[(size_t)targetIndex] = false;
+        publishTargetChainLocked(targetIndex);
+    }
+    cleanupRetiredChains();
     sendChangeMessage();
     return true;
 }

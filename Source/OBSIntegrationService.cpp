@@ -55,21 +55,18 @@ std::vector<DetectedAudioDevice> OBSIntegrationService::scanAvailableOutputDevic
 {
     std::vector<DetectedAudioDevice> devices;
 
-    for (auto* type : primaryDeviceManager.getAvailableDeviceTypes())
-    {
-        if (type == nullptr) continue;
-        type->scanForDevices();
-        auto outNames = type->getDeviceNames(false); // output devices
+    auto* type = primaryDeviceManager.getCurrentDeviceTypeObject();
+    if (type == nullptr)
+        return devices;
 
-        for (const auto& name : outNames)
-        {
-            DetectedAudioDevice dev;
-            dev.name = name;
-            dev.isVirtual = isVirtualAudioDevice(name);
-            dev.virtualDriverType = identifyVirtualDriverType(name);
-            dev.maxOutputChannels = 2; // Default stereo
-            devices.push_back(dev);
-        }
+    type->scanForDevices();
+    for (const auto& name : type->getDeviceNames(false))
+    {
+        DetectedAudioDevice dev;
+        dev.name = name;
+        dev.isVirtual = isVirtualAudioDevice(name);
+        dev.virtualDriverType = identifyVirtualDriverType(name);
+        devices.push_back(dev);
     }
     return devices;
 }
@@ -128,25 +125,38 @@ int OBSIntegrationService::getSecondaryBufferSize() const
 
 juce::String OBSIntegrationService::openSecondaryVirtualDevice(const juce::String& deviceName)
 {
+    return openSecondaryOutputDevice(deviceName);
+}
+
+juce::String OBSIntegrationService::openSecondaryOutputDevice(const juce::String& deviceName)
+{
+    if (deviceName.trim().isEmpty())
+        return "No output device was selected.";
+
     closeSecondaryDevice();
 
     chosenVirtualDeviceName = deviceName;
     secondaryDeviceManager = std::make_unique<juce::AudioDeviceManager>();
     secondaryDeviceManager->addChangeListener(this);
+    const auto primaryBackend = primaryDeviceManager.getCurrentAudioDeviceType();
+    if (primaryBackend.isNotEmpty())
+        secondaryDeviceManager->setCurrentAudioDeviceType(primaryBackend, true);
 
-    // Initialise for 0 inputs and 2 outputs
+    // Open the endpoint on the same backend as the primary device.
     juce::AudioDeviceManager::AudioDeviceSetup setup;
     secondaryDeviceManager->getAudioDeviceSetup(setup);
     setup.inputDeviceName = "";
     setup.outputDeviceName = deviceName;
     setup.useDefaultInputChannels = false;
     setup.useDefaultOutputChannels = true;
+    if (auto* primaryDevice = primaryDeviceManager.getCurrentAudioDevice())
+        setup.sampleRate = primaryDevice->getCurrentSampleRate();
 
     juce::String err = secondaryDeviceManager->initialise(0, 2, nullptr, true, deviceName, &setup);
     if (err.isNotEmpty())
     {
         deviceErrorState.store(true);
-        lastErrorMessage = "Failed to open virtual device '" + deviceName + "': " + err;
+        lastErrorMessage = "Failed to open output device '" + deviceName + "': " + err;
         secondaryDeviceManager.reset();
         notifyStatusChanged();
         return err;
@@ -179,6 +189,16 @@ void OBSIntegrationService::closeSecondaryDevice()
 
 void OBSIntegrationService::pushStreamAudioBlock(const juce::AudioBuffer<float>& streamBuffer, int numSamples)
 {
+    pushOutputAudioBlock(streamBuffer, streamBuffer, numSamples);
+}
+
+void OBSIntegrationService::pushOutputAudioBlock(const juce::AudioBuffer<float>& streamBuffer,
+                                                 const juce::AudioBuffer<float>& monitorBuffer,
+                                                 int numSamples)
+{
+    if (numSamples <= 0 || streamBuffer.getNumChannels() < 2 || monitorBuffer.getNumChannels() < 2)
+        return;
+
     // Real-Time Safe: Lock-free writing into circular FIFO
     int freeSpace = fifo.getFreeSpace();
     int samplesToWrite = juce::jmin(numSamples, freeSpace);
@@ -188,23 +208,36 @@ void OBSIntegrationService::pushStreamAudioBlock(const juce::AudioBuffer<float>&
     int startIndex1, blockSize1, startIndex2, blockSize2;
     fifo.prepareToWrite(samplesToWrite, startIndex1, blockSize1, startIndex2, blockSize2);
 
-    auto sanitizeBlock = [](float* dest, const float* src, int count) {
+    const auto bus = secondaryOutputBus.load(std::memory_order_relaxed);
+    const float streamGain = bus == SecondaryOutputBus::Monitor ? 0.0f :
+        (bus == SecondaryOutputBus::StreamAndMonitor ? 0.5f : 1.0f);
+    const float monitorGain = bus == SecondaryOutputBus::Stream ? 0.0f :
+        (bus == SecondaryOutputBus::StreamAndMonitor ? 0.5f : 1.0f);
+
+    auto writeBlock = [streamGain, monitorGain](float* destL, float* destR,
+                                                       const juce::AudioBuffer<float>& stream,
+                                                       const juce::AudioBuffer<float>& monitor,
+                                                       int offset, int count) {
         for (int i = 0; i < count; ++i)
         {
-            float v = src[i];
-            dest[i] = (std::isnan(v) || std::isinf(v)) ? 0.0f : juce::jlimit(-1.0f, 1.0f, v);
+            const float left = stream.getReadPointer(0)[offset + i] * streamGain +
+                               monitor.getReadPointer(0)[offset + i] * monitorGain;
+            const float right = stream.getReadPointer(1)[offset + i] * streamGain +
+                                monitor.getReadPointer(1)[offset + i] * monitorGain;
+            destL[i] = std::isfinite(left) ? juce::jlimit(-1.0f, 1.0f, left) : 0.0f;
+            destR[i] = std::isfinite(right) ? juce::jlimit(-1.0f, 1.0f, right) : 0.0f;
         }
     };
 
     if (blockSize1 > 0)
     {
-        sanitizeBlock(fifoBuffer.getWritePointer(0, startIndex1), streamBuffer.getReadPointer(0), blockSize1);
-        sanitizeBlock(fifoBuffer.getWritePointer(1, startIndex1), streamBuffer.getReadPointer(1), blockSize1);
+        writeBlock(fifoBuffer.getWritePointer(0, startIndex1), fifoBuffer.getWritePointer(1, startIndex1),
+                   streamBuffer, monitorBuffer, 0, blockSize1);
     }
     if (blockSize2 > 0)
     {
-        sanitizeBlock(fifoBuffer.getWritePointer(0, startIndex2), streamBuffer.getReadPointer(0) + blockSize1, blockSize2);
-        sanitizeBlock(fifoBuffer.getWritePointer(1, startIndex2), streamBuffer.getReadPointer(1) + blockSize1, blockSize2);
+        writeBlock(fifoBuffer.getWritePointer(0, startIndex2), fifoBuffer.getWritePointer(1, startIndex2),
+                   streamBuffer, monitorBuffer, blockSize1, blockSize2);
     }
 
     fifo.finishedWrite(samplesToWrite);
@@ -253,6 +286,20 @@ void OBSIntegrationService::audioDeviceIOCallbackWithContext(const float* const*
     if (testSignalActive.load(std::memory_order_relaxed))
     {
         renderTestSignal(outputChannelData, numOutputChannels, numSamples, secondarySampleRate);
+    }
+
+    const float endpointGain = secondaryOutputMuted.load(std::memory_order_relaxed)
+                                   ? 0.0f : secondaryOutputGain.load(std::memory_order_relaxed);
+    for (int ch = 0; ch < numOutputChannels; ++ch)
+    {
+        if (outputChannelData[ch] == nullptr)
+            continue;
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const float value = outputChannelData[ch][sample] * endpointGain;
+            outputChannelData[ch][sample] = std::isfinite(value)
+                ? juce::jlimit(-1.0f, 1.0f, value) : 0.0f;
+        }
     }
 
     // Calculate Peak and RMS for OBS meter
@@ -355,6 +402,21 @@ void OBSIntegrationService::renderTestSignal(float* const* outputChannels, int n
     }
 }
 
+juce::String OBSIntegrationService::getDriverReadinessSummary() const
+{
+    if (hasNativeVirtualAudioDriver())
+        return "LiveBus native virtual audio driver is active and ready for endpoint routing.";
+
+    if (isSecondaryDeviceActive())
+        return "External virtual cable active: " + getSecondaryDeviceName();
+
+    const auto available = const_cast<OBSIntegrationService*>(this)->getAvailableVirtualCables();
+    if (!available.isEmpty())
+        return "External virtual cable detected: " + available.joinIntoString(", ") + ".";
+
+    return "LiveBus native virtual audio driver is not installed in this build; use an external VB-Audio / VAC / OBS virtual device for endpoint routing.";
+}
+
 juce::String OBSIntegrationService::getStatusDescription() const
 {
     if (deviceErrorState.load())
@@ -366,8 +428,8 @@ juce::String OBSIntegrationService::getStatusDescription() const
             return "Primary Interface Multi-Channel: Stream Bus routed to Ch 1-2 (OBS Capture), Monitor Bus to Ch 3-4 (Headphones).";
         case OBSRoutingMode::DedicatedSecondaryDevice:
             if (isSecondaryDeviceActive())
-                return "Dedicated Virtual Cable Streaming: Stream Bus sending live audio to '" + getSecondaryDeviceName() + "' for OBS.";
-            return "Dedicated Virtual Device Standby: Please select and activate a virtual audio cable.";
+                return "Dedicated Endpoint Output: " + getSecondaryDeviceName();
+            return getDriverReadinessSummary();
         case OBSRoutingMode::PrimaryStreamOnly:
             return "Primary Stream Only: Entire primary device dedicated to Stream Bus for OBS. Monitor bus is muted to prevent OBS bleed.";
         case OBSRoutingMode::CombinedAudition:

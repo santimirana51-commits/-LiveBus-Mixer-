@@ -162,10 +162,11 @@ namespace LiveBus
             juce::Path fftPath;
             bool started = false;
             const float graphH = bounds.getHeight() - 40.0f;
+            const float binFrequency = (float)proc.getSampleRate() * 4.0f / (float)fftSize;
 
             for (size_t i = 0; i < owner.smoothedFftBins.size(); ++i)
             {
-                float freq = (float)i * 24000.0f / (float)owner.smoothedFftBins.size();
+                float freq = (float)i * binFrequency;
                 if (freq < 20.0f || freq > 20000.0f) continue;
 
                 float x = freqToX(freq);
@@ -2072,7 +2073,7 @@ namespace LiveBus
                 for (size_t i = 0; i < smoothedFftBins.size(); ++i)
                 {
                     size_t binIndex = juce::jlimit<size_t>(0, (size_t)fftSize / 2, i * 4);
-                    float mag = fftData[binIndex];
+                    float mag = fftData[binIndex] * (4.0f / (float)fftSize);
                     float db = juce::Decibels::gainToDecibels(mag, -90.0f);
                     smoothedFftBins[i] = smoothedFftBins[i] * 0.7f + db * 0.3f;
                 }

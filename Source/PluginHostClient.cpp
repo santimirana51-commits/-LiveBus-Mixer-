@@ -3,14 +3,16 @@
 
 PluginHostClient::PluginHostClient()
 {
+    static std::atomic<std::uint64_t> nextClientId{0};
+    const auto clientId = nextClientId.fetch_add(1, std::memory_order_relaxed);
 #if defined(_WIN32)
-    channelId = "LiveBusChannel_" + std::to_string(GetCurrentProcessId());
+    channelId = "LiveBusChannel_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(clientId);
 #else
-    channelId = "LiveBusChannel_1";
+    channelId = "LiveBusChannel_1_" + std::to_string(clientId);
 #endif
     channel.create(channelId, true);
-    dryRingBuffer.setSize(2, LiveBusIPC::maxFrames);
-    dryRingBuffer.clear();
+    currentInputBuffer.setSize(2, LiveBusIPC::maxFrames);
+    currentInputBuffer.clear();
 }
 
 PluginHostClient::~PluginHostClient()
@@ -23,20 +25,33 @@ void PluginHostClient::prepare(double sampleRate, int blockSize)
 {
     currentSampleRate = sampleRate > 0.0 ? sampleRate : 48000.0;
     currentBlockSize = juce::jmax(1, blockSize);
-    dryRingBuffer.setSize(2, juce::jmax((int)LiveBusIPC::maxFrames, currentBlockSize));
-    dryRingBuffer.clear();
+    currentInputBuffer.setSize(2, juce::jmax((int)LiveBusIPC::maxFrames, currentBlockSize));
+    currentInputBuffer.clear();
     pendingBlock.reset();
     activeSequence = 0;
+    dryDelay.reset();
 }
 
 bool PluginHostClient::launchHelper()
 {
     terminateHelper();
 
+    auto* data = channel.getData();
+    if (data == nullptr)
+    {
+        lastErrorMessage = "Shared-memory channel is unavailable";
+        return false;
+    }
+    data->helperPid = 0;
+
     auto appFile = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
     juce::Array<juce::File> candidates = {
         appFile.getSiblingFile("LiveBusPluginHost.exe"),
         appFile.getSiblingFile("LiveBus Plugin Host.exe"),
+        appFile.getParentDirectory().getParentDirectory().getParentDirectory()
+            .getChildFile("LiveBusPluginHost_artefacts/Release/LiveBusPluginHost.exe"),
+        appFile.getParentDirectory().getParentDirectory().getParentDirectory()
+            .getChildFile("LiveBusPluginHost_artefacts/Release/LiveBus Plugin Host.exe"),
         appFile.getParentDirectory().getParentDirectory().getChildFile("LiveBusPluginHost_artefacts/Release/LiveBusPluginHost.exe"),
         appFile.getParentDirectory().getParentDirectory().getChildFile("LiveBusPluginHost_artefacts/Release/LiveBus Plugin Host.exe"),
         juce::File::getCurrentWorkingDirectory().getChildFile("LiveBusPluginHost_artefacts/Release/LiveBusPluginHost.exe"),
@@ -94,12 +109,13 @@ bool PluginHostClient::launchHelper()
     // Wait briefly on non-real-time thread for helper to register
     for (int i = 0; i < 30; ++i)
     {
-        auto* data = channel.getData();
         if (data && data->helperPid != 0)
             return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
     }
-    return true;
+    lastErrorMessage = "LiveBusPluginHost did not register its shared-memory channel";
+    terminateHelper();
+    return false;
 #else
     return false;
 #endif
@@ -175,6 +191,12 @@ bool PluginHostClient::loadPlugin(const juce::String& path, double sampleRate, i
     currentSampleRate = sampleRate;
     currentBlockSize = blockSize;
     loadedPluginPath = path;
+    pluginLoaded.store(false, std::memory_order_relaxed);
+    currentPluginName.clear();
+    pendingBlock.reset();
+    dryDelay.reset();
+    lastErrorMessage.clear();
+    pluginLatencySamples.store(0, std::memory_order_relaxed);
 
     if (!isRunning())
     {
@@ -188,7 +210,7 @@ bool PluginHostClient::loadPlugin(const juce::String& path, double sampleRate, i
     data->command = LiveBusIPC::Command::LoadPlugin;
     data->sampleRate = sampleRate;
     data->frames = (uint32_t)blockSize;
-    std::strncpy(data->pluginPath, path.toRawUTF8(), sizeof(data->pluginPath) - 1);
+    LiveBusIPC::copyNullTerminatedString(data->pluginPath, sizeof(data->pluginPath), path.toRawUTF8());
     data->status = LiveBusIPC::Status::Idle;
 
     channel.signalRequest();
@@ -199,6 +221,8 @@ bool PluginHostClient::loadPlugin(const juce::String& path, double sampleRate, i
         if (data->status == LiveBusIPC::Status::Success)
         {
             currentPluginName = juce::String::fromUTF8(data->pluginName);
+            pluginLatencySamples.store((int)data->pluginLatencySamples,
+                                       std::memory_order_relaxed);
             pluginLoaded.store(true);
             crashed.store(false);
             return true;
@@ -217,6 +241,7 @@ bool PluginHostClient::loadPlugin(const juce::String& path, double sampleRate, i
 void PluginHostClient::releasePlugin()
 {
     pluginLoaded.store(false);
+    pluginLatencySamples.store(0, std::memory_order_relaxed);
     currentPluginName = "";
     loadedPluginPath = "";
     pendingBlock.reset();
@@ -250,10 +275,12 @@ bool PluginHostClient::saveState(juce::MemoryBlock& outBlock)
 bool PluginHostClient::restoreState(const void* dataPtr, size_t size)
 {
     auto* data = channel.getData();
-    if (!data || !isRunning() || !pluginLoaded.load()) return false;
+    if (!data || dataPtr == nullptr || size == 0 || size > LiveBusIPC::maxStateSize ||
+        !isRunning() || !pluginLoaded.load())
+        return false;
 
     data->command = LiveBusIPC::Command::RestoreState;
-    data->stateSize = (uint32_t)juce::jmin(size, (size_t)LiveBusIPC::maxStateSize);
+    data->stateSize = (uint32_t)size;
     std::memcpy(data->stateData, dataPtr, data->stateSize);
 
     channel.signalRequest();
@@ -268,14 +295,6 @@ bool PluginHostClient::restoreState(const void* dataPtr, size_t size)
 void PluginHostClient::setBypass(bool bypass)
 {
     bypassed.store(bypass);
-    auto* data = channel.getData();
-    if (data && isRunning())
-    {
-        data->command = LiveBusIPC::Command::SetBypass;
-        data->bypass = bypass ? 1 : 0;
-        channel.signalRequest();
-        channel.waitResponse(100);
-    }
 }
 
 juce::String PluginHostClient::getPluginName() const
@@ -290,69 +309,76 @@ juce::String PluginHostClient::getLastError() const
 
 void PluginHostClient::processBlock(juce::AudioBuffer<float>& buffer, int numSamples)
 {
-    const bool supportedBlock = numSamples <= buffer.getNumSamples()
-        && LiveBusIPC::isSupportedFrameCount((std::uint32_t)juce::jmax(0, numSamples));
-
-    // If not loaded, bypassed, or helper marked crashed: pass through dry audio
-    if (!pluginLoaded.load(std::memory_order_relaxed) || crashed.load(std::memory_order_relaxed))
-    {
-        pendingBlock.reset();
-        return; // dry buffer left untouched
-    }
-
-    if (bypassed.load(std::memory_order_relaxed))
-    {
-        if (pendingBlock.isPending())
-            pendingBlock.discardLateOutput();
+    if (numSamples <= 0 || numSamples > buffer.getNumSamples())
         return;
-    }
+
+    if (!LiveBusIPC::isSupportedFrameCount((std::uint32_t)numSamples))
+        return;
 
     auto* data = channel.getData();
-    if (!data)
-    {
-        pendingBlock.reset();
+    const bool pluginActive = pluginLoaded.load(std::memory_order_relaxed) &&
+                              !crashed.load(std::memory_order_relaxed) && data != nullptr;
+    if (!pluginActive && !dryDelay.hasAudio() && !pendingBlock.isPending())
         return;
+
+    const int channels = juce::jmin(2, buffer.getNumChannels());
+    std::array<const float*, 2> currentInput{};
+    std::array<float*, 2> output{};
+    for (int ch = 0; ch < channels; ++ch)
+    {
+        currentInputBuffer.copyFrom(ch, 0, buffer, ch, 0, numSamples);
+        currentInput[(size_t)ch] = currentInputBuffer.getReadPointer(ch);
+        output[(size_t)ch] = buffer.getWritePointer(ch);
     }
 
-    // -------------------------------------------------------------
-    // TRUE REAL-TIME ASYNCHRONOUS PIPELINE: ZERO-WAIT (0ms)
-    // -------------------------------------------------------------
-    // Poll the completion marker for the previously dispatched block.
+    bool usePluginOutput = false;
     if (pendingBlock.isPending())
     {
-        const auto completedSequence = LiveBusIPC::SharedMemoryChannel::loadOutputReadySequence(*data);
-
+        const auto completedSequence = data != nullptr
+            ? LiveBusIPC::SharedMemoryChannel::loadOutputReadySequence(*data) : 0;
         if (!pendingBlock.isComplete(completedSequence))
         {
             pendingBlock.discardLateOutput();
+            dryDelay.storeCurrent(currentInput.data(), channels,
+                                  (std::uint32_t)numSamples);
+            if (!dryDelay.copyPrevious(output.data(), channels,
+                                       (std::uint32_t)numSamples))
+                buffer.clear(0, numSamples);
             return;
         }
 
-        if (supportedBlock && pendingBlock.canUseOutput(completedSequence, data->status, (std::uint32_t)numSamples))
-        {
-            for (int ch = 0; ch < juce::jmin(2, buffer.getNumChannels()); ++ch)
-                std::memcpy(buffer.getWritePointer(ch), data->outputSamples[ch], (size_t)numSamples * sizeof(float));
-        }
-
-        channel.waitResponse(0);
+        usePluginOutput = pluginActive &&
+            !bypassed.load(std::memory_order_relaxed) &&
+            pendingBlock.canUseOutput(completedSequence, data->status,
+                                      (std::uint32_t)numSamples);
         pendingBlock.reset();
     }
 
-    if (!supportedBlock)
+    dryDelay.storeCurrent(currentInput.data(), channels, (std::uint32_t)numSamples);
+    if (usePluginOutput)
+    {
+        for (int ch = 0; ch < channels; ++ch)
+            std::memcpy(buffer.getWritePointer(ch), data->outputSamples[ch],
+                        (size_t)numSamples * sizeof(float));
+    }
+    else if (!dryDelay.copyPrevious(output.data(), channels, (std::uint32_t)numSamples))
+    {
+        buffer.clear(0, numSamples);
+    }
+
+    if (!pluginActive || bypassed.load(std::memory_order_relaxed) ||
+        pendingBlock.isPending())
         return;
 
-    for (int ch = 0; ch < juce::jmin(2, buffer.getNumChannels()); ++ch)
-    {
-        std::memcpy(data->inputSamples[ch], buffer.getReadPointer(ch), (size_t)numSamples * sizeof(float));
-    }
+    for (int ch = 0; ch < channels; ++ch)
+        std::memcpy(data->inputSamples[ch], currentInput[(size_t)ch],
+                    (size_t)numSamples * sizeof(float));
 
     activeSequence++;
     data->frames = (uint32_t)numSamples;
     data->sequence = activeSequence;
     data->command = LiveBusIPC::Command::ProcessBlock;
     pendingBlock.begin(activeSequence, (std::uint32_t)numSamples);
-
-    // Fast non-blocking signal (sub-microsecond kernel event set)
     channel.signalRequest();
 }
 

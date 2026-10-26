@@ -232,7 +232,15 @@ void PluginLibraryComponent::loadSelectedPlugin()
     if (row >= 0 && row < (int)filteredPlugins.size())
     {
         const auto& item = filteredPlugins[row];
-        hostEngine.loadPluginToTarget(activeTargetIndex, item.description, false);
+        if (!hostEngine.loadPluginToTarget(activeTargetIndex, item.description, isolatedModeEnabled))
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                   "Plug-in load failed",
+                                                   hostEngine.getLastLoadError().isNotEmpty()
+                                                       ? hostEngine.getLastLoadError()
+                                                       : "The selected plug-in could not be loaded.");
+            return;
+        }
 
         if (onPluginSelectedToLoad)
             onPluginSelectedToLoad(item.description);

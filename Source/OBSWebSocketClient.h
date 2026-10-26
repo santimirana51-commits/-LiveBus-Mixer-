@@ -10,15 +10,19 @@ enum class OBSWebSocketState
 {
     Disconnected = 0,
     Connecting,
+    TcpConnected,
+    WebSocketConnected,
+    Authenticating,
     Connected,
+    AuthenticationFailed,
     ConnectionFailed
 };
 
 /**
  * OBS WebSocket v5 connection client & status evaluator.
  *
- * Runs non-blocking TCP socket connection attempts to the OBS Studio
- * WebSocket server (default port 4455).
+ * Performs the OBS WebSocket v5 HTTP upgrade, authentication, and Identify
+ * handshake on a worker thread (default port 4455).
  * Completely decoupled from real-time audio routing.
  */
 class OBSWebSocketClient : public juce::Thread
@@ -29,8 +33,8 @@ public:
 
     OBSWebSocketState getState() const noexcept { return currentState.load(); }
     juce::String getStatusString() const;
-    juce::String getHost() const { return hostAddress; }
-    int getPort() const noexcept { return portNumber; }
+    juce::String getHost() const;
+    int getPort() const noexcept;
 
     void configure(const juce::String& host, int port, const juce::String& password);
     void connectAsync();
@@ -44,12 +48,15 @@ private:
     void run() override;
 
     std::atomic<OBSWebSocketState> currentState{OBSWebSocketState::Disconnected};
+    juce::CriticalSection configurationLock;
+    juce::CriticalSection socketLock;
+    juce::CriticalSection errorLock;
     juce::String hostAddress{"127.0.0.1"};
     int portNumber = 4455;
     juce::String authPassword;
     juce::String lastErrorMessage;
 
-    std::unique_ptr<juce::StreamingSocket> socket;
+    std::shared_ptr<juce::StreamingSocket> socket;
 
     void updateState(OBSWebSocketState newState, const juce::String& msg);
 

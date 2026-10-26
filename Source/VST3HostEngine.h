@@ -35,6 +35,7 @@ public:
     {
         PluginChainSlot slotInfo;
         std::unique_ptr<juce::AudioPluginInstance> pluginInstance;
+        std::unique_ptr<PluginHostClient> isolatedClient;
         std::atomic<bool> isBypassed{false};
         std::atomic<int> latency{0};
     };
@@ -83,6 +84,11 @@ public:
     PluginChainSlot getSlotInfo(int targetIndex, int slotIndex) const;
     juce::AudioPluginInstance* getPluginInstance(int targetIndex, int slotIndex) const;
     int getTargetTotalLatency(int targetIndex) const;
+    juce::String getLastLoadError() const;
+    double getCurrentSampleRate() const { return currentSampleRate.load(std::memory_order_relaxed); }
+    PluginHostClient::PluginState getTargetIsolatedState(int targetIndex) const;
+    bool simulateTargetIsolatedCrash(int targetIndex);
+    void checkIsolatedClientsHealthAndRecover();
 
     // =========================================================================
     // Real-Time Audio Processing
@@ -101,8 +107,14 @@ public:
     const juce::KnownPluginList& getKnownPluginList() const { return knownPluginList; }
 
 private:
+    using ChainSnapshot = std::vector<std::shared_ptr<ActiveInstance>>;
+
     void populateReferenceLibraryIfEmpty();
     void updateLibraryFromKnownList();
+    void publishTargetChainLocked(int targetIndex);
+    void cleanupRetiredChains();
+    void pauseAudioProcessing();
+    void resumeAudioProcessing(bool wasPrepared);
 
     class ScannerThread : public juce::Thread
     {
@@ -131,13 +143,25 @@ private:
     // Target Chains (Targets 0..5)
     mutable std::mutex chainMutex;
     std::array<std::vector<std::shared_ptr<ActiveInstance>>, NumTargets> targetChains;
+    std::array<std::atomic<const ChainSnapshot*>, NumTargets> publishedChains{};
+    std::array<bool, NumTargets> chainPublishingSuspended{};
+    std::vector<std::unique_ptr<ChainSnapshot>> retiredSnapshots;
+    struct RetiredInstance
+    {
+        int targetIndex = -1;
+        std::shared_ptr<ActiveInstance> instance;
+    };
+    std::vector<RetiredInstance> retiredInstances;
+    std::atomic<unsigned int> audioReaders{0};
 
     // Preallocated temporary audio buffers for DSP chain rendering
     juce::AudioBuffer<float> tempChainBuffer;
     juce::MidiBuffer emptyMidiBuffer;
 
-    double currentSampleRate{48000.0};
-    int currentBlockSize{512};
+    mutable std::mutex loadErrorMutex;
+    juce::String lastLoadError;
+    std::atomic<double> currentSampleRate{48000.0};
+    std::atomic<int> currentBlockSize{512};
     std::atomic<bool> isPrepared{false};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VST3HostEngine)

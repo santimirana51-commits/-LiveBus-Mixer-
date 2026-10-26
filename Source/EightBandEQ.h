@@ -257,6 +257,7 @@ namespace LiveBus
         float getMeterInR() const { return meterInR.load(std::memory_order_relaxed); }
         float getMeterOutL() const { return meterOutL.load(std::memory_order_relaxed); }
         float getMeterOutR() const { return meterOutR.load(std::memory_order_relaxed); }
+        double getSampleRate() const noexcept { return currentSampleRate; }
 
         // Analyzer mode
         void setAnalyzerEnabled(bool enabled) { analyzerEnabled.store(enabled, std::memory_order_relaxed); }

@@ -15,6 +15,8 @@ add_subdirectory("${JUCE_DIR}" JUCE)
 # -------------------------------------------------------------
 juce_add_gui_app(LiveBusMixer PRODUCT_NAME "LiveBusMixer"
     COMPANY_NAME "LiveBus" BUNDLE_ID "com.livebus.mixer"
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Resources/LiveBusMixerIcon.png"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Resources/LiveBusMixerIcon.png"
     NEEDS_WEB_BROWSER TRUE
     NEEDS_WEBVIEW2 TRUE)
 juce_generate_juce_header(LiveBusMixer)
@@ -122,6 +124,9 @@ target_sources(LiveBusMixer PRIVATE
     Source/MacroEngine.cpp
     Source/MacroControlComponent.h
     Source/MacroControlComponent.cpp
+    Source/RoutingGraphRouting.h
+    Source/RoutingGraphComponent.h
+    Source/RoutingGraphComponent.cpp
     Source/RoutingMatrixComponent.h
     Source/RoutingMatrixComponent.cpp
     Source/YouTubeAudioCaptureService.h
@@ -155,6 +160,9 @@ target_link_libraries(LiveBusMixer PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+if(WIN32)
+    target_link_libraries(LiveBusMixer PRIVATE bcrypt)
+endif()
 
 # -------------------------------------------------------------
 # 2. Out-of-Process VST3 Helper: LiveBusPluginHost
@@ -199,6 +207,7 @@ target_sources(LiveBusMixerTests PRIVATE
     Source/PluginHostClient.cpp
     Source/ChannelStripDSP.h
     Source/RoutingMatrix.h
+    Source/RoutingGraphRouting.h
     Source/DeviceSupervisor.h
     Source/DeviceSupervisor.cpp
     Source/SceneManager.h
@@ -268,6 +277,9 @@ target_link_libraries(LiveBusMixerTests PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+if(WIN32)
+    target_link_libraries(LiveBusMixerTests PRIVATE bcrypt)
+endif()
 add_test(NAME LiveBusMixerTests
     COMMAND $<TARGET_FILE:LiveBusMixerTests>)
 set_tests_properties(LiveBusMixerTests PROPERTIES

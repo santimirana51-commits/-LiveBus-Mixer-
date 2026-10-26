@@ -134,11 +134,18 @@ namespace LiveBus
         // =====================================================================
         // Top Header
         // =====================================================================
-        juce::TextButton gateMasterBtn{"GATE"};
+        juce::TextButton masterEnableBtn{"DSP OFF"};
         juce::Label titleLabel{"LIVEBUS VOCAL DYNAMICS RACK — eMo D5 ARCHITECTURE"};
         juce::ComboBox targetCombo;
         juce::ComboBox presetCombo;
-        juce::TextButton compMasterBtn{"COMP"};
+        std::array<juce::TextButton, 6> chainButtons{
+            juce::TextButton{"1  HPF"},
+            juce::TextButton{"2  Gate"},
+            juce::TextButton{"3  EQ"},
+            juce::TextButton{"4  De-Esser"},
+            juce::TextButton{"5  Comp"},
+            juce::TextButton{"6  Limiter"}
+        };
 
         // =====================================================================
         // Left Panel: Noise Gate / Expander

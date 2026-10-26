@@ -32,6 +32,10 @@ public:
     void setBypass(bool bypass);
     bool getBypass() const { return bypassed.load(); }
     bool isPluginLoaded() const { return pluginLoaded.load(); }
+    int getPluginLatencySamples() const noexcept
+    {
+        return pluginLatencySamples.load(std::memory_order_relaxed);
+    }
 
     enum class PluginState
     {
@@ -68,6 +72,7 @@ private:
     std::atomic<bool> crashed{false};
     std::atomic<bool> bypassed{false};
     std::atomic<bool> pluginLoaded{false};
+    std::atomic<int> pluginLatencySamples{0};
     juce::String loadedPluginPath;
     juce::String currentPluginName;
     juce::String lastErrorMessage;
@@ -78,7 +83,8 @@ private:
 
     std::uint32_t activeSequence = 0;
     LiveBusIPC::PendingAudioBlock pendingBlock;
-    juce::AudioBuffer<float> dryRingBuffer;
+    LiveBusIPC::FixedBlockAudioDelay dryDelay;
+    juce::AudioBuffer<float> currentInputBuffer;
 
 #if defined(_WIN32)
     PROCESS_INFORMATION processInfo{};

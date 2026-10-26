@@ -134,7 +134,10 @@ namespace LiveBus
     // 8-Band EQ Graph Mini Visualizer
     // =========================================================================
     VocalDSPRackComponent::EQGraphMiniComponent::EQGraphMiniComponent(VocalDSPRackComponent& o)
-        : owner(o) {}
+        : owner(o)
+    {
+        setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+    }
 
     float VocalDSPRackComponent::EQGraphMiniComponent::freqToX(float freq) const
     {
@@ -225,10 +228,12 @@ namespace LiveBus
         {
             float f = eq.params.bands[b].freq.load(std::memory_order_relaxed);
             float gDb = eq.params.bands[b].gainDb.load(std::memory_order_relaxed);
+            const auto type = eq.params.bands[b].type.load(std::memory_order_relaxed);
             bool en = eq.params.bands[b].enabled.load(std::memory_order_relaxed);
 
             float bx = freqToX(f);
-            float by = gainToY(gDb);
+            float by = gainToY(type == EQFilterType::HighPass || type == EQFilterType::LowPass
+                                   ? 0.0f : gDb);
 
             g.setColour(en ? bandColors[b] : juce::Colour(0xff64748b));
             g.fillEllipse(bx - 4.0f, by - 4.0f, 8.0f, 8.0f);
@@ -248,8 +253,10 @@ namespace LiveBus
         {
             float f = eq.params.bands[b].freq.load(std::memory_order_relaxed);
             float gDb = eq.params.bands[b].gainDb.load(std::memory_order_relaxed);
+            const auto type = eq.params.bands[b].type.load(std::memory_order_relaxed);
             float bx = freqToX(f);
-            float by = gainToY(gDb);
+            float by = gainToY(type == EQFilterType::HighPass || type == EQFilterType::LowPass
+                                   ? 0.0f : gDb);
 
             if (e.position.getDistanceFrom(juce::Point<float>(bx, by)) <= 12.0f)
             {
@@ -265,10 +272,13 @@ namespace LiveBus
         {
             auto& eq = owner.getCurrentProcessor().getEQ();
             float newF = juce::jlimit(20.0f, 20000.0f, xToFreq(e.position.x));
-            float newG = juce::jlimit(-18.0f, 18.0f, yToGain(e.position.y));
-
-            eq.params.bands[activeDragBand].freq.store(newF);
-            eq.params.bands[activeDragBand].gainDb.store(newG);
+            const auto type = eq.params.bands[activeDragBand].type.load(std::memory_order_relaxed);
+            eq.params.bands[activeDragBand].freq.store(newF, std::memory_order_relaxed);
+            if (type != EQFilterType::HighPass && type != EQFilterType::LowPass)
+                eq.params.bands[activeDragBand].gainDb.store(
+                    juce::jlimit(-18.0f, 18.0f, yToGain(e.position.y)),
+                    std::memory_order_relaxed);
+            eq.updateCoefficients();
             repaint();
         }
     }
@@ -357,13 +367,13 @@ namespace LiveBus
         : targetProcessors(processors)
     {
         // 1. Top Header Controls
-        gateMasterBtn.setClickingTogglesState(true);
-        gateMasterBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff1d3557));
-        gateMasterBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff2563eb));
-        gateMasterBtn.setToggleState(true, juce::dontSendNotification);
-        gateMasterBtn.addListener(this);
-        addAndMakeVisible(gateMasterBtn);
+        masterEnableBtn.setClickingTogglesState(true);
+        masterEnableBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff7f1d1d));
+        masterEnableBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff15803d));
+        masterEnableBtn.addListener(this);
+        addAndMakeVisible(masterEnableBtn);
 
+        titleLabel.setText("LIVEBUS DSP INSERT CHAIN", juce::dontSendNotification);
         titleLabel.setFont(juce::FontOptions(13.0f, juce::Font::bold));
         titleLabel.setColour(juce::Label::textColourId, juce::Colour(0xfff0f6fc));
         titleLabel.setJustificationType(juce::Justification::centred);
@@ -390,12 +400,30 @@ namespace LiveBus
         presetCombo.addListener(this);
         addAndMakeVisible(presetCombo);
 
-        compMasterBtn.setClickingTogglesState(true);
-        compMasterBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff7c2d12));
-        compMasterBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffea580c));
-        compMasterBtn.setToggleState(true, juce::dontSendNotification);
-        compMasterBtn.addListener(this);
-        addAndMakeVisible(compMasterBtn);
+        const juce::Colour chainColours[] = {
+            juce::Colour(0xff06b6d4), juce::Colour(0xff3b82f6),
+            juce::Colour(0xff10b981), juce::Colour(0xffa855f7),
+            juce::Colour(0xfff97316), juce::Colour(0xffef4444)
+        };
+        const char* chainTooltips[] = {
+            "Stage 1: high-pass filter bypass",
+            "Stage 2: noise gate / expander bypass",
+            "Stage 3: 8-band equalizer bypass",
+            "Stage 4: de-esser bypass",
+            "Stage 5: compressor bypass",
+            "Stage 6: limiter bypass"
+        };
+        for (size_t stage = 0; stage < chainButtons.size(); ++stage)
+        {
+            auto& button = chainButtons[stage];
+            button.setClickingTogglesState(true);
+            button.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff161e2b));
+            button.setColour(juce::TextButton::buttonOnColourId, chainColours[stage]);
+            button.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffcbd5e1));
+            button.setTooltip(chainTooltips[stage]);
+            button.addListener(this);
+            addAndMakeVisible(button);
+        }
 
         // 2. Setup Noise Gate / Expander Controls
         addAndMakeVisible(gateGroup);
@@ -585,9 +613,24 @@ namespace LiveBus
         isUpdatingUI = true;
         auto& proc = getCurrentProcessor();
 
-        // Header Bypasses
-        gateMasterBtn.setToggleState(!proc.params.gateBypassed.load(std::memory_order_relaxed), juce::dontSendNotification);
-        compMasterBtn.setToggleState(!proc.params.compBypassed.load(std::memory_order_relaxed), juce::dontSendNotification);
+        const bool masterEnabled = proc.params.masterEnabled.load(std::memory_order_relaxed);
+        masterEnableBtn.setToggleState(masterEnabled, juce::dontSendNotification);
+        masterEnableBtn.setButtonText(masterEnabled ? "DSP ON" : "DSP OFF");
+        const bool stageEnabled[] = {
+            !proc.params.hpfBypassed.load(std::memory_order_relaxed),
+            !proc.params.gateBypassed.load(std::memory_order_relaxed),
+            !proc.params.eqBypassed.load(std::memory_order_relaxed),
+            !proc.params.deEsserBypassed.load(std::memory_order_relaxed),
+            !proc.params.compBypassed.load(std::memory_order_relaxed),
+            !proc.params.limiterBypassed.load(std::memory_order_relaxed)
+        };
+        const char* stageNames[] = { "HPF", "Gate", "EQ", "De-Esser", "Comp", "Limiter" };
+        for (size_t stage = 0; stage < chainButtons.size(); ++stage)
+        {
+            chainButtons[stage].setToggleState(stageEnabled[stage], juce::dontSendNotification);
+            chainButtons[stage].setButtonText(juce::String((int)stage + 1) + "  " + stageNames[stage] +
+                                              (stageEnabled[stage] ? "  ON" : "  BYP"));
+        }
 
         // Gate
         gateOpenThreshSlider.setValue(proc.params.gateOpenThresholdDb.load(std::memory_order_relaxed), juce::dontSendNotification);
@@ -775,13 +818,30 @@ namespace LiveBus
     void VocalDSPRackComponent::buttonClicked(juce::Button* b)
     {
         auto& proc = getCurrentProcessor();
-        if (b == &gateMasterBtn)
+        for (size_t stage = 0; stage < chainButtons.size(); ++stage)
         {
-            proc.params.gateBypassed.store(!gateMasterBtn.getToggleState());
+            if (b != &chainButtons[stage])
+                continue;
+
+            const bool bypass = !chainButtons[stage].getToggleState();
+            switch (stage)
+            {
+                case 0: proc.params.hpfBypassed.store(bypass, std::memory_order_relaxed); break;
+                case 1: proc.params.gateBypassed.store(bypass, std::memory_order_relaxed); break;
+                case 2: proc.params.eqBypassed.store(bypass, std::memory_order_relaxed); break;
+                case 3: proc.params.deEsserBypassed.store(bypass, std::memory_order_relaxed); break;
+                case 4: proc.params.compBypassed.store(bypass, std::memory_order_relaxed); break;
+                case 5: proc.params.limiterBypassed.store(bypass, std::memory_order_relaxed); break;
+                default: break;
+            }
+            updateUIFromProcessor();
+            return;
         }
-        else if (b == &compMasterBtn)
+
+        if (b == &masterEnableBtn)
         {
-            proc.params.compBypassed.store(!compMasterBtn.getToggleState());
+            proc.params.masterEnabled.store(masterEnableBtn.getToggleState(), std::memory_order_relaxed);
+            updateUIFromProcessor();
         }
         else if (b == &gateModeBtn)
         {
@@ -849,6 +909,8 @@ namespace LiveBus
         {
             proc.params.limiterBypassed.store(!limBypassBtn.getToggleState());
         }
+
+        updateUIFromProcessor();
     }
 
     void VocalDSPRackComponent::comboBoxChanged(juce::ComboBox* combo)
@@ -906,18 +968,23 @@ namespace LiveBus
         const int h = getHeight();
 
         // Top Header (y: 6..42)
-        gateMasterBtn.setBounds(14, 8, 90, 28);
+        masterEnableBtn.setBounds(14, 8, 90, 28);
         titleLabel.setBounds(112, 10, w - 480, 24);
         targetCombo.setBounds(w - 360, 10, 160, 24);
         presetCombo.setBounds(w - 192, 10, 96, 24);
-        compMasterBtn.setBounds(w - 90, 8, 76, 28);
 
         // Main Layout:
         // Left Column: Gate (w: 220)
         // Center Area: Visualizers & Meters (x: 236 to w - 240)
         // Right Column: Compressor (x: w - 232, w: 220)
-        const int mainTop = 44;
-        const int mainHeight = h - 220; // leaves 170px for bottom row
+        const int chainGap = 6;
+        const int chainButtonWidth = juce::jmax(72, (w - 20 - chainGap * 5) / 6);
+        for (size_t stage = 0; stage < chainButtons.size(); ++stage)
+            chainButtons[stage].setBounds(10 + (int)stage * (chainButtonWidth + chainGap),
+                                          40, chainButtonWidth, 26);
+
+        const int mainTop = 74;
+        const int mainHeight = h - 250; // preserves the bottom processing controls
 
         // Left: Noise Gate Group
         const int gateW = 216;
@@ -991,8 +1058,6 @@ namespace LiveBus
 
         // Center Area: Flanking Meters & Visualizers
         const int centerX = gateW + 16;
-        const int centerW = compX - centerX - 6;
-
         gateGrMeter->setBounds(centerX, mainTop + 6, 26, mainHeight - 12);
         gateInMeter->setBounds(centerX + 30, mainTop + 6, 26, mainHeight - 12);
 
@@ -1060,16 +1125,22 @@ namespace LiveBus
         const int outW = w - outX - 10;
         outputGroup.setBounds(outX, botY, outW, botH);
 
-        compMixSlider.setBounds(outX + 4, botY + 50, 68, 80);
-        compMixLabel.setBounds(outX + 4, botY + 132, 68, 14);
+        constexpr int outputControlWidth = 54;
+        constexpr int outputControlGap = 4;
+        const int outputControlsX = outX + 8;
+        compMixSlider.setBounds(outputControlsX, botY + 50, outputControlWidth, 80);
+        compMixLabel.setBounds(outputControlsX, botY + 132, outputControlWidth, 14);
 
-        compMakeupSlider.setBounds(outX + 74, botY + 50, 68, 80);
-        compMakeupLabel.setBounds(outX + 74, botY + 132, 68, 14);
+        const int makeupX = outputControlsX + outputControlWidth + outputControlGap;
+        compMakeupSlider.setBounds(makeupX, botY + 50, outputControlWidth, 80);
+        compMakeupLabel.setBounds(makeupX, botY + 132, outputControlWidth, 14);
 
-        outputGainSlider.setBounds(outX + 144, botY + 50, 68, 80);
-        outputGainLabel.setBounds(outX + 144, botY + 132, 68, 14);
+        const int outputGainX = makeupX + outputControlWidth + outputControlGap;
+        outputGainSlider.setBounds(outputGainX, botY + 50, outputControlWidth, 80);
+        outputGainLabel.setBounds(outputGainX, botY + 132, outputControlWidth, 14);
 
-        outMeter->setBounds(outX + outW - 40, botY + 18, 24, botH - 42);
-        clipLed.setBounds(outX + outW - 40, botY + botH - 22, 24, 16);
+        const int outputMeterX = outX + outW - 32;
+        outMeter->setBounds(outputMeterX, botY + 18, 24, botH - 42);
+        clipLed.setBounds(outputMeterX, botY + botH - 22, 24, 16);
     }
 }

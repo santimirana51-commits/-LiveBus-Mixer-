@@ -2,11 +2,14 @@
 #include <JuceHeader.h>
 #include "RoutingMatrix.h"
 #include "AudioDeviceService.h"
+#include "RoutingGraphComponent.h"
 #include <vector>
 #include <memory>
 
 namespace LiveBus
 {
+
+class SignalFlowWindow;
 
 class RoutingMatrixComponent final : public juce::Component,
                                      public juce::Button::Listener,
@@ -16,7 +19,8 @@ class RoutingMatrixComponent final : public juce::Component,
                                      private juce::Timer
 {
 public:
-    RoutingMatrixComponent(RoutingMatrix& matrixRef, AudioDeviceService* deviceService = nullptr);
+    RoutingMatrixComponent(RoutingMatrix& matrixRef, AudioDeviceService* deviceService = nullptr,
+                           std::function<bool(int)> busMutedProvider = {});
     ~RoutingMatrixComponent() override;
 
     void paint(juce::Graphics& g) override;
@@ -34,20 +38,34 @@ public:
     void refreshFromMatrix();
     void syncFromMatrix();
     void updateUIFromMatrix() { refreshFromMatrix(); }
+    void showRoutingGraph();
+    void focusRoutingGraphNode(const juce::String& typeId, int index);
     void updateAvailableHardwareInputs(int count, const juce::StringArray& inputNames);
     void updateAvailableHardwareOutputs(int count, const juce::StringArray& outputNames);
+    juce::String getRoutingGraphLayoutXml() const;
+    void setRoutingGraphLayoutXml(const juce::String& xml);
     std::function<void(int)> onChannelSelected;
+    std::function<void(juce::Component*)> onAddInputNodeRequested;
+    std::function<void(RoutingGraphPaletteAction)> onPaletteActionRequested;
+    std::function<void(int)> onDSPNodeSelected;
+    std::function<void(int)> onVSTChainSelected;
+    RoutingGraphComponent::VSTChainPluginsProvider vstChainPluginsProvider;
+    RoutingGraphComponent::MasterBusControlCallbacks masterBusControlCallbacks;
+    RoutingGraphComponent::DSPControlCallbacks dspControlCallbacks;
 
 private:
     void timerCallback() override;
     void buildMatrixRow(int ch);
     void updateInspectorForSelectedChannel();
+    void setAdvancedRoutingVisible(bool shouldBeVisible);
+    void createRoutingGraph();
     void applySelectedPreset();
     void copySelectedChannelRoutingToAll();
     void resetAllRoutingToDefaults();
 
     RoutingMatrix& matrix;
     AudioDeviceService* audioDeviceService = nullptr;
+    std::function<bool(int)> busMutedProvider;
     int selectedChannelIndex = 0;
     int numHardwareInputsAvailable = 2;
     juce::StringArray hardwareInputChannelNames;
@@ -64,6 +82,12 @@ private:
     juce::TextButton applyPresetBtn{"Apply Preset"};
     juce::TextButton resetRoutesBtn{"Reset All Routes"};
     juce::TextButton copyToAllBtn{"Copy Routing to All"};
+    juce::TextButton signalFlowBtn{"Node Graph"};
+    juce::TextButton advancedRoutingBtn{"Advanced Sends"};
+    std::unique_ptr<SignalFlowWindow> signalFlowWindow;
+    std::unique_ptr<RoutingGraphComponent> routingGraph;
+    juce::String pendingRoutingGraphLayoutXml;
+    bool advancedRoutingVisible = false;
 
     // Main Matrix Table
     juce::Viewport matrixViewport;
@@ -74,6 +98,7 @@ private:
         juce::Label chNumLabel;
         juce::TextEditor nameEditor;
         juce::ComboBox inputSourceCombo;
+        juce::ComboBox outputRouteCombo;
         juce::ComboBox stereoModeCombo;
         juce::ComboBox submixGroupCombo;
         juce::Label statusBadge;
@@ -88,6 +113,9 @@ private:
         // Direct Hardware Outputs (HW 1, HW 2, HW 3, HW 4)
         std::array<juce::ToggleButton, 4> hwEnableBtns;
         juce::Slider panSlider;
+        juce::Slider gainSlider;
+        juce::ToggleButton muteBtn{"M"};
+        juce::ToggleButton soloBtn{"S"};
         juce::TextButton inspectBtn{"Inspect"};
         float inMeterLevel = 0.0f;
     };

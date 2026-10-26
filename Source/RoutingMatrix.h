@@ -44,7 +44,7 @@ struct AuxBusState
     std::atomic<float> peakMeterR{0.0f};
 
     // Built-in DSP mode for Aux Return:
-    // 0 = Pass-through / External VST, 1 = Built-in Studio Reverb, 2 = Built-in Stereo Delay
+    // 0 = Pass-through, 1 = Built-in Studio Reverb, 2 = Built-in Stereo Delay
     std::atomic<int> fxType{0};
     std::atomic<float> fxParam1{0.5f}; // Reverb RoomSize or Delay Time (sec)
     std::atomic<float> fxParam2{0.5f}; // Reverb Damping or Delay Feedback
@@ -178,11 +178,11 @@ public:
         auxBuses[1].fxType.store(2); // 2 = Built-in Stereo Delay
         auxBuses[1].returnLevel.store(0.707f);
 
-        auxBuses[2].name = "Aux 3 (Chorus)";
+        auxBuses[2].name = "Aux 3";
         auxBuses[2].fxType.store(0);
         auxBuses[2].returnLevel.store(0.707f);
 
-        auxBuses[3].name = "Aux 4 (FX 4)";
+        auxBuses[3].name = "Aux 4";
         auxBuses[3].fxType.store(0);
         auxBuses[3].returnLevel.store(0.707f);
 
@@ -202,7 +202,10 @@ public:
         for (int a = 0; a < maxAuxBuses; ++a)
             auxBuffers[(size_t)a].setSize(2, block, false, false, true);
         for (int s = 0; s < maxSubmixBuses; ++s)
-            submixBuffers[(size_t)s].setSize(2, block, false, false, true);
+        {
+            submixStreamBuffers[(size_t)s].setSize(2, block, false, false, true);
+            submixMonitorBuffers[(size_t)s].setSize(2, block, false, false, true);
+        }
 
         juce::Reverb::Parameters rParams;
         rParams.roomSize = 0.5f;
@@ -224,6 +227,21 @@ public:
     int getNumActiveChannels() const noexcept { return activeChannels.load(std::memory_order_relaxed); }
     void setNumActiveChannels(int count) noexcept { activeChannels.store(juce::jlimit(1, maxInputs, count), std::memory_order_release); }
     void setActiveChannels(int count) noexcept { setNumActiveChannels(count); }
+    void updateMasterBusMeter(int busIndex, float peakLeft, float peakRight) noexcept
+    {
+        if (busIndex < 0 || busIndex >= numBuses)
+            return;
+        masterBusPeakL[(size_t)busIndex].store(peakLeft, std::memory_order_relaxed);
+        masterBusPeakR[(size_t)busIndex].store(peakRight, std::memory_order_relaxed);
+    }
+
+    float getMasterBusPeak(int busIndex) const noexcept
+    {
+        if (busIndex < 0 || busIndex >= numBuses)
+            return 0.0f;
+        return juce::jmax(masterBusPeakL[(size_t)busIndex].load(std::memory_order_relaxed),
+                          masterBusPeakR[(size_t)busIndex].load(std::memory_order_relaxed));
+    }
 
     bool addChannel(const juce::String& defaultName = "")
     {
@@ -257,7 +275,7 @@ public:
     const SubmixBusState& getSubmixBus(int index) const { return submixBuses[(size_t)juce::jlimit(0, maxSubmixBuses - 1, index)]; }
 
     juce::AudioBuffer<float>& getAuxBuffer(int index) { return auxBuffers[(size_t)juce::jlimit(0, maxAuxBuses - 1, index)]; }
-    juce::AudioBuffer<float>& getSubmixBuffer(int index) { return submixBuffers[(size_t)juce::jlimit(0, maxSubmixBuses - 1, index)]; }
+    juce::AudioBuffer<float>& getSubmixBuffer(int index) { return submixStreamBuffers[(size_t)juce::jlimit(0, maxSubmixBuses - 1, index)]; }
 
     // Duplicate input source detection and warning
     void updateDuplicateWarnings()
@@ -296,6 +314,8 @@ public:
 
     void validateAvailableInputs(int numAvailableHardwareInputs)
     {
+        availableHardwareInputs.store(juce::jlimit(0, maxInputs, numAvailableHardwareInputs),
+                                      std::memory_order_release);
         int count = activeChannels.load(std::memory_order_relaxed);
         for (int i = 0; i < count; ++i)
         {
@@ -311,6 +331,11 @@ public:
         }
     }
 
+    int getNumAvailableHardwareInputs() const noexcept
+    {
+        return availableHardwareInputs.load(std::memory_order_relaxed);
+    }
+
     void validateAvailableOutputs(int numAvailableHardwareOutputs) noexcept
     {
         availableHwOutputs.store(juce::jlimit(0, maxHwOutputs, numAvailableHardwareOutputs), std::memory_order_release);
@@ -324,6 +349,38 @@ public:
     bool isHardwareOutputAvailable(int hwIndex) const noexcept
     {
         return hwIndex >= 0 && hwIndex < availableHwOutputs.load(std::memory_order_relaxed);
+    }
+
+    void applyChannelRouteState(int channelIndex, bool toStream, bool toMonitor) noexcept
+    {
+        if (channelIndex < 0 || channelIndex >= maxInputs)
+            return;
+
+        auto& channel = channels[(size_t)channelIndex];
+        channel.routeEnable[0].store(toStream, std::memory_order_release);
+        channel.routeEnable[1].store(toMonitor, std::memory_order_release);
+
+        const bool directRouteSelected = toStream || toMonitor;
+        const int currentSubmix = channel.submixGroup.load(std::memory_order_relaxed);
+        if (directRouteSelected && currentSubmix >= 0)
+            channel.submixGroup.store(-1, std::memory_order_release);
+
+        if (!directRouteSelected && currentSubmix >= 0)
+        {
+            channel.routeEnable[0].store(false, std::memory_order_release);
+            channel.routeEnable[1].store(false, std::memory_order_release);
+        }
+    }
+
+    void assignChannelToSubmix(int channelIndex, int submixIndex) noexcept
+    {
+        if (channelIndex < 0 || channelIndex >= maxInputs)
+            return;
+
+        auto& channel = channels[(size_t)channelIndex];
+        channel.submixGroup.store(submixIndex, std::memory_order_release);
+        channel.routeEnable[0].store(false, std::memory_order_release);
+        channel.routeEnable[1].store(false, std::memory_order_release);
     }
 
     // Real-time audio routing and summing into Stream, Monitor, Direct Hardware Output, Aux, and Submix buffers
@@ -354,9 +411,12 @@ public:
 
         for (int s = 0; s < maxSubmixBuses; ++s)
         {
-            submixBuffers[(size_t)s].clear(0, numSamples);
-            submixBuffers[(size_t)s].clear(1, numSamples);
+            submixStreamBuffers[(size_t)s].clear(0, numSamples);
+            submixStreamBuffers[(size_t)s].clear(1, numSamples);
+            submixMonitorBuffers[(size_t)s].clear(0, numSamples);
+            submixMonitorBuffers[(size_t)s].clear(1, numSamples);
         }
+        std::array<bool, maxAuxBuses> auxHasDuckedSend{};
 
         const int maxHwOutAllowed = juce::jmin(numHwDirectOutputs, availableHwOutputs.load(std::memory_order_relaxed));
         for (int h = 0; h < maxHwOutAllowed; ++h)
@@ -367,14 +427,35 @@ public:
 
         int activeCount = activeChannels.load(std::memory_order_relaxed);
 
-        // Check if any channel is soloed
+        std::array<bool, maxSubmixBuses> submixSolo{};
+        std::array<bool, maxAuxBuses> auxSolo{};
+        std::array<bool, maxSubmixBuses> submixHasSoloChannel{};
+        std::array<bool, maxAuxBuses> auxHasSoloChannel{};
         bool anySolo = false;
+        for (int s = 0; s < maxSubmixBuses; ++s)
+        {
+            submixSolo[(size_t)s] = submixBuses[(size_t)s].solo.load(std::memory_order_relaxed);
+            anySolo = anySolo || submixSolo[(size_t)s];
+        }
+        for (int a = 0; a < maxAuxBuses; ++a)
+        {
+            auxSolo[(size_t)a] = auxBuses[(size_t)a].solo.load(std::memory_order_relaxed);
+            anySolo = anySolo || auxSolo[(size_t)a];
+        }
         for (int i = 0; i < activeCount; ++i)
         {
-            if (channels[(size_t)i].solo.load(std::memory_order_relaxed))
+            auto& channel = channels[(size_t)i];
+            if (!channel.solo.load(std::memory_order_relaxed))
+                continue;
+
+            anySolo = true;
+            const int group = channel.submixGroup.load(std::memory_order_relaxed);
+            if (group >= 0 && group < maxSubmixBuses)
+                submixHasSoloChannel[(size_t)group] = true;
+            for (int a = 0; a < maxAuxBuses; ++a)
             {
-                anySolo = true;
-                break;
+                if (channel.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed))
+                    auxHasSoloChannel[(size_t)a] = true;
             }
         }
 
@@ -388,7 +469,14 @@ public:
                 ch.peakMeter.store(0.0f, std::memory_order_relaxed);
                 continue;
             }
-            if (anySolo && !ch.solo.load(std::memory_order_relaxed))
+            const bool channelSolo = ch.solo.load(std::memory_order_relaxed);
+            const int group = ch.submixGroup.load(std::memory_order_relaxed);
+            bool feedsSoloBus = group >= 0 && group < maxSubmixBuses &&
+                                submixSolo[(size_t)group];
+            for (int a = 0; a < maxAuxBuses && !feedsSoloBus; ++a)
+                feedsSoloBus = auxSolo[(size_t)a] &&
+                    ch.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed);
+            if (anySolo && !channelSolo && !feedsSoloBus)
             {
                 ch.peakMeter.store(0.0f, std::memory_order_relaxed);
                 continue;
@@ -426,11 +514,13 @@ public:
             // 1. Aux Sends (FX Tracks)
             for (int a = 0; a < maxAuxBuses; ++a)
             {
-                if (ch.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed))
+                if ((!anySolo || channelSolo || auxSolo[(size_t)a]) &&
+                    ch.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed))
                 {
                     bool pre = ch.preFaderAuxSend[(size_t)a].load(std::memory_order_relaxed);
-                    float effectiveGain = pre ? 1.0f : (gain * duckStream);
+                    float effectiveGain = pre ? 1.0f : gain;
                     float send = ch.auxSendLevel[(size_t)a].load(std::memory_order_relaxed) * effectiveGain;
+                    auxHasDuckedSend[(size_t)a] = auxHasDuckedSend[(size_t)a] || (isDucked && send != 0.0f);
                     float sendL = panL * send;
                     float sendR = panR * send;
 
@@ -447,7 +537,8 @@ public:
             // 2. Direct Hardware Outputs Routing (HW Out 1..8)
             for (int h = 0; h < maxHwOutAllowed; ++h)
             {
-                if (ch.hwRouteEnable[(size_t)h].load(std::memory_order_relaxed))
+                if ((!anySolo || channelSolo) &&
+                    ch.hwRouteEnable[(size_t)h].load(std::memory_order_relaxed))
                 {
                     if (hwDirectOutputs != nullptr && hwDirectOutputs[h] != nullptr)
                     {
@@ -466,19 +557,29 @@ public:
             int grp = ch.submixGroup.load(std::memory_order_relaxed);
             if (grp >= 0 && grp < maxSubmixBuses)
             {
+                if (anySolo && !channelSolo && !submixSolo[(size_t)grp])
+                    continue;
                 // Route to Submix Group
-                float sendL = panL * gain * duckStream;
-                float sendR = panR * gain * duckStream;
-                float* subL = submixBuffers[(size_t)grp].getWritePointer(0);
-                float* subR = submixBuffers[(size_t)grp].getWritePointer(1);
+                float streamSendL = panL * gain * duckStream;
+                float streamSendR = panR * gain * duckStream;
+                float monitorSendL = panL * gain * duckMonitor;
+                float monitorSendR = panR * gain * duckMonitor;
+                float* subStreamL = submixStreamBuffers[(size_t)grp].getWritePointer(0);
+                float* subStreamR = submixStreamBuffers[(size_t)grp].getWritePointer(1);
+                float* subMonitorL = submixMonitorBuffers[(size_t)grp].getWritePointer(0);
+                float* subMonitorR = submixMonitorBuffers[(size_t)grp].getWritePointer(1);
                 for (int s = 0; s < numSamples; ++s)
                 {
-                    subL[s] += inData[s] * sendL;
-                    subR[s] += inData[s] * sendR;
+                    subStreamL[s] += inData[s] * streamSendL;
+                    subStreamR[s] += inData[s] * streamSendR;
+                    subMonitorL[s] += inData[s] * monitorSendL;
+                    subMonitorR[s] += inData[s] * monitorSendR;
                 }
             }
             else
             {
+                if (anySolo && !channelSolo)
+                    continue;
                 // Direct to Master Stream Bus
                 if (ch.routeEnable[0].load(std::memory_order_relaxed))
                 {
@@ -521,24 +622,30 @@ public:
         for (int s = 0; s < maxSubmixBuses; ++s)
         {
             auto& sub = submixBuses[(size_t)s];
-            if (sub.mute.load(std::memory_order_relaxed))
+            if (sub.mute.load(std::memory_order_relaxed) ||
+                (anySolo && !submixSolo[(size_t)s] && !submixHasSoloChannel[(size_t)s]))
+            {
+                sub.peakMeterL.store(0.0f, std::memory_order_relaxed);
+                sub.peakMeterR.store(0.0f, std::memory_order_relaxed);
                 continue;
+            }
 
             float subGain = sub.gain.load(std::memory_order_relaxed);
             float subPan = juce::jlimit(-1.0f, 1.0f, sub.pan.load(std::memory_order_relaxed));
             float balL = (subPan <= 0.0f) ? 1.0f : (1.0f - subPan);
             float balR = (subPan >= 0.0f) ? 1.0f : (1.0f + subPan);
 
-            float peakL = submixBuffers[(size_t)s].getMagnitude(0, 0, numSamples);
-            float peakR = submixBuffers[(size_t)s].getMagnitude(1, 0, numSamples);
+            float peakL = juce::jmax(submixStreamBuffers[(size_t)s].getMagnitude(0, 0, numSamples),
+                                     submixMonitorBuffers[(size_t)s].getMagnitude(0, 0, numSamples));
+            float peakR = juce::jmax(submixStreamBuffers[(size_t)s].getMagnitude(1, 0, numSamples),
+                                     submixMonitorBuffers[(size_t)s].getMagnitude(1, 0, numSamples));
             sub.peakMeterL.store(peakL * subGain, std::memory_order_relaxed);
             sub.peakMeterR.store(peakR * subGain, std::memory_order_relaxed);
 
-            const float* inSubL = submixBuffers[(size_t)s].getReadPointer(0);
-            const float* inSubR = submixBuffers[(size_t)s].getReadPointer(1);
-
             if (sub.routeToStream.load(std::memory_order_relaxed))
             {
+                const float* inSubL = submixStreamBuffers[(size_t)s].getReadPointer(0);
+                const float* inSubR = submixStreamBuffers[(size_t)s].getReadPointer(1);
                 float streamSend = sub.sendLevelStream.load(std::memory_order_relaxed) * subGain;
                 float gL = streamSend * balL;
                 float gR = streamSend * balR;
@@ -553,6 +660,8 @@ public:
 
             if (sub.routeToMonitor.load(std::memory_order_relaxed))
             {
+                const float* inSubL = submixMonitorBuffers[(size_t)s].getReadPointer(0);
+                const float* inSubR = submixMonitorBuffers[(size_t)s].getReadPointer(1);
                 float monSend = sub.sendLevelMonitor.load(std::memory_order_relaxed) * subGain;
                 float gL = monSend * balL;
                 float gR = monSend * balR;
@@ -608,8 +717,13 @@ public:
         for (int a = 0; a < maxAuxBuses; ++a)
         {
             auto& aux = auxBuses[(size_t)a];
-            if (aux.mute.load(std::memory_order_relaxed))
+            if (aux.mute.load(std::memory_order_relaxed) ||
+                (anySolo && !auxSolo[(size_t)a] && !auxHasSoloChannel[(size_t)a]))
+            {
+                aux.peakMeterL.store(0.0f, std::memory_order_relaxed);
+                aux.peakMeterR.store(0.0f, std::memory_order_relaxed);
                 continue;
+            }
 
             float retLevel = aux.returnLevel.load(std::memory_order_relaxed);
             float auxPan = juce::jlimit(-1.0f, 1.0f, aux.pan.load(std::memory_order_relaxed));
@@ -626,7 +740,8 @@ public:
 
             if (aux.sendToStream.load(std::memory_order_relaxed))
             {
-                float streamSend = aux.sendLevelStream.load(std::memory_order_relaxed) * retLevel;
+                float streamDuck = auxHasDuckedSend[(size_t)a] ? duckingMultStream : 1.0f;
+                float streamSend = aux.sendLevelStream.load(std::memory_order_relaxed) * retLevel * streamDuck;
                 float gL = streamSend * balL;
                 float gR = streamSend * balR;
                 float* sL = streamBuf.getWritePointer(0);
@@ -640,7 +755,8 @@ public:
 
             if (aux.sendToMonitor.load(std::memory_order_relaxed))
             {
-                float monSend = aux.sendLevelMonitor.load(std::memory_order_relaxed) * retLevel;
+                float monitorDuck = auxHasDuckedSend[(size_t)a] ? duckingMultMonitor : 1.0f;
+                float monSend = aux.sendLevelMonitor.load(std::memory_order_relaxed) * retLevel * monitorDuck;
                 float gL = monSend * balL;
                 float gR = monSend * balR;
                 float* mL = monitorBuf.getWritePointer(0);
@@ -681,9 +797,12 @@ public:
 
         for (int s = 0; s < maxSubmixBuses; ++s)
         {
-            submixBuffers[(size_t)s].clear(0, numSamples);
-            submixBuffers[(size_t)s].clear(1, numSamples);
+            submixStreamBuffers[(size_t)s].clear(0, numSamples);
+            submixStreamBuffers[(size_t)s].clear(1, numSamples);
+            submixMonitorBuffers[(size_t)s].clear(0, numSamples);
+            submixMonitorBuffers[(size_t)s].clear(1, numSamples);
         }
+        std::array<bool, maxAuxBuses> auxHasDuckedSend{};
 
         const int maxHwOutAllowed = juce::jmin(numHwDirectOutputs, availableHwOutputs.load(std::memory_order_relaxed));
         for (int h = 0; h < maxHwOutAllowed; ++h)
@@ -694,14 +813,35 @@ public:
 
         int activeCount = activeChannels.load(std::memory_order_relaxed);
 
-        // Check if any channel is soloed
+        std::array<bool, maxSubmixBuses> submixSolo{};
+        std::array<bool, maxAuxBuses> auxSolo{};
+        std::array<bool, maxSubmixBuses> submixHasSoloChannel{};
+        std::array<bool, maxAuxBuses> auxHasSoloChannel{};
         bool anySolo = false;
+        for (int s = 0; s < maxSubmixBuses; ++s)
+        {
+            submixSolo[(size_t)s] = submixBuses[(size_t)s].solo.load(std::memory_order_relaxed);
+            anySolo = anySolo || submixSolo[(size_t)s];
+        }
+        for (int a = 0; a < maxAuxBuses; ++a)
+        {
+            auxSolo[(size_t)a] = auxBuses[(size_t)a].solo.load(std::memory_order_relaxed);
+            anySolo = anySolo || auxSolo[(size_t)a];
+        }
         for (int i = 0; i < activeCount; ++i)
         {
-            if (channels[(size_t)i].solo.load(std::memory_order_relaxed))
+            auto& channel = channels[(size_t)i];
+            if (!channel.solo.load(std::memory_order_relaxed))
+                continue;
+
+            anySolo = true;
+            const int group = channel.submixGroup.load(std::memory_order_relaxed);
+            if (group >= 0 && group < maxSubmixBuses)
+                submixHasSoloChannel[(size_t)group] = true;
+            for (int a = 0; a < maxAuxBuses; ++a)
             {
-                anySolo = true;
-                break;
+                if (channel.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed))
+                    auxHasSoloChannel[(size_t)a] = true;
             }
         }
 
@@ -715,7 +855,14 @@ public:
                 ch.peakMeter.store(0.0f, std::memory_order_relaxed);
                 continue;
             }
-            if (anySolo && !ch.solo.load(std::memory_order_relaxed))
+            const bool channelSolo = ch.solo.load(std::memory_order_relaxed);
+            const int group = ch.submixGroup.load(std::memory_order_relaxed);
+            bool feedsSoloBus = group >= 0 && group < maxSubmixBuses &&
+                                submixSolo[(size_t)group];
+            for (int a = 0; a < maxAuxBuses && !feedsSoloBus; ++a)
+                feedsSoloBus = auxSolo[(size_t)a] &&
+                    ch.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed);
+            if (anySolo && !channelSolo && !feedsSoloBus)
             {
                 ch.peakMeter.store(0.0f, std::memory_order_relaxed);
                 continue;
@@ -761,11 +908,13 @@ public:
             // 1. Aux Sends (FX Tracks)
             for (int a = 0; a < maxAuxBuses; ++a)
             {
-                if (ch.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed))
+                if ((!anySolo || channelSolo || auxSolo[(size_t)a]) &&
+                    ch.auxRouteEnable[(size_t)a].load(std::memory_order_relaxed))
                 {
                     bool pre = ch.preFaderAuxSend[(size_t)a].load(std::memory_order_relaxed);
-                    float effectiveGain = pre ? 1.0f : (gain * duckStream);
+                    float effectiveGain = pre ? 1.0f : gain;
                     float send = ch.auxSendLevel[(size_t)a].load(std::memory_order_relaxed) * effectiveGain;
+                    auxHasDuckedSend[(size_t)a] = auxHasDuckedSend[(size_t)a] || (isDucked && send != 0.0f);
                     float* aL = auxBuffers[(size_t)a].getWritePointer(0);
                     float* aR = auxBuffers[(size_t)a].getWritePointer(1);
 
@@ -795,7 +944,8 @@ public:
             // 2. Direct Hardware Outputs Routing (HW Out 1..8)
             for (int h = 0; h < maxHwOutAllowed; ++h)
             {
-                if (ch.hwRouteEnable[(size_t)h].load(std::memory_order_relaxed))
+                if ((!anySolo || channelSolo) &&
+                    ch.hwRouteEnable[(size_t)h].load(std::memory_order_relaxed))
                 {
                     if (hwDirectOutputs != nullptr && hwDirectOutputs[h] != nullptr)
                     {
@@ -823,33 +973,48 @@ public:
             int grp = ch.submixGroup.load(std::memory_order_relaxed);
             if (grp >= 0 && grp < maxSubmixBuses)
             {
-                float* subL = submixBuffers[(size_t)grp].getWritePointer(0);
-                float* subR = submixBuffers[(size_t)grp].getWritePointer(1);
-                float effGain = gain * duckStream;
+                if (anySolo && !channelSolo && !submixSolo[(size_t)grp])
+                    continue;
+                float* subStreamL = submixStreamBuffers[(size_t)grp].getWritePointer(0);
+                float* subStreamR = submixStreamBuffers[(size_t)grp].getWritePointer(1);
+                float* subMonitorL = submixMonitorBuffers[(size_t)grp].getWritePointer(0);
+                float* subMonitorR = submixMonitorBuffers[(size_t)grp].getWritePointer(1);
+                float streamEffGain = gain * duckStream;
+                float monitorEffGain = gain * duckMonitor;
 
                 if (mode == ChannelStereoMode::StereoPair)
                 {
-                    float gL = effGain * balL;
-                    float gR = effGain * balR;
+                    float streamGL = streamEffGain * balL;
+                    float streamGR = streamEffGain * balR;
+                    float monitorGL = monitorEffGain * balL;
+                    float monitorGR = monitorEffGain * balR;
                     for (int s = 0; s < numSamples; ++s)
                     {
-                        subL[s] += inL[s] * gL;
-                        subR[s] += inR[s] * gR;
+                        subStreamL[s] += inL[s] * streamGL;
+                        subStreamR[s] += inR[s] * streamGR;
+                        subMonitorL[s] += inL[s] * monitorGL;
+                        subMonitorR[s] += inR[s] * monitorGR;
                     }
                 }
                 else
                 {
-                    float gL = effGain * balL;
-                    float gR = effGain * balR;
+                    float streamGL = streamEffGain * balL;
+                    float streamGR = streamEffGain * balR;
+                    float monitorGL = monitorEffGain * balL;
+                    float monitorGR = monitorEffGain * balR;
                     for (int s = 0; s < numSamples; ++s)
                     {
-                        subL[s] += inL[s] * gL;
-                        subR[s] += inL[s] * gR;
+                        subStreamL[s] += inL[s] * streamGL;
+                        subStreamR[s] += inL[s] * streamGR;
+                        subMonitorL[s] += inL[s] * monitorGL;
+                        subMonitorR[s] += inL[s] * monitorGR;
                     }
                 }
             }
             else
             {
+                if (anySolo && !channelSolo)
+                    continue;
                 // Direct to Stream send
                 if (ch.routeEnable[0].load(std::memory_order_relaxed))
                 {
@@ -920,24 +1085,30 @@ public:
         for (int s = 0; s < maxSubmixBuses; ++s)
         {
             auto& sub = submixBuses[(size_t)s];
-            if (sub.mute.load(std::memory_order_relaxed))
+            if (sub.mute.load(std::memory_order_relaxed) ||
+                (anySolo && !submixSolo[(size_t)s] && !submixHasSoloChannel[(size_t)s]))
+            {
+                sub.peakMeterL.store(0.0f, std::memory_order_relaxed);
+                sub.peakMeterR.store(0.0f, std::memory_order_relaxed);
                 continue;
+            }
 
             float subGain = sub.gain.load(std::memory_order_relaxed);
             float subPan = juce::jlimit(-1.0f, 1.0f, sub.pan.load(std::memory_order_relaxed));
             float balL = (subPan <= 0.0f) ? 1.0f : (1.0f - subPan);
             float balR = (subPan >= 0.0f) ? 1.0f : (1.0f + subPan);
 
-            float peakL = submixBuffers[(size_t)s].getMagnitude(0, 0, numSamples);
-            float peakR = submixBuffers[(size_t)s].getMagnitude(1, 0, numSamples);
+            float peakL = juce::jmax(submixStreamBuffers[(size_t)s].getMagnitude(0, 0, numSamples),
+                                     submixMonitorBuffers[(size_t)s].getMagnitude(0, 0, numSamples));
+            float peakR = juce::jmax(submixStreamBuffers[(size_t)s].getMagnitude(1, 0, numSamples),
+                                     submixMonitorBuffers[(size_t)s].getMagnitude(1, 0, numSamples));
             sub.peakMeterL.store(peakL * subGain, std::memory_order_relaxed);
             sub.peakMeterR.store(peakR * subGain, std::memory_order_relaxed);
 
-            const float* inSubL = submixBuffers[(size_t)s].getReadPointer(0);
-            const float* inSubR = submixBuffers[(size_t)s].getReadPointer(1);
-
             if (sub.routeToStream.load(std::memory_order_relaxed))
             {
+                const float* inSubL = submixStreamBuffers[(size_t)s].getReadPointer(0);
+                const float* inSubR = submixStreamBuffers[(size_t)s].getReadPointer(1);
                 float streamSend = sub.sendLevelStream.load(std::memory_order_relaxed) * subGain;
                 float gL = streamSend * balL;
                 float gR = streamSend * balR;
@@ -952,6 +1123,8 @@ public:
 
             if (sub.routeToMonitor.load(std::memory_order_relaxed))
             {
+                const float* inSubL = submixMonitorBuffers[(size_t)s].getReadPointer(0);
+                const float* inSubR = submixMonitorBuffers[(size_t)s].getReadPointer(1);
                 float monSend = sub.sendLevelMonitor.load(std::memory_order_relaxed) * subGain;
                 float gL = monSend * balL;
                 float gR = monSend * balR;
@@ -1004,8 +1177,13 @@ public:
         for (int a = 0; a < maxAuxBuses; ++a)
         {
             auto& aux = auxBuses[(size_t)a];
-            if (aux.mute.load(std::memory_order_relaxed))
+            if (aux.mute.load(std::memory_order_relaxed) ||
+                (anySolo && !auxSolo[(size_t)a] && !auxHasSoloChannel[(size_t)a]))
+            {
+                aux.peakMeterL.store(0.0f, std::memory_order_relaxed);
+                aux.peakMeterR.store(0.0f, std::memory_order_relaxed);
                 continue;
+            }
 
             float retLevel = aux.returnLevel.load(std::memory_order_relaxed);
             float auxPan = juce::jlimit(-1.0f, 1.0f, aux.pan.load(std::memory_order_relaxed));
@@ -1022,7 +1200,8 @@ public:
 
             if (aux.sendToStream.load(std::memory_order_relaxed))
             {
-                float streamSend = aux.sendLevelStream.load(std::memory_order_relaxed) * retLevel;
+                float streamDuck = auxHasDuckedSend[(size_t)a] ? duckingMultStream : 1.0f;
+                float streamSend = aux.sendLevelStream.load(std::memory_order_relaxed) * retLevel * streamDuck;
                 float gL = streamSend * balL;
                 float gR = streamSend * balR;
                 float* sL = streamBuf.getWritePointer(0);
@@ -1036,7 +1215,8 @@ public:
 
             if (aux.sendToMonitor.load(std::memory_order_relaxed))
             {
-                float monSend = aux.sendLevelMonitor.load(std::memory_order_relaxed) * retLevel;
+                float monitorDuck = auxHasDuckedSend[(size_t)a] ? duckingMultMonitor : 1.0f;
+                float monSend = aux.sendLevelMonitor.load(std::memory_order_relaxed) * retLevel * monitorDuck;
                 float gL = monSend * balL;
                 float gR = monSend * balR;
                 float* mL = monitorBuf.getWritePointer(0);
@@ -1331,14 +1511,18 @@ public:
 
 private:
     std::atomic<int> activeChannels{defaultNumInputs};
+    std::atomic<int> availableHardwareInputs{2};
     std::atomic<int> availableHwOutputs{2}; // Default to 2 outputs until hardware device is validated
     std::array<InputChannelState, numInputs> channels;
 
     // Aux FX & Submix Engine
     std::array<AuxBusState, maxAuxBuses> auxBuses;
     std::array<SubmixBusState, maxSubmixBuses> submixBuses;
+    std::array<std::atomic<float>, numBuses> masterBusPeakL{{ 0.0f, 0.0f }};
+    std::array<std::atomic<float>, numBuses> masterBusPeakR{{ 0.0f, 0.0f }};
     std::array<juce::AudioBuffer<float>, maxAuxBuses> auxBuffers;
-    std::array<juce::AudioBuffer<float>, maxSubmixBuses> submixBuffers;
+    std::array<juce::AudioBuffer<float>, maxSubmixBuses> submixStreamBuffers;
+    std::array<juce::AudioBuffer<float>, maxSubmixBuses> submixMonitorBuffers;
     juce::Reverb builtInReverb;
     std::vector<float> delayBufferL;
     std::vector<float> delayBufferR;
@@ -1352,4 +1536,4 @@ namespace LiveBus
     using ChannelStereoMode = ::ChannelStereoMode;
     using InputChannelState = ::InputChannelState;
     using RoutingMatrix = ::RoutingMatrix;
-    }
+}

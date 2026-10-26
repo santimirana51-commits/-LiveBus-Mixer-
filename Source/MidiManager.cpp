@@ -658,9 +658,36 @@ bool MidiManager::importPreset(const juce::File& srcFile)
     auto xml = juce::XmlDocument::parse(srcFile);
     if (xml == nullptr || !xml->hasTagName("LiveBusMidiMappingPreset")) return false;
 
-    auto name = xml->getStringAttribute("name", srcFile.getFileNameWithoutExtension());
-    auto destFile = getPresetsDirectory().getChildFile(name + ".xml");
-    srcFile.copyFileTo(destFile);
+    auto name = xml->getStringAttribute("name", srcFile.getFileNameWithoutExtension()).trim();
+    if (name.isEmpty() || name.length() > 80)
+        return false;
+
+    for (int i = 0; i < name.length(); ++i)
+    {
+        const auto c = name[i];
+        const bool isAsciiLetter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool isDigit = c >= '0' && c <= '9';
+        if (!isAsciiLetter && !isDigit && c != ' ' && c != '-' && c != '_' && c != '(' && c != ')')
+            return false;
+    }
+
+    const auto reservedName = name.toUpperCase();
+    const bool isNumberedDeviceName = reservedName.length() == 4 &&
+        (reservedName.startsWith("COM") || reservedName.startsWith("LPT")) &&
+        reservedName[3] >= '1' && reservedName[3] <= '9';
+    if (reservedName == "CON" || reservedName == "PRN" || reservedName == "AUX" || reservedName == "NUL" ||
+        isNumberedDeviceName)
+        return false;
+
+    auto presetsDirectory = getPresetsDirectory();
+    auto destFile = presetsDirectory.getChildFile(name + ".xml");
+    if (!destFile.getParentDirectory().getFullPathName().equalsIgnoreCase(presetsDirectory.getFullPathName()))
+        return false;
+
+    xml->setAttribute("name", name);
+    xml->setAttribute("isFactory", false);
+    if (!xml->writeTo(destFile))
+        return false;
 
     return loadPreset(name);
 }

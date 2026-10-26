@@ -75,8 +75,14 @@ public:
     bool selectTrack(int index);
     bool nextTrack();
     bool prevTrack();
-    void setAutoNextTrack(bool autoNext) { autoNextTrackActive.store(autoNext, std::memory_order_relaxed); }
+    void setAutoNextTrack(bool autoNext)
+    {
+        autoNextTrackActive.store(autoNext, std::memory_order_relaxed);
+        if (!autoNext)
+            autoNextPending.store(false, std::memory_order_relaxed);
+    }
     bool isAutoNextTrack() const { return autoNextTrackActive.load(std::memory_order_relaxed); }
+    bool consumeAutoNextRequest() noexcept { return autoNextPending.exchange(false, std::memory_order_relaxed); }
     bool savePlaylistXml(const juce::File& destFile);
     bool loadPlaylistXml(const juce::File& srcFile);
 
@@ -100,7 +106,7 @@ public:
     void importState(const PlaybackState& state);
 
 private:
-    void triggerAutoNextAsync();
+    void requestAutoNext() noexcept { autoNextPending.store(true, std::memory_order_relaxed); }
 
     juce::AudioFormatManager formatManager;
     juce::TimeSliceThread thread{"BGM Player Thread"};
@@ -124,6 +130,7 @@ private:
     std::atomic<double> loopEnd{10.0};
     std::atomic<float> speedRatio{1.0f};
     std::atomic<bool> autoNextTrackActive{true};
+    std::atomic<bool> autoNextPending{false};
 
     // Anti-click fade on play/pause/loop
     float currentGainRamp{0.0f};
@@ -145,7 +152,7 @@ private:
     int currentBlockSize{512};
     double fileSampleRate{44100.0};
     int fileChannels{2};
-    double fileDuration{0.0};
+    std::atomic<double> fileDuration{0.0};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioFilePlayer)
 };

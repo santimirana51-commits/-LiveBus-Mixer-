@@ -6,6 +6,7 @@ namespace LiveBus
 AudioFilePlayer::AudioFilePlayer()
 {
     formatManager.registerBasicFormats();
+    resamplingSource = std::make_unique<juce::ResamplingAudioSource>(&transportSource, false, 2);
     thread.startThread(juce::Thread::Priority::normal);
 }
 
@@ -48,12 +49,12 @@ bool AudioFilePlayer::loadFile(const juce::File& file)
 
     transportSource.stop();
     transportSource.setSource(nullptr);
-    resamplingSource.reset();
     readerSource.reset();
 
     fileSampleRate = reader->sampleRate;
     fileChannels = (int)reader->numChannels;
-    fileDuration = (double)reader->lengthInSamples / fileSampleRate;
+    const double duration = (double)reader->lengthInSamples / fileSampleRate;
+    fileDuration.store(duration, std::memory_order_relaxed);
 
     // Generate waveform peak cache
     waveformCache.generatePeaks(*reader);
@@ -63,15 +64,12 @@ bool AudioFilePlayer::loadFile(const juce::File& file)
     transportSource.setSource(readerSource.get(), 65536, &thread, reader->sampleRate);
     transportSource.setGain(playbackGain.load(std::memory_order_relaxed));
 
-    // Build Resampling source for speed control wrapping transportSource
-    resamplingSource = std::make_unique<juce::ResamplingAudioSource>(&transportSource, false, 2);
-    resamplingSource->prepareToPlay(currentBlockSize, currentDeviceSampleRate);
     float speed = speedRatio.load(std::memory_order_relaxed);
     resamplingSource->setResamplingRatio((double)juce::jmax(0.1f, speed));
 
     currentFile = file;
     loopStart.store(0.0, std::memory_order_relaxed);
-    loopEnd.store(fileDuration, std::memory_order_relaxed);
+    loopEnd.store(duration, std::memory_order_relaxed);
     hasFileLoaded.store(true, std::memory_order_relaxed);
 
     sendChangeMessage();
@@ -85,7 +83,8 @@ juce::String AudioFilePlayer::getLoadedFileName() const
 
 double AudioFilePlayer::getLengthInSeconds() const
 {
-    return fileDuration > 0.0 ? fileDuration : transportSource.getLengthInSeconds();
+    const double length = fileDuration.load(std::memory_order_relaxed);
+    return length > 0.0 ? length : transportSource.getLengthInSeconds();
 }
 
 double AudioFilePlayer::getCurrentPosition() const
@@ -377,13 +376,6 @@ bool AudioFilePlayer::loadPlaylistXml(const juce::File& srcFile)
     return true;
 }
 
-void AudioFilePlayer::triggerAutoNextAsync()
-{
-    juce::MessageManager::callAsync([this]() {
-        nextTrack();
-    });
-}
-
 void AudioFilePlayer::renderBlock(juce::AudioBuffer<float>& destBuffer, int numSamples)
 {
     if (!transportSource.isPlaying() || numSamples <= 0)
@@ -426,7 +418,7 @@ void AudioFilePlayer::renderBlock(juce::AudioBuffer<float>& destBuffer, int numS
         if (totalLen > 0.0 && curPos >= totalLen - 0.05)
         {
             if (autoNextTrackActive.load(std::memory_order_relaxed))
-                triggerAutoNextAsync();
+                requestAutoNext();
         }
     }
 
@@ -500,7 +492,7 @@ void AudioFilePlayer::processMix(juce::AudioBuffer<float>& streamBuf,
         {
             if (autoNextTrackActive.load(std::memory_order_relaxed))
             {
-                triggerAutoNextAsync();
+                requestAutoNext();
             }
         }
     }

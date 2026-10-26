@@ -142,6 +142,12 @@ float OBSChannelStrip::getGainDb() const
     return (float)fader.getValue();
 }
 
+void OBSChannelStrip::setChannelName(const juce::String& name)
+{
+    channelName = name;
+    nameLabel.setText(name + " ▼", juce::dontSendNotification);
+}
+
 void OBSChannelStrip::drawOBSMeter(juce::Graphics& g, juce::Rectangle<int> bounds, float peakVal, float peakHoldVal)
 {
     // Meter track background
@@ -288,9 +294,9 @@ OBSMixerComponent::OBSMixerComponent(OBSIntegrationService& service,
     addAndMakeVisible(titleLabel);
 
     statusPill.setFont(juce::FontOptions(11.0f, juce::Font::bold));
-    statusPill.setColour(juce::Label::backgroundColourId, juce::Colour(0x2210b981));
-    statusPill.setColour(juce::Label::textColourId, juce::Colour(0xff10b981));
-    statusPill.setText("● VIRTUAL CABLE ROUTING: READY", juce::dontSendNotification);
+    statusPill.setColour(juce::Label::backgroundColourId, juce::Colour(0x22f59e0b));
+    statusPill.setColour(juce::Label::textColourId, juce::Colour(0xfff59e0b));
+    statusPill.setText("[LIVEBUS DRIVER] External virtual cable required; native LiveBus driver not installed.", juce::dontSendNotification);
     addAndMakeVisible(statusPill);
 
     // Stream Output Device Combo
@@ -302,14 +308,46 @@ OBSMixerComponent::OBSMixerComponent(OBSIntegrationService& service,
     streamDeviceCombo.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff2a3447));
     streamDeviceCombo.setColour(juce::ComboBox::textColourId, juce::Colour(0xfff1f5f9));
     streamDeviceCombo.onChange = [this]() {
-        juce::String selectedDev = streamDeviceCombo.getText();
-        if (selectedDev.isNotEmpty())
+        if (updatingOutputDevices)
+            return;
+
+        const int selectedId = streamDeviceCombo.getSelectedId();
+        if (selectedId == 1)
         {
-            obsService.openSecondaryVirtualDevice(selectedDev);
+            obsService.closeSecondaryDevice();
+            obsService.setRoutingMode(OBSRoutingMode::DedicatedSecondaryDevice);
             updateUIFromState();
+            return;
         }
+
+        const int deviceIndex = selectedId - 2;
+        if (!juce::isPositiveAndBelow(deviceIndex, outputDeviceNames.size()))
+            return;
+
+        const auto error = obsService.openSecondaryOutputDevice(outputDeviceNames[deviceIndex]);
+        if (error.isEmpty())
+            obsService.setRoutingMode(OBSRoutingMode::DedicatedSecondaryDevice);
+        updateUIFromState();
     };
     addAndMakeVisible(streamDeviceCombo);
+
+    endpointBusCombo.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff12161f));
+    endpointBusCombo.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff2a3447));
+    endpointBusCombo.setColour(juce::ComboBox::textColourId, juce::Colour(0xfff1f5f9));
+    endpointBusCombo.addItem("Stream Bus", 1);
+    endpointBusCombo.addItem("Monitor Bus", 2);
+    endpointBusCombo.addItem("Stream + Monitor", 3);
+    endpointBusCombo.setSelectedId(1, juce::dontSendNotification);
+    endpointBusCombo.setTooltip("Choose the bus sent to the selected Windows output endpoint");
+    endpointBusCombo.onChange = [this]() {
+        switch (endpointBusCombo.getSelectedId())
+        {
+            case 2: obsService.setSecondaryOutputBus(SecondaryOutputBus::Monitor); break;
+            case 3: obsService.setSecondaryOutputBus(SecondaryOutputBus::StreamAndMonitor); break;
+            default: obsService.setSecondaryOutputBus(SecondaryOutputBus::Stream); break;
+        }
+    };
+    addAndMakeVisible(endpointBusCombo);
 
     // Routing Mode Combo
     routingModeLabel.setFont(juce::FontOptions(12.0f, juce::Font::bold));
@@ -320,13 +358,15 @@ OBSMixerComponent::OBSMixerComponent(OBSIntegrationService& service,
     routingModeCombo.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff2a3447));
     routingModeCombo.setColour(juce::ComboBox::textColourId, juce::Colour(0xfff1f5f9));
     routingModeCombo.addItem("Primary Multi-Channel (Ch 1-2 Stream, Ch 3-4 Monitor)", 1);
-    routingModeCombo.addItem("Dedicated Virtual Device (Stream to Virtual Cable, Monitor on Headphones)", 2);
+    routingModeCombo.addItem("Dedicated Endpoint (Stream to Endpoint, Monitor on Primary)", 2);
     routingModeCombo.addItem("Primary Stream Only (Entire device to OBS)", 3);
     routingModeCombo.addItem("Combined Audition (Stream + Monitor mix)", 4);
-    routingModeCombo.setSelectedId(2, juce::dontSendNotification);
+    routingModeCombo.setSelectedId((int)obsService.getRoutingMode() + 1,
+                                   juce::dontSendNotification);
     routingModeCombo.onChange = [this]() {
         int id = routingModeCombo.getSelectedId();
-        obsService.setRoutingMode(static_cast<OBSRoutingMode>(id - 1));
+        if (id >= 1 && id <= 4)
+            obsService.setRoutingMode(static_cast<OBSRoutingMode>(id - 1));
         updateUIFromState();
     };
     addAndMakeVisible(routingModeCombo);
@@ -345,7 +385,7 @@ OBSMixerComponent::OBSMixerComponent(OBSIntegrationService& service,
     testSignalBtn.onClick = [this]() {
         bool on = testSignalBtn.getToggleState();
         obsService.setTestSignalEnabled(on);
-        testSignalBtn.setButtonText(on ? "Stop Test Tone" : "Send Test Tone to OBS");
+        testSignalBtn.setButtonText(on ? "Stop Test Tone" : "Test Endpoint Output");
     };
     addAndMakeVisible(testSignalBtn);
 
@@ -425,7 +465,7 @@ OBSMixerComponent::OBSMixerComponent(OBSIntegrationService& service,
     };
     addAndMakeVisible(musicStrip.get());
 
-    monitorStrip = std::make_unique<OBSChannelStrip>("Monitor Bus (Phones)", "Inactive", juce::Colour(0xff64748b));
+    monitorStrip = std::make_unique<OBSChannelStrip>("Monitor Bus (Phones)", "BUS", juce::Colour(0xff06b6d4));
     monitorStrip->fader.setLookAndFeel(&obsLookAndFeel);
     monitorStrip->onGainChanged = [this](float g) {
         if (onBusGainChanged) onBusGainChanged(1, g);
@@ -434,6 +474,20 @@ OBSMixerComponent::OBSMixerComponent(OBSIntegrationService& service,
         if (onBusMuteChanged) onBusMuteChanged(1, m);
     };
     addAndMakeVisible(monitorStrip.get());
+
+    endpointOutputStrip = std::make_unique<OBSChannelStrip>("Endpoint Output", "Inactive",
+                                                             juce::Colour(0xffa855f7));
+    endpointOutputStrip->fader.setLookAndFeel(&obsLookAndFeel);
+    endpointOutputStrip->onGainChanged = [this](float gain) {
+        obsService.setSecondaryOutputGain(gain);
+    };
+    endpointOutputStrip->onMuteToggled = [this](bool muted) {
+        obsService.setSecondaryOutputMuted(muted);
+    };
+    endpointOutputStrip->monitorBtn.setVisible(false);
+    endpointOutputStrip->gearBtn.setVisible(false);
+    endpointOutputStrip->setGainDb(0.0f);
+    addAndMakeVisible(endpointOutputStrip.get());
 
     // WebSocket Dialog Controls
     wsHostEditor.setText("127.0.0.1");
@@ -499,42 +553,43 @@ OBSMixerComponent::~OBSMixerComponent()
     guitarStrip->fader.setLookAndFeel(nullptr);
     musicStrip->fader.setLookAndFeel(nullptr);
     monitorStrip->fader.setLookAndFeel(nullptr);
+    endpointOutputStrip->fader.setLookAndFeel(nullptr);
 }
 
 void OBSMixerComponent::refreshDevices()
 {
+    updatingOutputDevices = true;
     streamDeviceCombo.clear(juce::dontSendNotification);
+    outputDeviceNames.clear();
 
     auto allDevices = obsService.scanAvailableOutputDevices();
-    int id = 1;
-    int virtualIdToSelect = 0;
+    streamDeviceCombo.addItem("Select output endpoint...", 1);
+    int selectedId = 1;
+    const auto activeDeviceName = obsService.isSecondaryDeviceActive()
+                                      ? obsService.getSecondaryDeviceName()
+                                      : juce::String();
 
     for (const auto& dev : allDevices)
     {
         juce::String label = dev.name;
         if (dev.isVirtual)
-        {
             label += " [" + dev.virtualDriverType + "]";
-            if (virtualIdToSelect == 0)
-                virtualIdToSelect = id;
-        }
-        streamDeviceCombo.addItem(label, id++);
+        const int itemId = outputDeviceNames.size() + 2;
+        outputDeviceNames.add(dev.name);
+        streamDeviceCombo.addItem(label, itemId);
+        if (dev.name == activeDeviceName)
+            selectedId = itemId;
     }
 
-    if (virtualIdToSelect != 0)
-    {
-        streamDeviceCombo.setSelectedId(virtualIdToSelect, juce::sendNotification);
-    }
-    else if (streamDeviceCombo.getNumItems() > 0)
-    {
-        streamDeviceCombo.setSelectedId(1, juce::sendNotification);
-    }
-
+    streamDeviceCombo.setSelectedId(selectedId, juce::dontSendNotification);
+    updatingOutputDevices = false;
     updateUIFromState();
 }
 
 void OBSMixerComponent::updateUIFromState()
 {
+    routingModeCombo.setSelectedId((int)obsService.getRoutingMode() + 1, juce::dontSendNotification);
+
     if (obsService.isDeviceError())
     {
         statusPill.setText("[!] " + obsService.getErrorMessage(), juce::dontSendNotification);
@@ -543,9 +598,16 @@ void OBSMixerComponent::updateUIFromState()
     }
     else if (obsService.isSecondaryDeviceActive())
     {
-        statusPill.setText("[STREAMING] " + obsService.getSecondaryDeviceName(), juce::dontSendNotification);
+        statusPill.setText("[OUTPUT ACTIVE] " + obsService.getSecondaryDeviceName(), juce::dontSendNotification);
         statusPill.setColour(juce::Label::backgroundColourId, juce::Colour(0x2210b981));
         statusPill.setColour(juce::Label::textColourId, juce::Colour(0xff10b981));
+    }
+    else if (!obsService.hasNativeVirtualAudioDriver())
+    {
+        const auto summary = obsService.getDriverReadinessSummary();
+        statusPill.setText("[LIVEBUS DRIVER] " + summary, juce::dontSendNotification);
+        statusPill.setColour(juce::Label::backgroundColourId, juce::Colour(0x22f59e0b));
+        statusPill.setColour(juce::Label::textColourId, juce::Colour(0xfff59e0b));
     }
     else
     {
@@ -554,6 +616,17 @@ void OBSMixerComponent::updateUIFromState()
         statusPill.setColour(juce::Label::textColourId, juce::Colour(0xff0284c7));
     }
 
+    if (endpointOutputStrip != nullptr)
+    {
+        endpointOutputStrip->setChannelName(obsService.isSecondaryDeviceActive()
+                                                ? obsService.getSecondaryDeviceName()
+                                                : "Endpoint Output");
+        endpointOutputStrip->setGainDb(obsService.getSecondaryOutputGain() > 0.0f
+            ? juce::Decibels::gainToDecibels(obsService.getSecondaryOutputGain(), -60.0f)
+            : -60.0f);
+        endpointOutputStrip->muteBtn.setToggleState(obsService.isSecondaryOutputMuted(),
+                                                     juce::dontSendNotification);
+    }
     updateAudioSpecsLabel();
 }
 
@@ -561,11 +634,9 @@ void OBSMixerComponent::updateAudioSpecsLabel()
 {
     double sr = obsService.getSecondarySampleRate();
     int bs = obsService.getSecondaryBufferSize();
-    float durMs = OBSIntegrationService::isVirtualAudioDevice(obsService.getSecondaryDeviceName())
-                      ? AudioDeviceService::calculateBufferDurationMs(bs, sr)
-                      : 0.0f;
+    float durMs = AudioDeviceService::calculateBufferDurationMs(bs, sr);
 
-    audioSpecsPill.setText("Stream Clock: " + juce::String(sr * 0.001, 1) + " kHz | Buffer: " +
+    audioSpecsPill.setText("Endpoint Clock: " + juce::String(sr * 0.001, 1) + " kHz | Buffer: " +
                            juce::String(bs) + " samples (~" + juce::String(durMs, 1) + " ms single buffer)",
                            juce::dontSendNotification);
 }
@@ -600,6 +671,9 @@ void OBSMixerComponent::timerCallback()
         musicStrip->setLevelMeter(ch2Snap.peakL, ch3Snap.peakR,
                                  ch2Snap.rmsL, ch3Snap.rmsR);
     }
+
+    endpointOutputStrip->setLevelMeter(obsService.getStreamPeakL(), obsService.getStreamPeakR(),
+                                       obsService.getStreamRmsL(), obsService.getStreamRmsR());
 }
 
 void OBSMixerComponent::paint(juce::Graphics& g)
@@ -649,27 +723,51 @@ void OBSMixerComponent::paint(juce::Graphics& g)
 
 void OBSMixerComponent::resized()
 {
-    // 1. Top Controls Layout
-    titleLabel.setBounds(20, 14, 220, 22);
-    statusPill.setBounds(250, 14, 460, 22);
+    const int width = getWidth();
+    const bool compactLayout = width < 1000;
 
-    int row2Y = 44;
-    deviceLabel.setBounds(20, row2Y, 130, 24);
-    streamDeviceCombo.setBounds(155, row2Y, 260, 24);
+    // Keep selectors and actions on separate rows so the controls cannot overlap.
+    titleLabel.setBounds(20, 10, 210, 24);
+    statusPill.setBounds(240, 10, juce::jmax(0, width - 260), 24);
 
-    routingModeLabel.setBounds(430, row2Y, 95, 24);
-    routingModeCombo.setBounds(530, row2Y, 320, 24);
+    if (compactLayout)
+    {
+        deviceLabel.setBounds(20, 40, 110, 24);
+        streamDeviceCombo.setBounds(135, 40, juce::jmax(120, width - 155), 24);
 
-    audioSpecsPill.setBounds(20, 74, 520, 20);
+        endpointBusCombo.setBounds(20, 70, 155, 24);
+        routingModeLabel.setBounds(185, 70, 95, 24);
+        routingModeCombo.setBounds(285, 70, juce::jmax(120, width - 305), 24);
+    }
+    else
+    {
+        const int selectorWidth = width - 440;
+        const int deviceComboWidth = juce::jlimit(200, 300,
+                                                   juce::roundToInt(selectorWidth * 0.4f));
+        const int deviceComboX = 135;
+        const int endpointBusX = deviceComboX + deviceComboWidth + 10;
+        const int routingLabelX = endpointBusX + 170;
+        const int routingComboX = routingLabelX + 105;
 
-    testSignalBtn.setBounds(getWidth() - 470, row2Y, 160, 28);
-    openGuideBtn.setBounds(getWidth() - 300, row2Y, 160, 28);
-    webSocketBtn.setBounds(getWidth() - 130, row2Y, 110, 28);
+        deviceLabel.setBounds(20, 40, 110, 24);
+        streamDeviceCombo.setBounds(deviceComboX, 40, deviceComboWidth, 24);
+        endpointBusCombo.setBounds(endpointBusX, 40, 160, 24);
+        routingModeLabel.setBounds(routingLabelX, 40, 100, 24);
+        routingModeCombo.setBounds(routingComboX, 40,
+                                   juce::jmax(180, width - routingComboX - 20), 24);
+    }
+
+    const int buttonY = compactLayout ? 102 : 72;
+    testSignalBtn.setBounds(width - 470, buttonY, 160, 28);
+    openGuideBtn.setBounds(width - 300, buttonY, 160, 28);
+    webSocketBtn.setBounds(width - 130, buttonY, 110, 28);
+    audioSpecsPill.setBounds(20, compactLayout ? 136 : 106,
+                             juce::jmax(0, width - 40), 20);
 
     // 2. 5 Vertical OBS Strips Layout
-    int stripAreaY = 148;
+    int stripAreaY = compactLayout ? 170 : 140;
     int stripAreaH = getHeight() - 164;
-    int totalStrips = 5;
+    int totalStrips = 6;
     int stripGap = 12;
     int startX = 24;
     int stripW = ((getWidth() - 48) - (stripGap * (totalStrips - 1))) / totalStrips;
@@ -679,6 +777,7 @@ void OBSMixerComponent::resized()
     if (guitarStrip) guitarStrip->setBounds(startX + 2 * (stripW + stripGap), stripAreaY, stripW, stripAreaH);
     if (musicStrip) musicStrip->setBounds(startX + 3 * (stripW + stripGap), stripAreaY, stripW, stripAreaH);
     if (monitorStrip) monitorStrip->setBounds(startX + 4 * (stripW + stripGap), stripAreaY, stripW, stripAreaH);
+    if (endpointOutputStrip) endpointOutputStrip->setBounds(startX + 5 * (stripW + stripGap), stripAreaY, stripW, stripAreaH);
 
     // 3. WebSocket Overlay Positioning
     if (showWebSocketOverlay)

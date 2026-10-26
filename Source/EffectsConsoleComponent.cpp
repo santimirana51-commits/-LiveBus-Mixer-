@@ -31,6 +31,10 @@ EffectsConsoleComponent::EffectsConsoleComponent(VST3HostEngine& engine, PluginH
     // Mode Toggle
     isolatedModeToggle.setColour(juce::ToggleButton::textColourId, juce::Colour(0xff60a5fa));
     isolatedModeToggle.setToggleState(false, juce::dontSendNotification);
+    isolatedModeToggle.onClick = [this]() {
+        if (libraryComponent)
+            libraryComponent->setIsolatedModeEnabled(isolatedModeToggle.getToggleState());
+    };
     addAndMakeVisible(isolatedModeToggle);
 
     // Top Controls
@@ -76,7 +80,8 @@ EffectsConsoleComponent::EffectsConsoleComponent(VST3HostEngine& engine, PluginH
     testWatchdogBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffd97706)); // Amber
     testWatchdogBtn.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
     testWatchdogBtn.onClick = [this]() {
-        outOfProcessClient.simulateCrash();
+        if (!hostEngine.simulateTargetIsolatedCrash(currentTargetIndex))
+            outOfProcessClient.simulateCrash();
     };
     addAndMakeVisible(testWatchdogBtn);
 
@@ -96,6 +101,7 @@ EffectsConsoleComponent::EffectsConsoleComponent(VST3HostEngine& engine, PluginH
 
     // Plug-in Library Overlay
     libraryComponent = std::make_unique<PluginLibraryComponent>(hostEngine);
+    libraryComponent->setIsolatedModeEnabled(isolatedModeToggle.getToggleState());
     libraryComponent->onCloseRequested = [this]() { showPluginLibrary(false); };
     libraryComponent->onPluginSelectedToLoad = [this](const juce::PluginDescription& /*desc*/) {
         rebuildSlotViews();
@@ -136,6 +142,7 @@ void EffectsConsoleComponent::showPluginLibrary(bool show)
         if (show)
         {
             libraryComponent->setActiveTarget(currentTargetIndex);
+            libraryComponent->setIsolatedModeEnabled(isolatedModeToggle.getToggleState());
             libraryComponent->toFront(true);
         }
     }
@@ -150,9 +157,11 @@ void EffectsConsoleComponent::changeListenerCallback(juce::ChangeBroadcaster* /*
 
 void EffectsConsoleComponent::timerCallback()
 {
+    hostEngine.checkIsolatedClientsHealthAndRecover();
+
     // Update Telemetry
     juce::String stateStr;
-    auto state = outOfProcessClient.getPluginState();
+    auto state = hostEngine.getTargetIsolatedState(currentTargetIndex);
     switch (state)
     {
         case PluginHostClient::PluginState::HelperCrashed:
@@ -170,7 +179,8 @@ void EffectsConsoleComponent::timerCallback()
     }
 
     int totalLat = hostEngine.getTargetTotalLatency(currentTargetIndex);
-    double latMs = (double)totalLat / 48.0; // @ 48kHz
+    const double sampleRate = hostEngine.getCurrentSampleRate();
+    const double latMs = sampleRate > 0.0 ? (double)totalLat * 1000.0 / sampleRate : 0.0;
     latencyTelemetryLabel.setText("Chain Latency: " + juce::String(totalLat) + " smp (" + juce::String(latMs, 1) + " ms)",
                                   juce::dontSendNotification);
 

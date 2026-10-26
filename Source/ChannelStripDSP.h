@@ -113,6 +113,7 @@ struct BusDSPParameters
     std::atomic<float> masterGain{1.0f};
     std::atomic<float> masterPan{0.0f};          // -1.0 to +1.0
     std::atomic<bool> masterMute{false};
+    std::atomic<bool> masterDim{false};
 
     BusDSPParameters()
     {
@@ -129,7 +130,10 @@ struct BusDSPParameters
 class BusDSPProcessor
 {
 public:
-    BusDSPProcessor() = default;
+    BusDSPProcessor()
+    {
+        eightBandEQ.params.masterEnabled.store(false, std::memory_order_relaxed);
+    }
 
     void prepare(double sampleRate, int maxBlockSize)
     {
@@ -156,6 +160,10 @@ public:
             legacyEqMid2Filter[ch].reset();
             legacyEqHighFilter[ch].reset();
         }
+        lastHpfFreq = -1.0f;
+        lastHpfSlope = -1;
+        lastLpfFreq = -1.0f;
+        lastLpfSlope = -1;
 
         reverb.prepare(spec);
 
@@ -229,12 +237,18 @@ public:
             : juce::dsp::IIR::Coefficients<float>::makeHighPass(currentSampleRate, hpfF, 1.3065f);
 
         // 2. Low Pass Filter (up to 24dB/Oct)
-        float lpfF = juce::jlimit(1000.0f, 22000.0f, params.lpfFreq.load(std::memory_order_relaxed));
-        int lpfSlope = params.lpfSlope.load(std::memory_order_relaxed);
-        auto lpfCoeff1 = (lpfSlope <= 1)
+        const float lpfMaxFreq = juce::jmin(22000.0f, (float)(currentSampleRate * 0.49));
+        const float lpfF = juce::jlimit(juce::jmin(1000.0f, lpfMaxFreq), lpfMaxFreq,
+                                        params.lpfFreq.load(std::memory_order_relaxed));
+        const int lpfSlope = juce::jlimit(0, 4, params.lpfSlope.load(std::memory_order_relaxed));
+        auto lpfCoeff1 = lpfSlope <= 1
             ? juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass(currentSampleRate, lpfF)
-            : juce::dsp::IIR::Coefficients<float>::makeLowPass(currentSampleRate, lpfF, 0.707f);
-        auto lpfCoeff2 = juce::dsp::IIR::Coefficients<float>::makeLowPass(currentSampleRate, lpfF, (lpfSlope >= 4) ? 1.3065f : 0.707f);
+            : juce::dsp::IIR::Coefficients<float>::makeLowPass(
+                  currentSampleRate, lpfF, lpfSlope == 4 ? 0.5412f : 0.7071f);
+        auto lpfCoeff2 = lpfSlope == 3
+            ? juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass(currentSampleRate, lpfF)
+            : juce::dsp::IIR::Coefficients<float>::makeLowPass(
+                  currentSampleRate, lpfF, lpfSlope == 4 ? 1.3065f : 0.7071f);
 
         // 3. 15-Band PUZU Parametric Equalizer
         std::array<juce::ReferenceCountedObjectPtr<juce::dsp::IIR::Coefficients<float>>, numPuzuBands> puzuCoeffs;
@@ -284,6 +298,8 @@ public:
 
         lastHpfFreq = hpfF;
         lastHpfSlope = hpfSlope;
+        lastLpfFreq = lpfF;
+        lastLpfSlope = lpfSlope;
 
         // Reverb Parameters
         juce::dsp::Reverb::Parameters rParams;
@@ -419,7 +435,14 @@ public:
                 processHPF(buffer, numSamples);
             }
 
-            // 2. Noise Gate / Expander
+            // 2. Low-Pass Filter (LPF)
+            if (params.lpfEnabled.load(std::memory_order_relaxed) &&
+                params.lpfSlope.load(std::memory_order_relaxed) > 0)
+            {
+                processLPF(buffer, numSamples);
+            }
+
+            // 3. Noise Gate / Expander
             if (params.gateEnabled.load(std::memory_order_relaxed))
             {
                 processGate(buffer, numSamples);
@@ -430,7 +453,7 @@ public:
                 gateCurrentState.store(2, std::memory_order_relaxed); // Open when disabled
             }
 
-            // 3. 8-Band Studio Parametric Equalizer (and legacy PUZU if enabled)
+            // 4. 8-Band Studio Parametric Equalizer (and legacy PUZU if enabled)
             if (params.eqEnabled.load(std::memory_order_relaxed))
             {
                 for (int ch = 0; ch < numChannels; ++ch)
@@ -450,11 +473,11 @@ public:
                     legacyEqMid2Filter[ch].process(context);
                     legacyEqHighFilter[ch].process(context);
                 }
-                if (eightBandEQ.params.masterEnabled.load(std::memory_order_relaxed))
-                    eightBandEQ.process(buffer, numSamples);
             }
 
-            // 4. Dynamics Compressor
+            eightBandEQ.process(buffer, numSamples);
+
+            // 5. Dynamics Compressor
             if (params.compEnabled.load(std::memory_order_relaxed))
             {
                 processCompressor(buffer, numSamples);
@@ -464,19 +487,19 @@ public:
                 compGR.store(0.0f, std::memory_order_relaxed);
             }
 
-            // 5. Studio Reverb
+            // 6. Studio Reverb
             if (params.reverbEnabled.load(std::memory_order_relaxed))
             {
                 processReverb(buffer, numSamples);
             }
 
-            // 6. Stereo Creative Delay
+            // 7. Stereo Creative Delay
             if (params.delayEnabled.load(std::memory_order_relaxed))
             {
                 processDelay(buffer, numSamples);
             }
 
-            // 7. Brickwall Peak Limiter
+            // 8. Brickwall Peak Limiter
             if (params.limiterEnabled.load(std::memory_order_relaxed))
             {
                 processLimiter(buffer, numSamples);
@@ -499,6 +522,8 @@ public:
         }
 
         float targetGain = params.masterGain.load(std::memory_order_relaxed);
+        if (params.masterDim.load(std::memory_order_relaxed))
+            targetGain *= juce::Decibels::decibelsToGain(-20.0f);
         smoothedMasterGain.setTargetValue(targetGain);
 
         float pan = juce::jlimit(-1.0f, 1.0f, params.masterPan.load(std::memory_order_relaxed));
@@ -608,6 +633,46 @@ private:
             hpfFilterStage1[ch].process(context);
             if (slope >= 2)
                 hpfFilterStage2[ch].process(context);
+        }
+    }
+
+    void processLPF(juce::AudioBuffer<float>& buffer, int numSamples)
+    {
+        const float maxFrequency = juce::jmin(22000.0f, (float)(currentSampleRate * 0.49));
+        const float freq = juce::jlimit(juce::jmin(1000.0f, maxFrequency), maxFrequency,
+                                        params.lpfFreq.load(std::memory_order_relaxed));
+        const int slope = juce::jlimit(1, 4, params.lpfSlope.load(std::memory_order_relaxed));
+
+        if (std::abs(freq - lastLpfFreq) > 0.5f || slope != lastLpfSlope)
+        {
+            lastLpfFreq = freq;
+            lastLpfSlope = slope;
+            const auto stage1 = slope == 1
+                ? juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass(currentSampleRate, freq)
+                : juce::dsp::IIR::Coefficients<float>::makeLowPass(
+                      currentSampleRate, freq, slope == 4 ? 0.5412f : 0.7071f);
+            const auto stage2 = slope == 3
+                ? juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass(currentSampleRate, freq)
+                : juce::dsp::IIR::Coefficients<float>::makeLowPass(
+                      currentSampleRate, freq, slope == 4 ? 1.3065f : 0.7071f);
+
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                *lpfFilterStage1[ch].coefficients = *stage1;
+                *lpfFilterStage2[ch].coefficients = *stage2;
+            }
+        }
+
+        juce::dsp::AudioBlock<float> block(buffer);
+        const int numChannels = juce::jmin(2, buffer.getNumChannels());
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            auto singleBlock = block.getSingleChannelBlock((size_t)ch)
+                                   .getSubBlock(0, (size_t)numSamples);
+            juce::dsp::ProcessContextReplacing<float> context(singleBlock);
+            lpfFilterStage1[ch].process(context);
+            if (slope >= 3)
+                lpfFilterStage2[ch].process(context);
         }
     }
 
@@ -868,6 +933,8 @@ private:
 
     float lastHpfFreq = -1.0f;
     int lastHpfSlope = -1;
+    float lastLpfFreq = -1.0f;
+    int lastLpfSlope = -1;
 
     juce::dsp::IIR::Filter<float> hpfFilterStage1[2];
     juce::dsp::IIR::Filter<float> hpfFilterStage2[2];

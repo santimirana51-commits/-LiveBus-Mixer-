@@ -33,6 +33,7 @@ struct SceneData
     struct ChannelSceneData
     {
         juce::String name;
+        juce::uint32 accentColour = 0;
         float gain = 0.707f;
         float pan = 0.0f;
         bool mute = false;
@@ -192,6 +193,7 @@ struct SceneData
     juce::String safetyXmlString;
     juce::String macroXmlString;
     juce::String routingXmlString;
+    juce::String routingGraphLayoutXml;
 };
 
 struct SceneSummaryInfo

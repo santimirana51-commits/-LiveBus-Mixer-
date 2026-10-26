@@ -10,7 +10,7 @@ AudioSafetyProcessor::AudioSafetyProcessor()
 
 void AudioSafetyProcessor::prepare(double newSampleRate, int newMaxBlockSize)
 {
-    sampleRate = newSampleRate > 0.0 ? newSampleRate : 48000.0;
+    sampleRate.store(newSampleRate > 0.0 ? newSampleRate : 48000.0, std::memory_order_relaxed);
     maxBlockSize = newMaxBlockSize > 0 ? newMaxBlockSize : 512;
     updateCoeffs();
     reset();
@@ -22,6 +22,8 @@ void AudioSafetyProcessor::reset()
     monitorMuteGain = 1.0f;
     streamLimiterGain = 1.0f;
     monitorLimiterGain = 1.0f;
+    hardwareMuteGains.fill(1.0f);
+    hardwareLimiterGains.fill(1.0f);
     streamPeakDb.store(-100.0f);
     monitorPeakDb.store(-100.0f);
     streamGrDb.store(0.0f);
@@ -32,15 +34,75 @@ void AudioSafetyProcessor::reset()
 
 void AudioSafetyProcessor::updateCoeffs()
 {
-    double sr = sampleRate > 0.0 ? sampleRate : 48000.0;
+    double sr = sampleRate.load(std::memory_order_relaxed);
+    if (!(sr > 0.0))
+        sr = 48000.0;
     // 1 ms mute ramp time constant
-    rampCoeff = 1.0f - std::exp(-1.0f / (float)(0.001 * sr));
+    rampCoeff.store(1.0f - std::exp(-1.0f / (float)(0.001 * sr)), std::memory_order_relaxed);
 
     float sRel = juce::jmax(5.0f, streamReleaseMs.load(std::memory_order_relaxed));
-    streamReleaseCoeff = 1.0f - std::exp(-1.0f / (float)(sRel * 0.001 * sr));
+    streamReleaseCoeff.store(1.0f - std::exp(-1.0f / (float)(sRel * 0.001 * sr)),
+                             std::memory_order_relaxed);
 
     float mRel = juce::jmax(5.0f, monitorReleaseMs.load(std::memory_order_relaxed));
-    monitorReleaseCoeff = 1.0f - std::exp(-1.0f / (float)(mRel * 0.001 * sr));
+    monitorReleaseCoeff.store(1.0f - std::exp(-1.0f / (float)(mRel * 0.001 * sr)),
+                              std::memory_order_relaxed);
+}
+
+void AudioSafetyProcessor::processHardwareOutputs(float* const* outputs, int numOutputs,
+                                                   int numSamples)
+{
+    if (outputs == nullptr || numOutputs <= 0 || numSamples <= 0)
+        return;
+
+    const int channelCount = juce::jmin(numOutputs, maxHardwareOutputChannels);
+    const auto mode = emergencyMuteMode.load(std::memory_order_relaxed);
+    const bool shouldMute = mode == EmergencyMuteMode::Both;
+    const float targetMuteGain = shouldMute ? 0.0f : 1.0f;
+    const float muteRampCoefficient = rampCoeff.load(std::memory_order_relaxed);
+    const bool limiterEnabled = streamLimiterEnabled.load(std::memory_order_relaxed) ||
+                                monitorLimiterEnabled.load(std::memory_order_relaxed);
+    const float ceilingDb = juce::jmin(streamCeilingDb.load(std::memory_order_relaxed),
+                                       monitorCeilingDb.load(std::memory_order_relaxed));
+    const float ceilingLinear = std::pow(10.0f, ceilingDb / 20.0f);
+    const float releaseCoefficient = juce::jmin(
+        streamReleaseCoeff.load(std::memory_order_relaxed),
+        monitorReleaseCoeff.load(std::memory_order_relaxed));
+
+    for (int channel = 0; channel < channelCount; ++channel)
+    {
+        auto* output = outputs[channel];
+        if (output == nullptr)
+            continue;
+
+        auto& muteGain = hardwareMuteGains[(size_t)channel];
+        auto& limiterGain = hardwareLimiterGains[(size_t)channel];
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            float value = std::isfinite(output[sample]) ? output[sample] : 0.0f;
+            muteGain += (targetMuteGain - muteGain) * muteRampCoefficient;
+            if (targetMuteGain == 0.0f && muteGain < 0.0001f)
+                muteGain = 0.0f;
+            else if (targetMuteGain == 1.0f && muteGain > 0.9999f)
+                muteGain = 1.0f;
+            value *= muteGain;
+
+            if (limiterEnabled && ceilingLinear > 0.0f)
+            {
+                const float peak = std::abs(value);
+                if (peak > ceilingLinear)
+                    limiterGain = ceilingLinear / peak;
+                else
+                {
+                    limiterGain += (1.0f - limiterGain) * releaseCoefficient;
+                    if (limiterGain > 0.9999f)
+                        limiterGain = 1.0f;
+                }
+                value *= limiterGain;
+            }
+            output[sample] = value;
+        }
+    }
 }
 
 void AudioSafetyProcessor::setEmergencyMute(EmergencyMuteMode mode) noexcept
@@ -63,14 +125,21 @@ void AudioSafetyProcessor::processStreamBus(juce::AudioBuffer<float>& buffer, in
     int numChannels = buffer.getNumChannels();
     float* const* channelData = buffer.getArrayOfWritePointers();
 
+    for (int ch = 0; ch < numChannels; ++ch)
+        if (channelData[ch] != nullptr)
+            for (int s = 0; s < numSamples; ++s)
+                if (!std::isfinite(channelData[ch][s]))
+                    channelData[ch][s] = 0.0f;
+
     // 1. Emergency Mute Processing (Smooth anti-pop ramp)
     auto mode = emergencyMuteMode.load(std::memory_order_relaxed);
     bool shouldMute = (mode == EmergencyMuteMode::StreamOnly || mode == EmergencyMuteMode::Both);
     float targetMuteGain = shouldMute ? 0.0f : 1.0f;
+    const float muteRampCoefficient = rampCoeff.load(std::memory_order_relaxed);
 
     for (int s = 0; s < numSamples; ++s)
     {
-        streamMuteGain += (targetMuteGain - streamMuteGain) * rampCoeff;
+        streamMuteGain += (targetMuteGain - streamMuteGain) * muteRampCoefficient;
         if (targetMuteGain == 0.0f && streamMuteGain < 0.0001f)
             streamMuteGain = 0.0f;
         else if (targetMuteGain == 1.0f && streamMuteGain > 0.9999f)
@@ -94,6 +163,7 @@ void AudioSafetyProcessor::processStreamBus(juce::AudioBuffer<float>& buffer, in
     // 2. Output Brickwall Limiter & Peak Detection
     bool limEn = streamLimiterEnabled.load(std::memory_order_relaxed);
     float ceilDb = streamCeilingDb.load(std::memory_order_relaxed);
+    const float releaseCoefficient = streamReleaseCoeff.load(std::memory_order_relaxed);
     float ceilLinear = std::pow(10.0f, ceilDb / 20.0f);
 
     float maxPeak = 0.0f;
@@ -123,7 +193,7 @@ void AudioSafetyProcessor::processStreamBus(juce::AudioBuffer<float>& buffer, in
             else
             {
                 // Exponential release
-                streamLimiterGain += (1.0f - streamLimiterGain) * streamReleaseCoeff;
+                streamLimiterGain += (1.0f - streamLimiterGain) * releaseCoefficient;
                 if (streamLimiterGain > 0.9999f)
                     streamLimiterGain = 1.0f;
             }
@@ -168,14 +238,21 @@ void AudioSafetyProcessor::processMonitorBus(juce::AudioBuffer<float>& buffer, i
     int numChannels = buffer.getNumChannels();
     float* const* channelData = buffer.getArrayOfWritePointers();
 
+    for (int ch = 0; ch < numChannels; ++ch)
+        if (channelData[ch] != nullptr)
+            for (int s = 0; s < numSamples; ++s)
+                if (!std::isfinite(channelData[ch][s]))
+                    channelData[ch][s] = 0.0f;
+
     // 1. Emergency Mute Processing (Smooth anti-pop ramp)
     auto mode = emergencyMuteMode.load(std::memory_order_relaxed);
     bool shouldMute = (mode == EmergencyMuteMode::MonitorOnly || mode == EmergencyMuteMode::Both);
     float targetMuteGain = shouldMute ? 0.0f : 1.0f;
+    const float muteRampCoefficient = rampCoeff.load(std::memory_order_relaxed);
 
     for (int s = 0; s < numSamples; ++s)
     {
-        monitorMuteGain += (targetMuteGain - monitorMuteGain) * rampCoeff;
+        monitorMuteGain += (targetMuteGain - monitorMuteGain) * muteRampCoefficient;
         if (targetMuteGain == 0.0f && monitorMuteGain < 0.0001f)
             monitorMuteGain = 0.0f;
         else if (targetMuteGain == 1.0f && monitorMuteGain > 0.9999f)
@@ -199,6 +276,7 @@ void AudioSafetyProcessor::processMonitorBus(juce::AudioBuffer<float>& buffer, i
     // 2. Output Brickwall Limiter & Peak Detection
     bool limEn = monitorLimiterEnabled.load(std::memory_order_relaxed);
     float ceilDb = monitorCeilingDb.load(std::memory_order_relaxed);
+    const float releaseCoefficient = monitorReleaseCoeff.load(std::memory_order_relaxed);
     float ceilLinear = std::pow(10.0f, ceilDb / 20.0f);
 
     float maxPeak = 0.0f;
@@ -227,7 +305,7 @@ void AudioSafetyProcessor::processMonitorBus(juce::AudioBuffer<float>& buffer, i
             }
             else
             {
-                monitorLimiterGain += (1.0f - monitorLimiterGain) * monitorReleaseCoeff;
+                monitorLimiterGain += (1.0f - monitorLimiterGain) * releaseCoefficient;
                 if (monitorLimiterGain > 0.9999f)
                     monitorLimiterGain = 1.0f;
             }

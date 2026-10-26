@@ -1,0 +1,30 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out LiveBus Mixer
+        uses: actions/checkout@v4
+
+      - name: Check out pinned JUCE
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 8.0.4
+          path: JUCE
+
+      - name: Configure x64 Release
+        run: cmake -S . -B build -A x64 "-DJUCE_DIR=$env:GITHUB_WORKSPACE\JUCE"
+
+      - name: Build app, VST helper, and tests
+        run: cmake --build build --config Release --target LiveBusMixer LiveBusPluginHost LiveBusMixerTests --parallel 4
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure

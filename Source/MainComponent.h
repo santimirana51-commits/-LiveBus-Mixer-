@@ -44,7 +44,9 @@
 #include "MacroControlComponent.h"
 #include "YouTubeAudioCaptureService.h"
 #include "YouTubePlayerComponent.h"
+#include "AudioDelayCompensator.h"
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -214,6 +216,40 @@ public:
 // ==============================================================================
 // MainComponent Class
 // ==============================================================================
+class FloatingFxRackWindow final : public juce::DocumentWindow
+{
+public:
+    FloatingFxRackWindow()
+        : juce::DocumentWindow("LiveBus FX Rack", juce::Colour(0xff0d1117), juce::DocumentWindow::allButtons)
+    {
+        setUsingNativeTitleBar(true);
+        setResizable(true, true);
+        setResizeLimits(720, 440, 1800, 1200);
+        setContentComponentSize(900, 640);
+    }
+
+    void closeButtonPressed() override { setVisible(false); }
+};
+
+class FxStripButton final : public juce::TextButton
+{
+public:
+    using juce::TextButton::TextButton;
+    std::function<void()> onContextMenu;
+
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        if (event.mods.isRightButtonDown())
+        {
+            if (onContextMenu)
+                onContextMenu();
+            return;
+        }
+
+        juce::TextButton::mouseDown(event);
+    }
+};
+
 class MainComponent final : public juce::Component,
                             private juce::AudioIODeviceCallback,
                             private juce::Button::Listener,
@@ -268,16 +304,24 @@ private:
     void onDeleteScene();
     void initializeMidiParameterRegistry();
 
-    void handleAddChannel();
+    void handleAddChannel(juce::Component* menuTarget = nullptr);
     void handleRemoveChannel();
+    void chooseStreamRecordingFile();
+    bool startStreamRecording(const juce::File& file);
+    void stopStreamRecording();
+    void updateLatencyCompensation();
     void updateChannelUIVisibility();
     void syncSharedUIFromModel();
 
     void selectDSPTarget(int targetIndex);
+    void openFloatingFxRack(int targetIndex);
+    void showFxChainMenu(int targetIndex, juce::Component& targetComponent);
+    void updateFxStripIndicators();
     void applyDSPControls(int targetIndex);
     void updateDSPControlsFromTarget(int targetIndex);
     BusDSPProcessor& getProcessorForTarget(int targetIndex);
 
+    void syncChannelRouteUiState(int channelIndex);
     void applySceneToUI(const SceneData& data);
     void captureSceneFromUI(SceneData& data);
     void applySceneWithFilter(const SceneData& data, const LiveBus::RecallFilter& filter);
@@ -302,6 +346,11 @@ private:
     RoutingMatrix routingMatrix;
     std::array<BusDSPProcessor, maxInputs> channelDSPs;
     std::array<BusDSPProcessor, numBuses> busProcessors;
+    std::array<LiveBus::AudioDelayCompensator, maxInputs> channelLatencyCompensators;
+    std::array<LiveBus::AudioDelayCompensator, numBuses> busLatencyCompensators;
+    LiveBus::AudioDelayCompensator hardwareDirectLatencyCompensator;
+    std::atomic<bool> latencyCompensationOutOfRange{false};
+    bool latencyCompensationWarningLogged = false;
     std::array<juce::AudioBuffer<float>, maxInputs> channelBuffers;
     PluginHostClient pluginHostClient;
     std::unique_ptr<LiveBus::AudioDeviceService> audioDeviceService;
@@ -386,7 +435,8 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     // Area 1: Input Channels (1..4, expandable to 16)
     struct InputChannelUI
     {
-        juce::Label numLabel;
+        juce::TextButton channelColorButton;
+        juce::Colour accentColour;
         juce::Label iconLabel;
         juce::TextEditor nameEditor;
         juce::Label inputSourceHeaderLabel{"Input Source"};
@@ -400,16 +450,15 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
         juce::TextButton muteBtn{"M"};
         juce::TextButton soloBtn{"S"};
         juce::TextButton linkBtn{"Link"};
+        juce::ComboBox outputRouteCombo;
         juce::TextButton bottomPillBtn;
+        FxStripButton dspSelectBtn{"FX"};
         juce::ToggleButton streamRouteToggle{"Send to Stream"};
         juce::Slider streamSendKnob;
         juce::Label streamSendValue;
         juce::ToggleButton monitorRouteToggle{"Send to Monitor"};
         juce::Slider monitorSendKnob;
         juce::Label monitorSendValue;
-        juce::TextButton dspSelectBtn{"DSP / FX"};
-        float currentMeterL = 0.0f;
-        float currentMeterR = 0.0f;
     };
     std::array<InputChannelUI, maxInputs> inputUIs;
     juce::TextButton addChannelBtn{"+ Add Ch"};
@@ -432,11 +481,8 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
         juce::TextButton muteBtn{"M"};
         juce::TextButton linkBtn{"Link"};
         juce::Label outputTagLabel;
-        juce::TextButton dspSelectBtn{"Bus DSP"};
+        FxStripButton dspSelectBtn{"Bus DSP"};
         juce::TextButton bottomPillBtn;
-        float currentMeterL = 0.0f;
-        float currentMeterR = 0.0f;
-        bool clipping = false;
     };
     std::array<MasterBusUI, numBuses> masterUIs;
 
@@ -679,6 +725,9 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     juce::TextEditor discoveredPluginsEditor;
     std::unique_ptr<LiveBus::VST3HostEngine> vst3HostEngine;
     std::unique_ptr<LiveBus::EffectsConsoleComponent> effectsConsoleComponent;
+    std::unique_ptr<LiveBus::EffectsConsoleComponent> floatingFxRackComponent;
+    std::unique_ptr<FloatingFxRackWindow> floatingFxRackWindow;
+    int fxStatusRefreshTicks = 0;
 
     // Scenes Full Page
     juce::Label scenesPageTitle{"Scene Manager & Preset Cloud"};
@@ -745,6 +794,14 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     std::unique_ptr<LiveBus::AudioSafetyComponent> audioSafetyComponent;
     std::unique_ptr<LiveBus::MacroControlComponent> macroControlComponent;
     std::unique_ptr<LiveBus::RoutingMatrixComponent> routingMatrixComponent;
+    juce::TimeSliceThread streamRecorderThread{"Stream recorder writer"};
+    std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> streamRecorder;
+    std::atomic<juce::AudioFormatWriter::ThreadedWriter*> activeStreamRecorder{nullptr};
+    std::atomic<unsigned int> streamRecorderReaders{0};
+    std::atomic<std::uint64_t> droppedRecordingBlocks{0};
+    std::atomic<bool> recordingFileChooserOpen{false};
+    std::unique_ptr<juce::FileChooser> recordingFileChooser;
+    juce::File streamRecordingFile;
 
     // Embedded YouTube Player & Audio Capture Bridge
     LiveBus::YouTubeAudioCaptureService youtubeAudioService;

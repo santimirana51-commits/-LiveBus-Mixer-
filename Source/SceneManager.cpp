@@ -271,6 +271,12 @@ juce::String SceneManager::serializeToXmlString(const SceneData& data)
     xml.setAttribute("mixerFirstVisibleChannel", data.mixerFirstVisibleChannel);
     xml.setAttribute("mixerTopPanelProportion", (double)data.mixerTopPanelProportion);
 
+    if (data.routingGraphLayoutXml.isNotEmpty())
+    {
+        auto* graphLayout = xml.createNewChildElement("ROUTING_GRAPH_LAYOUT");
+        graphLayout->addTextElement(data.routingGraphLayoutXml);
+    }
+
     // Channels
     auto* channelsElem = xml.createNewChildElement("CHANNELS");
     for (int i = 0; i < data.numActiveChannels; ++i)
@@ -279,6 +285,8 @@ juce::String SceneManager::serializeToXmlString(const SceneData& data)
         auto* c = channelsElem->createNewChildElement("CHANNEL");
         c->setAttribute("index", i);
         c->setAttribute("name", ch.name);
+        if (ch.accentColour != 0)
+            c->setAttribute("accentColour", juce::String((juce::int64)ch.accentColour));
         c->setAttribute("gain", (double)ch.gain);
         c->setAttribute("pan", (double)ch.pan);
         c->setAttribute("mute", ch.mute);
@@ -489,6 +497,8 @@ bool SceneManager::deserializeFromXml(const juce::XmlElement& xml, SceneData& ou
         xml.getIntAttribute("mixerFirstVisibleChannel", 0));
     outData.mixerTopPanelProportion = juce::jlimit(0.35f, 0.75f,
         (float)xml.getDoubleAttribute("mixerTopPanelProportion", 0.54));
+    if (auto* graphLayout = xml.getChildByName("ROUTING_GRAPH_LAYOUT"))
+        outData.routingGraphLayoutXml = graphLayout->getAllSubText();
 
     // Channels
     if (auto* channelsElem = xml.getChildByName("CHANNELS"))
@@ -502,6 +512,7 @@ bool SceneManager::deserializeFromXml(const juce::XmlElement& xml, SceneData& ou
                 {
                     auto& ch = outData.channels[(size_t)idx];
                     ch.name = c->getStringAttribute("name", "Input " + juce::String(idx + 1));
+                    ch.accentColour = (juce::uint32)c->getStringAttribute("accentColour", "0").getLargeIntValue();
                     ch.gain = juce::jlimit(0.0f, 2.0f, (float)c->getDoubleAttribute("gain", 0.707));
                     ch.pan = juce::jlimit(-1.0f, 1.0f, (float)c->getDoubleAttribute("pan", 0.0));
                     ch.mute = c->getBoolAttribute("mute", false);

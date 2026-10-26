@@ -39,6 +39,7 @@ public:
     // Target selection for loading
     void setActiveTarget(int targetIndex) { activeTargetIndex = targetIndex; }
     int getActiveTarget() const { return activeTargetIndex; }
+    void setIsolatedModeEnabled(bool enabled) { isolatedModeEnabled = enabled; }
 
 private:
     void rebuildFilteredList();
@@ -46,6 +47,7 @@ private:
 
     VST3HostEngine& hostEngine;
     int activeTargetIndex{4}; // Default to Stream Bus (4)
+    bool isolatedModeEnabled{false};
 
     std::vector<PluginInfoItem> allPlugins;
     std::vector<PluginInfoItem> filteredPlugins;

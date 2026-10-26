@@ -44,6 +44,7 @@ public:
     // Processes audio buffer through emergency mute ramp, brickwall limiter, and peak/clip detector
     void processStreamBus(juce::AudioBuffer<float>& buffer, int numSamples);
     void processMonitorBus(juce::AudioBuffer<float>& buffer, int numSamples);
+    void processHardwareOutputs(float* const* outputs, int numOutputs, int numSamples);
 
     // =========================================================================
     // Emergency Mute Controls (Real-Time Safe, Atomic)
@@ -104,28 +105,32 @@ public:
 private:
     void updateCoeffs();
 
-    double sampleRate = 48000.0;
+    std::atomic<double> sampleRate{48000.0};
     int maxBlockSize = 512;
 
     // Emergency Mute
     std::atomic<EmergencyMuteMode> emergencyMuteMode{EmergencyMuteMode::None};
     float streamMuteGain = 1.0f; // Smooth 1ms ramp
     float monitorMuteGain = 1.0f;
-    float rampCoeff = 0.05f;
+    std::atomic<float> rampCoeff{0.05f};
 
     // Stream Limiter State
     std::atomic<bool> streamLimiterEnabled{true};
     std::atomic<float> streamCeilingDb{-0.5f};
     std::atomic<float> streamReleaseMs{50.0f};
     float streamLimiterGain = 1.0f;
-    float streamReleaseCoeff = 0.01f;
+    std::atomic<float> streamReleaseCoeff{0.01f};
 
     // Monitor Limiter State
     std::atomic<bool> monitorLimiterEnabled{true};
     std::atomic<float> monitorCeilingDb{-0.5f};
     std::atomic<float> monitorReleaseMs{50.0f};
     float monitorLimiterGain = 1.0f;
-    float monitorReleaseCoeff = 0.01f;
+    std::atomic<float> monitorReleaseCoeff{0.01f};
+
+    static constexpr int maxHardwareOutputChannels = 8;
+    std::array<float, maxHardwareOutputChannels> hardwareMuteGains{};
+    std::array<float, maxHardwareOutputChannels> hardwareLimiterGains{};
 
     // Telemetry
     std::atomic<float> streamPeakDb{-100.0f};

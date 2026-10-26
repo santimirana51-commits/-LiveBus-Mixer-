@@ -1,5 +1,22 @@
 #include "MainComponent.h"
+#include "MasterOutputRouter.h"
 #include <cmath>
+
+namespace
+{
+    const std::array<juce::Colour, 8> channelAccentPalette = {
+        juce::Colour(0xff2563eb), juce::Colour(0xff16a34a),
+        juce::Colour(0xffdc2626), juce::Colour(0xffea580c),
+        juce::Colour(0xff06b6d4), juce::Colour(0xff9333ea),
+        juce::Colour(0xffdb2777), juce::Colour(0xffca8a04)
+    };
+
+    juce::Colour defaultChannelAccent(int channelIndex)
+    {
+        return channelIndex < 4 ? channelAccentPalette[(size_t)channelIndex]
+                                : channelAccentPalette[0];
+    }
+}
 
 // ==============================================================================
 // SceneListModel Implementation
@@ -316,12 +333,6 @@ MainComponent::MainComponent()
     // 2. Input Channels Setup (1..4 default, expandable to maxInputs)
     const char* defaultNames[] = { "Microphone", "Guitar / Instrument", "Music Left", "Music Right" };
     const char* defaultIcons[] = { "MIC", "INST", "MUS L", "MUS R" };
-    const juce::Colour defaultHeaderColors[] = {
-        juce::Colour(0xff2563eb), // Blue
-        juce::Colour(0xff16a34a), // Green
-        juce::Colour(0xffdc2626), // Red
-        juce::Colour(0xffea580c)  // Orange
-    };
     const double defaultFaderDbs[] = { -8.3, -12.6, -18.1, -17.9 };
     const double defaultGainDbs[] = { 0.0, 0.0, -3.0, -3.0 };
     const double defaultPans[] = { 0.0, 0.0, -1.0, 1.0 };
@@ -344,10 +355,44 @@ MainComponent::MainComponent()
     for (int i = 0; i < maxInputs; ++i)
     {
         auto& ch = inputUIs[i];
-        ch.numLabel.setText(juce::String(i + 1), juce::dontSendNotification);
-        ch.numLabel.setFont(juce::FontOptions(12.0f, juce::Font::bold));
-        ch.numLabel.setColour(juce::Label::textColourId, i < 4 ? defaultHeaderColors[i % 4] : juce::Colour(0xff38bdf8));
-        addAndMakeVisible(ch.numLabel);
+        ch.accentColour = defaultChannelAccent(i);
+        ch.channelColorButton.setButtonText(juce::String(i + 1));
+        ch.channelColorButton.setTooltip("Click to choose this channel's color");
+        ch.channelColorButton.setColour(juce::TextButton::buttonColourId, ch.accentColour.withAlpha(0.22f));
+        ch.channelColorButton.setColour(juce::TextButton::textColourOffId, ch.accentColour.brighter(0.35f));
+        ch.channelColorButton.onClick = [this, i]() {
+            juce::PopupMenu menu;
+            for (int colourIndex = 0; colourIndex < (int)channelAccentPalette.size(); ++colourIndex)
+                menu.addItem(colourIndex + 1, "Color " + juce::String(colourIndex + 1),
+                             true, inputUIs[i].accentColour == channelAccentPalette[(size_t)colourIndex]);
+
+            juce::Component::SafePointer<MainComponent> safeThis(this);
+            menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&inputUIs[i].channelColorButton),
+                [safeThis, i](int result) {
+                    if (safeThis == nullptr || result < 1 || result > (int)channelAccentPalette.size())
+                        return;
+
+                    auto& channel = safeThis->inputUIs[i];
+                    channel.accentColour = channelAccentPalette[(size_t)(result - 1)];
+                    channel.channelColorButton.setColour(juce::TextButton::buttonColourId,
+                                                         channel.accentColour.withAlpha(0.22f));
+                    channel.channelColorButton.setColour(juce::TextButton::textColourOffId,
+                                                         channel.accentColour.brighter(0.35f));
+                    channel.gainSlider.setColour(juce::Slider::rotarySliderFillColourId, channel.accentColour);
+                    channel.panSlider.setColour(juce::Slider::rotarySliderFillColourId, channel.accentColour);
+                    if (i < 4)
+                    {
+                        safeThis->matrixChannelPills[(size_t)i].setColour(
+                            juce::Label::backgroundColourId, channel.accentColour.withAlpha(0.2f));
+                        safeThis->matrixChannelPills[(size_t)i].setColour(
+                            juce::Label::textColourId, channel.accentColour.brighter(0.4f));
+                        safeThis->matrixPanSliders[(size_t)i].setColour(
+                            juce::Slider::rotarySliderFillColourId, channel.accentColour);
+                    }
+                    safeThis->repaint();
+                });
+        };
+        addAndMakeVisible(ch.channelColorButton);
 
         ch.iconLabel.setText(i < 4 ? defaultIcons[i % 4] : "🎙", juce::dontSendNotification);
         ch.iconLabel.setFont(juce::FontOptions(13.0f));
@@ -428,7 +473,7 @@ MainComponent::MainComponent()
         ch.gainSlider.setRange(-24.0, 24.0, 0.1);
         double defGainDb = (i < 4 ? defaultGainDbs[i % 4] : 0.0);
         ch.gainSlider.setValue(defGainDb);
-        ch.gainSlider.setColour(juce::Slider::rotarySliderFillColourId, i < 4 ? defaultHeaderColors[i % 4] : juce::Colour(0xff38bdf8));
+        ch.gainSlider.setColour(juce::Slider::rotarySliderFillColourId, defaultChannelAccent(i));
         ch.gainSlider.onValueChange = [this, i]() {
             float db = (float)inputUIs[i].gainSlider.getValue();
             channelDSPs[i].params.masterGain.store(juce::Decibels::decibelsToGain(db));
@@ -447,7 +492,7 @@ MainComponent::MainComponent()
         ch.panSlider.setRange(-1.0, 1.0, 0.01);
         double defPan = (i < 4 ? defaultPans[i % 4] : 0.0);
         ch.panSlider.setValue(defPan);
-        ch.panSlider.setColour(juce::Slider::rotarySliderFillColourId, i < 4 ? defaultHeaderColors[i % 4] : juce::Colour(0xff38bdf8));
+        ch.panSlider.setColour(juce::Slider::rotarySliderFillColourId, defaultChannelAccent(i));
         ch.panSlider.onValueChange = [this, i]() {
             float p = (float)inputUIs[i].panSlider.getValue();
             routingMatrix.getChannel(i).pan.store(p);
@@ -488,6 +533,34 @@ MainComponent::MainComponent()
         ch.linkBtn.setButtonText("Link");
         addAndMakeVisible(ch.linkBtn);
 
+        ch.outputRouteCombo.addItem("Stream + Monitor", 1);
+        ch.outputRouteCombo.addItem("Stream only", 2);
+        ch.outputRouteCombo.addItem("Monitor only", 3);
+        ch.outputRouteCombo.addItem("Off", 4);
+        ch.outputRouteCombo.addSeparator();
+        ch.outputRouteCombo.addItem("Sub 1 Vocals", 5);
+        ch.outputRouteCombo.addItem("Sub 2 BGM", 6);
+        ch.outputRouteCombo.addItem("Sub 3 Inst", 7);
+        ch.outputRouteCombo.addItem("Sub 4 Aux", 8);
+        ch.outputRouteCombo.setTooltip("Choose the channel output bus or route it through a submix");
+        ch.outputRouteCombo.onChange = [this, i]() {
+            const int selectedId = inputUIs[(size_t)i].outputRouteCombo.getSelectedId();
+            if (selectedId >= 1 && selectedId <= 4)
+            {
+                const bool toStream = selectedId == 1 || selectedId == 2;
+                const bool toMonitor = selectedId == 1 || selectedId == 3;
+                routingMatrix.applyChannelRouteState(i, toStream, toMonitor);
+                syncChannelRouteUiState(i);
+            }
+            else if (selectedId >= 5 && selectedId <= 8)
+            {
+                const int submixIndex = selectedId - 5;
+                routingMatrix.assignChannelToSubmix(i, submixIndex);
+                syncChannelRouteUiState(i);
+            }
+        };
+        addAndMakeVisible(ch.outputRouteCombo);
+
         const char* pillLabels[] = { "Mic", "Guitar", "Music L", "Music R" };
         ch.bottomPillBtn.setButtonText(i < 4 ? pillLabels[i % 4] : ("In " + juce::String(i + 1)));
         ch.bottomPillBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff161e2e));
@@ -496,12 +569,19 @@ MainComponent::MainComponent()
         };
         addAndMakeVisible(ch.bottomPillBtn);
 
+        ch.dspSelectBtn.setButtonText("FX");
+        ch.dspSelectBtn.setTooltip("Left-click: open insert rack. Right-click: quick bypass controls.");
+        ch.dspSelectBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff164e63));
+        ch.dspSelectBtn.onContextMenu = [this, i, button = &ch.dspSelectBtn]() {
+            showFxChainMenu(i, *button);
+        };
         // Legacy stream / monitor knobs
         ch.streamRouteToggle.setToggleState(true, juce::dontSendNotification);
         ch.streamRouteToggle.onStateChange = [this, i]() {
-            bool s = inputUIs[i].streamRouteToggle.getToggleState();
-            routingMatrix.getChannel(i).routeEnable[0].store(s);
-            if (i < 4) matrixStreamToggles[i].setToggleState(s, juce::dontSendNotification);
+            const bool toStream = inputUIs[i].streamRouteToggle.getToggleState();
+            const bool toMonitor = routingMatrix.getChannel(i).routeEnable[1].load(std::memory_order_relaxed);
+            routingMatrix.applyChannelRouteState(i, toStream, toMonitor);
+            syncChannelRouteUiState(i);
         };
         addChildComponent(ch.streamRouteToggle);
 
@@ -515,9 +595,10 @@ MainComponent::MainComponent()
 
         ch.monitorRouteToggle.setToggleState(true, juce::dontSendNotification);
         ch.monitorRouteToggle.onStateChange = [this, i]() {
-            bool s = inputUIs[i].monitorRouteToggle.getToggleState();
-            routingMatrix.getChannel(i).routeEnable[1].store(s);
-            if (i < 4) matrixMonitorToggles[i].setToggleState(s, juce::dontSendNotification);
+            const bool toMonitor = inputUIs[i].monitorRouteToggle.getToggleState();
+            const bool toStream = routingMatrix.getChannel(i).routeEnable[0].load(std::memory_order_relaxed);
+            routingMatrix.applyChannelRouteState(i, toStream, toMonitor);
+            syncChannelRouteUiState(i);
         };
         addChildComponent(ch.monitorRouteToggle);
 
@@ -534,7 +615,7 @@ MainComponent::MainComponent()
 
         // Initial visibility - show all channels for Mixcraft-style workflow
         bool initialVis = true;
-        ch.numLabel.setVisible(initialVis);
+        ch.channelColorButton.setVisible(initialVis);
         ch.iconLabel.setVisible(initialVis);
         ch.nameEditor.setVisible(initialVis);
         ch.inputSourceHeaderLabel.setVisible(initialVis);
@@ -548,6 +629,7 @@ MainComponent::MainComponent()
         ch.muteBtn.setVisible(initialVis);
         ch.soloBtn.setVisible(initialVis);
         ch.linkBtn.setVisible(initialVis);
+        ch.outputRouteCombo.setVisible(initialVis);
         ch.bottomPillBtn.setVisible(initialVis);
     }
 
@@ -604,6 +686,12 @@ MainComponent::MainComponent()
     masterUIs[0].bottomPillBtn.onClick = [this]() { selectDSPTarget(maxInputs); };
     addAndMakeVisible(masterUIs[0].bottomPillBtn);
 
+    masterUIs[0].dspSelectBtn.setButtonText("FX");
+    masterUIs[0].dspSelectBtn.setTooltip("Left-click: open insert rack. Right-click: quick bypass controls.");
+    masterUIs[0].dspSelectBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff4c1d95));
+    masterUIs[0].dspSelectBtn.onContextMenu = [this]() {
+        showFxChainMenu(maxInputs, masterUIs[0].dspSelectBtn);
+    };
     masterUIs[0].outputTagLabel.setText("OBS Output", juce::dontSendNotification);
     masterUIs[0].outputTagLabel.setFont(juce::FontOptions(10.0f));
     masterUIs[0].outputTagLabel.setColour(juce::Label::textColourId, juce::Colour(0xffa855f7));
@@ -659,6 +747,12 @@ MainComponent::MainComponent()
     masterUIs[1].bottomPillBtn.onClick = [this]() { selectDSPTarget(maxInputs + 1); };
     addAndMakeVisible(masterUIs[1].bottomPillBtn);
 
+    masterUIs[1].dspSelectBtn.setButtonText("FX");
+    masterUIs[1].dspSelectBtn.setTooltip("Left-click: open insert rack. Right-click: quick bypass controls.");
+    masterUIs[1].dspSelectBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff164e63));
+    masterUIs[1].dspSelectBtn.onContextMenu = [this]() {
+        showFxChainMenu(maxInputs + 1, masterUIs[1].dspSelectBtn);
+    };
     masterUIs[1].outputTagLabel.setText("Headphones", juce::dontSendNotification);
     masterUIs[1].outputTagLabel.setFont(juce::FontOptions(10.0f));
     masterUIs[1].outputTagLabel.setColour(juce::Label::textColourId, juce::Colour(0xff06b6d4));
@@ -908,8 +1002,8 @@ MainComponent::MainComponent()
     {
         matrixChannelPills[r].setText(rowPillNames[r], juce::dontSendNotification);
         matrixChannelPills[r].setFont(juce::FontOptions(10.5f, juce::Font::bold));
-        matrixChannelPills[r].setColour(juce::Label::backgroundColourId, defaultHeaderColors[r].withAlpha(0.2f));
-        matrixChannelPills[r].setColour(juce::Label::textColourId, defaultHeaderColors[r].brighter(0.4f));
+        matrixChannelPills[r].setColour(juce::Label::backgroundColourId, defaultChannelAccent(r).withAlpha(0.2f));
+        matrixChannelPills[r].setColour(juce::Label::textColourId, defaultChannelAccent(r).brighter(0.4f));
         addAndMakeVisible(matrixChannelPills[r]);
 
         // Source combo
@@ -962,7 +1056,14 @@ MainComponent::MainComponent()
         matrixStreamToggles[r].setToggleState(true, juce::dontSendNotification);
         matrixStreamToggles[r].onClick = [this, r]() {
             bool s = matrixStreamToggles[r].getToggleState();
-            routingMatrix.getChannel(r).routeEnable[0].store(s);
+            const bool toMonitor = routingMatrix.getChannel(r).routeEnable[1].load(std::memory_order_relaxed);
+            routingMatrix.applyChannelRouteState(r, s, toMonitor);
+            inputUIs[r].streamRouteToggle.setToggleState(s, juce::dontSendNotification);
+            if (routingMatrix.getChannel(r).submixGroup.load(std::memory_order_relaxed) < 0)
+            {
+                const int selectedId = (s && toMonitor) ? 1 : (s ? 2 : (toMonitor ? 3 : 4));
+                inputUIs[r].outputRouteCombo.setSelectedId(selectedId, juce::dontSendNotification);
+            }
         };
         addAndMakeVisible(matrixStreamToggles[r]);
 
@@ -987,7 +1088,14 @@ MainComponent::MainComponent()
         matrixMonitorToggles[r].setToggleState(true, juce::dontSendNotification);
         matrixMonitorToggles[r].onClick = [this, r]() {
             bool s = matrixMonitorToggles[r].getToggleState();
-            routingMatrix.getChannel(r).routeEnable[1].store(s);
+            const bool toStream = routingMatrix.getChannel(r).routeEnable[0].load(std::memory_order_relaxed);
+            routingMatrix.applyChannelRouteState(r, toStream, s);
+            inputUIs[r].monitorRouteToggle.setToggleState(s, juce::dontSendNotification);
+            if (routingMatrix.getChannel(r).submixGroup.load(std::memory_order_relaxed) < 0)
+            {
+                const int selectedId = (toStream && s) ? 1 : (toStream ? 2 : (s ? 3 : 4));
+                inputUIs[r].outputRouteCombo.setSelectedId(selectedId, juce::dontSendNotification);
+            }
         };
         addAndMakeVisible(matrixMonitorToggles[r]);
 
@@ -1012,7 +1120,7 @@ MainComponent::MainComponent()
         matrixPanSliders[r].setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
         matrixPanSliders[r].setRange(-1.0, 1.0, 0.01);
         matrixPanSliders[r].setValue(defaultPans[r]);
-        matrixPanSliders[r].setColour(juce::Slider::rotarySliderFillColourId, defaultHeaderColors[r]);
+        matrixPanSliders[r].setColour(juce::Slider::rotarySliderFillColourId, defaultChannelAccent(r));
         matrixPanSliders[r].onValueChange = [this, r]() {
             float p = (float)matrixPanSliders[r].getValue();
             routingMatrix.getChannel(r).pan.store(p);
@@ -1903,20 +2011,10 @@ MainComponent::MainComponent()
     // Populate default demo tracks from bundled assets if playlist is empty
     if (audioFilePlayer.getPlaylist().empty())
     {
-        juce::File demoCello = juce::File::getCurrentWorkingDirectory().getChildFile("Cello_Solo.wav");
-        if (!demoCello.existsAsFile())
-        {
-            juce::File assetCello("C:\\Users\\miran\\Documents\\muli agen\\JUCE\\examples\\Assets\\cello.wav");
-            if (assetCello.existsAsFile())
-                assetCello.copyFileTo(demoCello);
-        }
-        juce::File demoGuitar = juce::File::getCurrentWorkingDirectory().getChildFile("Guitar_Riff.wav");
-        if (!demoGuitar.existsAsFile())
-        {
-            juce::File assetGuitar("C:\\Users\\miran\\Documents\\muli agen\\JUCE\\examples\\Assets\\guitar_amp.wav");
-            if (assetGuitar.existsAsFile())
-                assetGuitar.copyFileTo(demoGuitar);
-        }
+        const auto appDirectory =
+            juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+        const auto demoCello = appDirectory.getChildFile("Cello_Solo.wav");
+        const auto demoGuitar = appDirectory.getChildFile("Guitar_Riff.wav");
 
         if (demoCello.existsAsFile())
         {
@@ -2106,10 +2204,266 @@ MainComponent::MainComponent()
     macroControlComponent = std::make_unique<LiveBus::MacroControlComponent>(macroEngine);
     addChildComponent(macroControlComponent.get());
 
-    routingMatrixComponent = std::make_unique<LiveBus::RoutingMatrixComponent>(routingMatrix, audioDeviceService.get());
+    routingMatrixComponent = std::make_unique<LiveBus::RoutingMatrixComponent>(
+        routingMatrix, audioDeviceService.get(), [this](int busIndex) {
+            if (busIndex < 0 || busIndex >= numBuses)
+                return false;
+            return busProcessors[(size_t)busIndex].params.masterMute.load(std::memory_order_relaxed);
+        });
+    routingMatrixComponent->masterBusControlCallbacks.getGainDb = [this](int busIndex) {
+        if (busIndex < 0 || busIndex >= numBuses)
+            return 0.0f;
+        return juce::Decibels::gainToDecibels(
+            busProcessors[(size_t)busIndex].params.masterGain.load(std::memory_order_relaxed), -60.0f);
+    };
+    routingMatrixComponent->masterBusControlCallbacks.setGainDb = [this](int busIndex, float db) {
+        if (busIndex < 0 || busIndex >= numBuses)
+            return;
+        const auto gain = juce::Decibels::decibelsToGain(db);
+        busProcessors[(size_t)busIndex].params.masterGain.store(gain, std::memory_order_relaxed);
+        masterUIs[(size_t)busIndex].masterFader.setValue(db, juce::dontSendNotification);
+        masterUIs[(size_t)busIndex].faderValueLabel.setText(
+            db <= -59.0f ? "-inf dB" : juce::String(db, 1) + " dB", juce::dontSendNotification);
+    };
+    routingMatrixComponent->masterBusControlCallbacks.getMute = [this](int busIndex) {
+        return busIndex >= 0 && busIndex < numBuses &&
+               busProcessors[(size_t)busIndex].params.masterMute.load(std::memory_order_relaxed);
+    };
+    routingMatrixComponent->masterBusControlCallbacks.setMute = [this](int busIndex, bool muted) {
+        if (busIndex < 0 || busIndex >= numBuses)
+            return;
+        busProcessors[(size_t)busIndex].params.masterMute.store(muted, std::memory_order_relaxed);
+        masterUIs[(size_t)busIndex].muteBtn.setToggleState(muted, juce::dontSendNotification);
+    };
+    routingMatrixComponent->masterBusControlCallbacks.getDim = [this](int busIndex) {
+        return busIndex >= 0 && busIndex < numBuses &&
+               busProcessors[(size_t)busIndex].params.masterDim.load(std::memory_order_relaxed);
+    };
+    routingMatrixComponent->masterBusControlCallbacks.setDim = [this](int busIndex, bool dimmed) {
+        if (busIndex < 0 || busIndex >= numBuses)
+            return;
+        busProcessors[(size_t)busIndex].params.masterDim.store(dimmed, std::memory_order_relaxed);
+    };
+    routingMatrixComponent->dspControlCallbacks.getModuleEnabled =
+        [this](int targetIndex, LiveBus::RoutingGraphDSPModule module) {
+            const auto& params = getProcessorForTarget(targetIndex).params;
+            switch (module)
+            {
+                case LiveBus::RoutingGraphDSPModule::HPF:
+                    return params.hpfEnabled.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPModule::LPF:
+                    return params.lpfEnabled.load(std::memory_order_relaxed) &&
+                           params.lpfSlope.load(std::memory_order_relaxed) > 0;
+                case LiveBus::RoutingGraphDSPModule::EQ:
+                    return params.eqEnabled.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPModule::Gate:
+                    return params.gateEnabled.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPModule::Compressor:
+                    return params.compEnabled.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPModule::Limiter:
+                    return params.limiterEnabled.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPModule::Reverb:
+                    return params.reverbEnabled.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPModule::Delay:
+                    return params.delayEnabled.load(std::memory_order_relaxed);
+            }
+            return false;
+        };
+    routingMatrixComponent->dspControlCallbacks.setModuleEnabled =
+        [this](int targetIndex, LiveBus::RoutingGraphDSPModule module, bool enabled) {
+            auto& processor = getProcessorForTarget(targetIndex);
+            auto& params = processor.params;
+            switch (module)
+            {
+                case LiveBus::RoutingGraphDSPModule::HPF:
+                    params.hpfEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPModule::LPF:
+                    params.lpfEnabled.store(enabled, std::memory_order_relaxed);
+                    if (enabled && params.lpfSlope.load(std::memory_order_relaxed) <= 0)
+                        params.lpfSlope.store(1, std::memory_order_relaxed);
+                    processor.updateCoefficients();
+                    break;
+                case LiveBus::RoutingGraphDSPModule::EQ:
+                    params.eqEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPModule::Gate:
+                    params.gateEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPModule::Compressor:
+                    params.compEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPModule::Limiter:
+                    params.limiterEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPModule::Reverb:
+                    params.reverbEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPModule::Delay:
+                    params.delayEnabled.store(enabled, std::memory_order_relaxed);
+                    break;
+            }
+        };
+    routingMatrixComponent->dspControlCallbacks.getParameter =
+        [this](int targetIndex, LiveBus::RoutingGraphDSPParameter parameter) {
+            const auto& params = getProcessorForTarget(targetIndex).params;
+            switch (parameter)
+            {
+                case LiveBus::RoutingGraphDSPParameter::HPFFrequency:
+                    return params.hpfFreq.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::LPFFrequency:
+                    return params.lpfFreq.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::EQGain:
+                    return params.eqGainDb.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::GateThreshold:
+                    return params.gateThresholdDb.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::CompressorThreshold:
+                    return params.compThresholdDb.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::LimiterCeiling:
+                    return params.limiterCeilingDb.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::ReverbWet:
+                    return params.reverbWetLevel.load(std::memory_order_relaxed);
+                case LiveBus::RoutingGraphDSPParameter::DelayTime:
+                    return params.delayTimeMs.load(std::memory_order_relaxed);
+            }
+            return 0.0f;
+        };
+    routingMatrixComponent->dspControlCallbacks.setParameter =
+        [this](int targetIndex, LiveBus::RoutingGraphDSPParameter parameter, float value) {
+            auto& processor = getProcessorForTarget(targetIndex);
+            auto& params = processor.params;
+            bool updateCoefficients = false;
+            switch (parameter)
+            {
+                case LiveBus::RoutingGraphDSPParameter::HPFFrequency:
+                    params.hpfFreq.store(juce::jlimit(20.0f, 1000.0f, value),
+                                         std::memory_order_relaxed);
+                    updateCoefficients = true;
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::LPFFrequency:
+                    params.lpfFreq.store(juce::jlimit(1000.0f, 22000.0f, value),
+                                         std::memory_order_relaxed);
+                    updateCoefficients = true;
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::EQGain:
+                    params.eqGainDb.store(juce::jlimit(-18.0f, 18.0f, value),
+                                          std::memory_order_relaxed);
+                    updateCoefficients = true;
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::GateThreshold:
+                    params.gateThresholdDb.store(juce::jlimit(-80.0f, 0.0f, value),
+                                                 std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::CompressorThreshold:
+                    params.compThresholdDb.store(juce::jlimit(-60.0f, 0.0f, value),
+                                                 std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::LimiterCeiling:
+                    params.limiterCeilingDb.store(juce::jlimit(-20.0f, 0.0f, value),
+                                                  std::memory_order_relaxed);
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::ReverbWet:
+                    params.reverbWetLevel.store(juce::jlimit(0.0f, 1.0f, value),
+                                                std::memory_order_relaxed);
+                    updateCoefficients = true;
+                    break;
+                case LiveBus::RoutingGraphDSPParameter::DelayTime:
+                    params.delayTimeMs.store(juce::jlimit(10.0f, 1500.0f, value),
+                                             std::memory_order_relaxed);
+                    break;
+            }
+            if (updateCoefficients)
+                processor.updateCoefficients();
+        };
+    routingMatrixComponent->dspControlCallbacks.controlChanged = [this](int targetIndex) {
+        if (selectedTarget != targetIndex)
+            selectDSPTarget(targetIndex);
+        updateDSPControlsFromTarget(targetIndex);
+        if (eqCurveDisplay)
+            eqCurveDisplay->repaint();
+        markUnsavedChanges();
+    };
     routingMatrixComponent->onChannelSelected = [this](int channelIndex) {
         selectDSPTarget(channelIndex);
     };
+    routingMatrixComponent->onDSPNodeSelected = [this](int targetIndex) {
+        selectDSPTarget(targetIndex);
+    };
+    routingMatrixComponent->onVSTChainSelected = [this](int targetIndex) {
+        openFloatingFxRack(targetIndex);
+    };
+    routingMatrixComponent->vstChainPluginsProvider = [this](int targetIndex) {
+        std::vector<juce::String> plugins;
+        if (vst3HostEngine == nullptr)
+            return plugins;
+
+        const int count = vst3HostEngine->getNumPluginsInTarget(targetIndex);
+        plugins.reserve((size_t)count);
+        for (int slot = 0; slot < count; ++slot)
+        {
+            const auto info = vst3HostEngine->getSlotInfo(targetIndex, slot);
+            plugins.push_back(info.pluginName + (info.isBypassed ? " [bypassed]" : ""));
+        }
+        return plugins;
+    };
+    routingMatrixComponent->onAddInputNodeRequested = [this](juce::Component* menuTarget) {
+        handleAddChannel(menuTarget);
+    };
+    routingMatrixComponent->onPaletteActionRequested =
+        [this](LiveBus::RoutingGraphPaletteAction action) {
+            switch (action)
+            {
+                case LiveBus::RoutingGraphPaletteAction::Gate:
+                case LiveBus::RoutingGraphPaletteAction::Equalizer:
+                case LiveBus::RoutingGraphPaletteAction::Compressor:
+                {
+                    const auto typeId = action == LiveBus::RoutingGraphPaletteAction::Gate
+                        ? "gate" : action == LiveBus::RoutingGraphPaletteAction::Equalizer
+                        ? "eq" : "compressor";
+                    selectDSPTarget(selectedTarget);
+                    routingMatrixComponent->focusRoutingGraphNode(typeId, selectedTarget);
+                    break;
+                }
+                case LiveBus::RoutingGraphPaletteAction::VST3Chain:
+                    routingMatrixComponent->focusRoutingGraphNode("vst3", selectedTarget);
+                    openFloatingFxRack(selectedTarget);
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::Submix:
+                    routingMatrixComponent->focusRoutingGraphNode("submix", 0);
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::Aux:
+                    routingMatrixComponent->focusRoutingGraphNode("aux", 0);
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::StreamBus:
+                    selectDSPTarget(maxInputs);
+                    routingMatrixComponent->focusRoutingGraphNode("stream", 0);
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::MonitorBus:
+                    selectDSPTarget(maxInputs + 1);
+                    routingMatrixComponent->focusRoutingGraphNode("monitor", 0);
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::VirtualCable:
+                case LiveBus::RoutingGraphPaletteAction::OBS:
+                    currentTab = TabOBS;
+                    resized();
+                    repaint();
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::AudioDevice:
+                    showAudioSettings();
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::YouTubeCapture:
+                    currentTab = TabYouTube;
+                    resized();
+                    repaint();
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::Recorder:
+                    chooseStreamRecordingFile();
+                    break;
+                case LiveBus::RoutingGraphPaletteAction::AddInput:
+                    break;
+            }
+        };
+    routingMatrixComponent->showRoutingGraph();
     addChildComponent(routingMatrixComponent.get());
 
     // Embedded YouTube Player Component
@@ -2147,6 +2501,7 @@ MainComponent::~MainComponent()
     stopTimer();
     deviceManager.removeAudioCallback(this);
     deviceManager.removeChangeListener(this);
+    stopStreamRecording();
 
     // Auto-save session state on exit
     SceneData lastSession;
@@ -2177,6 +2532,175 @@ MainComponent::~MainComponent()
     setLookAndFeel(nullptr);
 }
 
+void MainComponent::chooseStreamRecordingFile()
+{
+    if (activeStreamRecorder.load(std::memory_order_seq_cst) != nullptr)
+    {
+        stopStreamRecording();
+        return;
+    }
+
+    if (recordingFileChooserOpen.exchange(true, std::memory_order_acq_rel))
+        return;
+
+    recordingFileChooser = std::make_unique<juce::FileChooser>(
+        "Record Stream Bus to WAV",
+        juce::File::getSpecialLocation(juce::File::userMusicDirectory)
+            .getChildFile("LiveBus Stream.wav"),
+        "*.wav");
+    const auto safeComponent = juce::Component::SafePointer<MainComponent>(this);
+    const auto chooserFlags = juce::FileBrowserComponent::saveMode |
+                              juce::FileBrowserComponent::canSelectFiles;
+    recordingFileChooser->launchAsync(chooserFlags,
+        [safeComponent](const juce::FileChooser& chooser)
+        {
+            if (safeComponent == nullptr)
+                return;
+
+            safeComponent->recordingFileChooserOpen.store(false, std::memory_order_release);
+            auto file = chooser.getResult();
+            if (file == juce::File{})
+                return;
+            if (!file.getFileExtension().equalsIgnoreCase(".wav"))
+                file = file.withFileExtension(".wav");
+            safeComponent->startStreamRecording(file);
+        });
+}
+
+bool MainComponent::startStreamRecording(const juce::File& file)
+{
+    if (!isAudioRunning.load(std::memory_order_acquire))
+    {
+        log("Stream recording not started: audio device is not running.");
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+            "Recorder", "Start the audio device before recording the Stream Bus.");
+        return false;
+    }
+
+    juce::WavAudioFormat wavFormat;
+    auto outputStream = std::make_unique<juce::FileOutputStream>(file);
+    if (!outputStream->openedOk())
+    {
+        log("Stream recording failed: could not open " + file.getFullPathName());
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+            "Recorder", "The selected WAV file could not be opened for writing.");
+        return false;
+    }
+    if (!outputStream->setPosition(0))
+    {
+        log("Stream recording failed: could not rewind " + file.getFullPathName());
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+            "Recorder", "The selected WAV file could not be prepared for recording.");
+        return false;
+    }
+    const auto truncateResult = outputStream->truncate();
+    if (truncateResult.failed())
+    {
+        log("Stream recording failed: could not truncate " + file.getFullPathName() +
+            " (" + truncateResult.getErrorMessage() + ")");
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+            "Recorder", "The selected WAV file could not be prepared for recording.");
+        return false;
+    }
+
+    std::unique_ptr<juce::AudioFormatWriter> writer(wavFormat.createWriterFor(
+        outputStream.get(), currentSampleRate, 2, 24, {}, 0));
+    if (writer == nullptr)
+    {
+        log("Stream recording failed: WAV writer could not be created.");
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+            "Recorder", "A WAV writer could not be created for the selected file.");
+        return false;
+    }
+    outputStream.release();
+
+    if (!streamRecorderThread.isThreadRunning() && !streamRecorderThread.startThread())
+    {
+        log("Stream recording failed: writer thread could not be started.");
+        return false;
+    }
+
+    streamRecorder = std::make_unique<juce::AudioFormatWriter::ThreadedWriter>(
+        writer.release(), streamRecorderThread, juce::jmax(8192, currentBlockSize * 16));
+    streamRecordingFile = file;
+    droppedRecordingBlocks.store(0, std::memory_order_relaxed);
+    activeStreamRecorder.store(streamRecorder.get(), std::memory_order_seq_cst);
+    log("Stream Bus recording started: " + file.getFullPathName());
+    return true;
+}
+
+void MainComponent::updateLatencyCompensation()
+{
+    std::array<int, maxInputs> channelLatencies{};
+    const int activeChannels = routingMatrix.getNumActiveChannels();
+    int maxChannelLatency = 0;
+    int maxBusLatency = 0;
+
+    auto getTargetLatency = [this](int targetIndex)
+    {
+        if (vst3HostEngine != nullptr)
+            return juce::jmax(0, vst3HostEngine->getTargetTotalLatency(targetIndex));
+        if (targetIndex >= 0 && targetIndex < maxInputs + 2 &&
+            vstTargetIndex[targetIndex].load(std::memory_order_relaxed) == targetIndex)
+            return juce::jmax(0, pluginHostClient.getPluginLatencySamples());
+        return 0;
+    };
+
+    for (int channel = 0; channel < maxInputs; ++channel)
+    {
+        if (channel < activeChannels)
+        {
+            channelLatencies[(size_t)channel] = getTargetLatency(channel);
+            maxChannelLatency = juce::jmax(maxChannelLatency, channelLatencies[(size_t)channel]);
+        }
+    }
+
+    std::array<int, numBuses> busLatencies{};
+    for (int bus = 0; bus < numBuses; ++bus)
+    {
+        busLatencies[(size_t)bus] = getTargetLatency(maxInputs + bus);
+        maxBusLatency = juce::jmax(maxBusLatency, busLatencies[(size_t)bus]);
+    }
+
+    bool delayOutOfRange = false;
+    for (int channel = 0; channel < maxInputs; ++channel)
+    {
+        const int compensation = maxChannelLatency - channelLatencies[(size_t)channel];
+        delayOutOfRange = !channelLatencyCompensators[(size_t)channel].setDelaySamples(compensation) ||
+                          delayOutOfRange;
+    }
+    for (int bus = 0; bus < numBuses; ++bus)
+    {
+        const int compensation = maxBusLatency - busLatencies[(size_t)bus];
+        delayOutOfRange = !busLatencyCompensators[(size_t)bus].setDelaySamples(compensation) ||
+                          delayOutOfRange;
+    }
+    delayOutOfRange = !hardwareDirectLatencyCompensator.setDelaySamples(maxBusLatency) ||
+                      delayOutOfRange;
+    latencyCompensationOutOfRange.store(delayOutOfRange, std::memory_order_release);
+}
+
+void MainComponent::stopStreamRecording()
+{
+    auto* const writer = activeStreamRecorder.exchange(nullptr, std::memory_order_seq_cst);
+    if (writer == nullptr)
+        return;
+
+    while (streamRecorderReaders.load(std::memory_order_seq_cst) != 0)
+        juce::Thread::yield();
+
+    streamRecorder.reset();
+    const bool writerThreadStopped = streamRecorderThread.stopThread(2000);
+    const auto droppedBlocks = droppedRecordingBlocks.exchange(0, std::memory_order_relaxed);
+    if (droppedBlocks == 0 && writerThreadStopped)
+        log("Stream Bus recording saved: " + streamRecordingFile.getFullPathName());
+    else
+        log("Stream Bus recording ended with " + juce::String((juce::int64)droppedBlocks) +
+            " dropped audio blocks" + (writerThreadStopped ? ": " : " and writer thread did not stop cleanly: ") +
+            streamRecordingFile.getFullPathName());
+    streamRecordingFile = {};
+}
+
 // ==============================================================================
 // Audio Processing Callback
 // ==============================================================================
@@ -2188,6 +2712,31 @@ void MainComponent::audioDeviceIOCallbackWithContext(const float* const* inputCh
 
     if (audioPerformanceMonitor != nullptr)
         audioPerformanceMonitor->callbackStart(numSamples, currentSampleRate > 0.0 ? currentSampleRate : 48000.0);
+
+    const auto clearOutputs = [&]()
+    {
+        if (numSamples <= 0)
+            return;
+        for (int ch = 0; ch < numOutputChannels; ++ch)
+            if (outputChannelData != nullptr && outputChannelData[ch] != nullptr)
+                juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
+    };
+
+    bool buffersCanProcessBlock = numSamples > 0 &&
+        streamBuffer.getNumSamples() >= numSamples &&
+        monitorBuffer.getNumSamples() >= numSamples &&
+        routingPlaybackBuffer.getNumSamples() >= numSamples &&
+        routingTestSignalBuffer.getNumSamples() >= numSamples &&
+        routingHwDirectBuffer.getNumSamples() >= numSamples;
+    for (int ch = 0; ch < maxInputs && buffersCanProcessBlock; ++ch)
+        buffersCanProcessBlock = channelBuffers[ch].getNumSamples() >= numSamples;
+    if (!buffersCanProcessBlock)
+    {
+        clearOutputs();
+        if (audioPerformanceMonitor != nullptr)
+            audioPerformanceMonitor->callbackEnd();
+        return;
+    }
 
     // Buffers pre-allocated in audioDeviceAboutToStart - no setSize() in callback
     streamBuffer.clear();
@@ -2356,12 +2905,10 @@ void MainComponent::audioDeviceIOCallbackWithContext(const float* const* inputCh
             pluginHostClient.processBlock(channelBuffers[ch], numSamples);
         }
 
+        channelLatencyCompensators[(size_t)ch].process(channelBuffers[ch], numSamples);
+
         // Process Channel Level Metering (Thread-Safe DSP)
         channelLevelMeters[ch].processBlock(channelBuffers[ch], 0, numSamples);
-        float pL = channelBuffers[ch].getMagnitude(0, 0, numSamples);
-        float pR = channelBuffers[ch].getMagnitude(1, 0, numSamples);
-        inputUIs[ch].currentMeterL = pL;
-        inputUIs[ch].currentMeterR = pR;
 
         inPtrs[ch] = channelBuffers[ch].getReadPointer(0);
     }
@@ -2446,100 +2993,56 @@ void MainComponent::audioDeviceIOCallbackWithContext(const float* const* inputCh
             pluginHostClient.processBlock(monitorBuffer, numSamples);
     }
 
+    busLatencyCompensators[0].process(streamBuffer, numSamples);
+    busLatencyCompensators[1].process(monitorBuffer, numSamples);
+
     // Master Bus Level Metering (Thread-Safe DSP)
     busLevelMeters[0].processBlock(streamBuffer, 0, numSamples);
     busLevelMeters[1].processBlock(monitorBuffer, 0, numSamples);
 
-    masterUIs[0].currentMeterL = streamBuffer.getMagnitude(0, 0, numSamples);
-    masterUIs[0].currentMeterR = streamBuffer.getMagnitude(1, 0, numSamples);
-    masterUIs[0].clipping = (masterUIs[0].currentMeterL >= 0.999f || masterUIs[0].currentMeterR >= 0.999f);
-
-    masterUIs[1].currentMeterL = monitorBuffer.getMagnitude(0, 0, numSamples);
-    masterUIs[1].currentMeterR = monitorBuffer.getMagnitude(1, 0, numSamples);
-    masterUIs[1].clipping = (masterUIs[1].currentMeterL >= 0.999f || masterUIs[1].currentMeterR >= 0.999f);
+    const float streamPeakL = streamBuffer.getMagnitude(0, 0, numSamples);
+    const float streamPeakR = streamBuffer.getMagnitude(1, 0, numSamples);
 
     // 5b. Audio Safety Processor: Brickwall Output Limiter, True Peak & Emergency Mute
     audioSafetyProcessor.processStreamBus(streamBuffer, numSamples);
     audioSafetyProcessor.processMonitorBus(monitorBuffer, numSamples);
+    streamRecorderReaders.fetch_add(1, std::memory_order_seq_cst);
+    if (auto* recorder = activeStreamRecorder.load(std::memory_order_seq_cst))
+    {
+        if (!recorder->write(streamBuffer.getArrayOfReadPointers(), numSamples))
+            droppedRecordingBlocks.fetch_add(1, std::memory_order_relaxed);
+    }
+    streamRecorderReaders.fetch_sub(1, std::memory_order_seq_cst);
+    routingMatrix.updateMasterBusMeter(0,
+        streamBuffer.getMagnitude(0, 0, numSamples),
+        streamBuffer.getMagnitude(1, 0, numSamples));
+    routingMatrix.updateMasterBusMeter(1,
+        monitorBuffer.getMagnitude(0, 0, numSamples),
+        monitorBuffer.getMagnitude(1, 0, numSamples));
 
     // Push Stream Bus audio into secondary virtual device FIFO & update telemetry for OBS
     if (obsIntegrationService != nullptr)
     {
-        obsIntegrationService->pushStreamAudioBlock(streamBuffer, numSamples);
+        obsIntegrationService->pushOutputAudioBlock(streamBuffer, monitorBuffer, numSamples);
         float sRmsL = streamBuffer.getRMSLevel(0, 0, numSamples);
         float sRmsR = streamBuffer.getRMSLevel(1, 0, numSamples);
-        obsIntegrationService->updateStreamMeter(masterUIs[0].currentMeterL, masterUIs[0].currentMeterR, sRmsL, sRmsR);
+        obsIntegrationService->updateStreamMeter(streamPeakL, streamPeakR, sRmsL, sRmsR);
     }
 
     // 6. Write to Hardware Outputs
-    if (numOutputChannels >= 4)
-    {
-        // HW 0-1: Stream Bus (OBS / Broadcast)
-        if (outputChannelData[0]) juce::FloatVectorOperations::copy(outputChannelData[0], streamBuffer.getReadPointer(0), numSamples);
-        if (outputChannelData[1]) juce::FloatVectorOperations::copy(outputChannelData[1], streamBuffer.getReadPointer(1), numSamples);
+    clearOutputs();
+    const auto outputMode = obsIntegrationService != nullptr
+        ? obsIntegrationService->getRoutingMode()
+        : LiveBus::OBSRoutingMode::PrimaryMultiChannel;
+    LiveBus::routeMasterBusesToDevice(outputChannelData, numOutputChannels,
+                                      streamBuffer, monitorBuffer, numSamples, outputMode);
 
-        // HW 2-3: Monitor Bus (Headphones / Control Room)
-        if (outputChannelData[2]) juce::FloatVectorOperations::copy(outputChannelData[2], monitorBuffer.getReadPointer(0), numSamples);
-        if (outputChannelData[3]) juce::FloatVectorOperations::copy(outputChannelData[3], monitorBuffer.getReadPointer(1), numSamples);
+    hardwareDirectLatencyCompensator.process(routingHwDirectBuffer, numSamples);
+    for (int h = 0; h < juce::jmin(numOutputChannels, maxHwOutputs); ++h)
+        if (outputChannelData != nullptr && outputChannelData[h] != nullptr)
+            juce::FloatVectorOperations::add(outputChannelData[h], routingHwDirectBuffer.getReadPointer(h), numSamples);
 
-        // Clear remaining physical outputs
-        for (int ch = 4; ch < numOutputChannels; ++ch)
-            if (outputChannelData[ch]) juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
-
-        // Direct hardware channel routing additions (HW Out 1..N)
-        for (int h = 0; h < juce::jmin(numOutputChannels, maxHwOutputs); ++h)
-        {
-            if (outputChannelData[h] != nullptr)
-            {
-                juce::FloatVectorOperations::add(outputChannelData[h], routingHwDirectBuffer.getReadPointer(h), numSamples);
-            }
-        }
-    }
-    else if (numOutputChannels >= 2)
-    {
-        auto mode = obsIntegrationService != nullptr ? obsIntegrationService->getRoutingMode() : LiveBus::OBSRoutingMode::PrimaryMultiChannel;
-        if (mode == LiveBus::OBSRoutingMode::DedicatedSecondaryDevice)
-        {
-            // Secondary device (Virtual Cable) handles Stream Bus audio directly!
-            // Primary device channels 0-1 carry Monitor Bus (Headphones) ONLY! Zero monitor bleed to OBS!
-            if (outputChannelData[0]) juce::FloatVectorOperations::copy(outputChannelData[0], monitorBuffer.getReadPointer(0), numSamples);
-            if (outputChannelData[1]) juce::FloatVectorOperations::copy(outputChannelData[1], monitorBuffer.getReadPointer(1), numSamples);
-        }
-        else if (mode == LiveBus::OBSRoutingMode::PrimaryStreamOnly)
-        {
-            // Primary device itself is dedicated to Stream Bus for OBS. Monitor bus muted on this device to prevent bleed.
-            if (outputChannelData[0]) juce::FloatVectorOperations::copy(outputChannelData[0], streamBuffer.getReadPointer(0), numSamples);
-            if (outputChannelData[1]) juce::FloatVectorOperations::copy(outputChannelData[1], streamBuffer.getReadPointer(1), numSamples);
-        }
-        else if (mode == LiveBus::OBSRoutingMode::CombinedAudition)
-        {
-            // Explicit Audition mix mode: Stream + Monitor
-            if (outputChannelData[0])
-            {
-                juce::FloatVectorOperations::copy(outputChannelData[0], streamBuffer.getReadPointer(0), numSamples);
-                juce::FloatVectorOperations::add(outputChannelData[0], monitorBuffer.getReadPointer(0), numSamples);
-            }
-            if (outputChannelData[1])
-            {
-                juce::FloatVectorOperations::copy(outputChannelData[1], streamBuffer.getReadPointer(1), numSamples);
-                juce::FloatVectorOperations::add(outputChannelData[1], monitorBuffer.getReadPointer(1), numSamples);
-            }
-        }
-        else // Default 2-channel: Stream Bus on 0-1
-        {
-            if (outputChannelData[0]) juce::FloatVectorOperations::copy(outputChannelData[0], streamBuffer.getReadPointer(0), numSamples);
-            if (outputChannelData[1]) juce::FloatVectorOperations::copy(outputChannelData[1], streamBuffer.getReadPointer(1), numSamples);
-        }
-
-        // Direct hardware channel routing additions for 2-channel setup
-        for (int h = 0; h < juce::jmin(numOutputChannels, 2); ++h)
-        {
-            if (outputChannelData[h] != nullptr)
-            {
-                juce::FloatVectorOperations::add(outputChannelData[h], routingHwDirectBuffer.getReadPointer(h), numSamples);
-            }
-        }
-    }
+    audioSafetyProcessor.processHardwareOutputs(outputChannelData, numOutputChannels, numSamples);
 
     if (audioPerformanceMonitor != nullptr)
         audioPerformanceMonitor->callbackEnd();
@@ -2559,17 +3062,17 @@ void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device)
     routingPlaybackBuffer.setSize(2, currentBlockSize);
     routingTestSignalBuffer.setSize(2, currentBlockSize);
     routingHwDirectBuffer.setSize(maxHwOutputs, currentBlockSize);
+    for (auto& compensator : channelLatencyCompensators)
+        compensator.prepare(2, currentBlockSize);
+    for (auto& compensator : busLatencyCompensators)
+        compensator.prepare(2, currentBlockSize);
+    hardwareDirectLatencyCompensator.prepare(maxHwOutputs, currentBlockSize);
 
     auto inNames = device->getInputChannelNames();
     auto outNames = device->getOutputChannelNames();
     routingMatrix.validateAvailableInputs(inNames.size());
     routingMatrix.validateAvailableOutputs(outNames.size());
     routingMatrix.prepare(currentSampleRate, currentBlockSize);
-    if (routingMatrixComponent)
-    {
-        routingMatrixComponent->updateAvailableHardwareInputs(inNames.size(), inNames);
-        routingMatrixComponent->updateAvailableHardwareOutputs(outNames.size(), outNames);
-    }
 
     busProcessors[0].prepare(currentSampleRate, currentBlockSize);
     busProcessors[1].prepare(currentSampleRate, currentBlockSize);
@@ -2584,30 +3087,50 @@ void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device)
     audioFilePlayer.prepareToPlay(currentSampleRate, currentBlockSize);
     autoDucker.prepare(currentSampleRate, currentBlockSize);
     audioSafetyProcessor.prepare(currentSampleRate, currentBlockSize);
-
-    srPillLabel.setText("SR: " + juce::String(currentSampleRate * 0.001, 1) + " kHz", juce::dontSendNotification);
-    bufferPillLabel.setText("Buffer: " + juce::String(currentBlockSize), juce::dontSendNotification);
-    devicePillLabel.setText("Device: " + device->getName(), juce::dontSendNotification);
+    testSignalGenerator.prepareToPlay(currentSampleRate, currentBlockSize);
+    if (vst3HostEngine != nullptr)
+        vst3HostEngine->prepareToPlay(currentSampleRate, currentBlockSize);
+    updateLatencyCompensation();
+    for (auto& compensator : channelLatencyCompensators)
+        compensator.reset();
+    for (auto& compensator : busLatencyCompensators)
+        compensator.reset();
+    hardwareDirectLatencyCompensator.reset();
 
     if (audioPerformanceMonitor != nullptr)
         audioPerformanceMonitor->resetStatistics();
 
-    log("Audio device started: " + device->getName() + " (" + juce::String(currentSampleRate) + " Hz, " + juce::String(currentBlockSize) + " samples)");
-
-    if (diagnosticsLogManager != nullptr)
+    const auto deviceName = device->getName();
+    const auto sampleRate = currentSampleRate;
+    const auto blockSize = currentBlockSize;
+    const auto safeComponent = juce::Component::SafePointer<MainComponent>(this);
+    juce::MessageManager::callAsync([safeComponent, deviceName, sampleRate, blockSize,
+                                     inNames, outNames]() mutable
     {
-        diagnosticsLogManager->log(LiveBus::DiagnosticSeverity::Info,
-                                   LiveBus::DiagnosticCategory::Device,
-                                   "Audio device opened: " + device->getName() + " (" + juce::String((int)currentSampleRate) + " Hz, " + juce::String(currentBlockSize) + " smp)");
-    }
+        if (safeComponent == nullptr)
+            return;
 
-    if (performanceDiagnosticsComponent != nullptr)
-        performanceDiagnosticsComponent->refreshFromHardware();
-
-    refreshChannelInputSourceCombos();
-
-    if (audioSettingsComponent != nullptr)
-        audioSettingsComponent->updateUIFromDevice();
+        safeComponent->srPillLabel.setText("SR: " + juce::String(sampleRate * 0.001, 1) + " kHz", juce::dontSendNotification);
+        safeComponent->bufferPillLabel.setText("Buffer: " + juce::String(blockSize), juce::dontSendNotification);
+        safeComponent->devicePillLabel.setText("Device: " + deviceName, juce::dontSendNotification);
+        if (safeComponent->routingMatrixComponent)
+        {
+            safeComponent->routingMatrixComponent->updateAvailableHardwareInputs(inNames.size(), inNames);
+            safeComponent->routingMatrixComponent->updateAvailableHardwareOutputs(outNames.size(), outNames);
+        }
+        safeComponent->log("Audio device started: " + deviceName + " (" + juce::String(sampleRate) +
+                           " Hz, " + juce::String(blockSize) + " samples)");
+        if (safeComponent->diagnosticsLogManager != nullptr)
+            safeComponent->diagnosticsLogManager->log(
+                LiveBus::DiagnosticSeverity::Info, LiveBus::DiagnosticCategory::Device,
+                "Audio device opened: " + deviceName + " (" + juce::String((int)sampleRate) +
+                " Hz, " + juce::String(blockSize) + " smp)");
+        if (safeComponent->performanceDiagnosticsComponent != nullptr)
+            safeComponent->performanceDiagnosticsComponent->refreshFromHardware();
+        safeComponent->refreshChannelInputSourceCombos();
+        if (safeComponent->audioSettingsComponent != nullptr)
+            safeComponent->audioSettingsComponent->updateUIFromDevice();
+    });
 }
 
 void MainComponent::audioDeviceStopped()
@@ -2620,36 +3143,41 @@ void MainComponent::audioDeviceStopped()
     busLevelMeters[0].reset();
     busLevelMeters[1].reset();
 
-    audioStatusBadge.setText("● Audio Stopped", juce::dontSendNotification);
-    audioStatusBadge.setColour(juce::Label::textColourId, juce::Colour(0xffef4444));
-    audioStatusBadge.setColour(juce::Label::backgroundColourId, juce::Colour(0x22ef4444));
-    log("Audio device stopped.");
-
-    refreshChannelInputSourceCombos();
-
-    if (diagnosticsLogManager != nullptr)
+    const auto safeComponent = juce::Component::SafePointer<MainComponent>(this);
+    juce::MessageManager::callAsync([safeComponent]()
     {
-        diagnosticsLogManager->log(LiveBus::DiagnosticSeverity::Warning,
-                                   LiveBus::DiagnosticCategory::Device,
-                                   "Audio device stopped");
-    }
-
-    if (audioSettingsComponent != nullptr)
-        audioSettingsComponent->updateUIFromDevice();
+        if (safeComponent == nullptr)
+            return;
+        safeComponent->stopStreamRecording();
+        safeComponent->audioStatusBadge.setText("● Audio Stopped", juce::dontSendNotification);
+        safeComponent->audioStatusBadge.setColour(juce::Label::textColourId, juce::Colour(0xffef4444));
+        safeComponent->audioStatusBadge.setColour(juce::Label::backgroundColourId, juce::Colour(0x22ef4444));
+        safeComponent->log("Audio device stopped.");
+        safeComponent->refreshChannelInputSourceCombos();
+        if (safeComponent->diagnosticsLogManager != nullptr)
+            safeComponent->diagnosticsLogManager->log(
+                LiveBus::DiagnosticSeverity::Warning, LiveBus::DiagnosticCategory::Device,
+                "Audio device stopped");
+        if (safeComponent->audioSettingsComponent != nullptr)
+            safeComponent->audioSettingsComponent->updateUIFromDevice();
+    });
 }
 
 void MainComponent::audioDeviceError(const juce::String& errorMessage)
 {
-    if (audioPerformanceMonitor != nullptr)
-        audioPerformanceMonitor->recordDeviceError(errorMessage.toRawUTF8());
-
-    if (diagnosticsLogManager != nullptr)
+    const auto safeComponent = juce::Component::SafePointer<MainComponent>(this);
+    juce::MessageManager::callAsync([safeComponent, errorMessage]()
     {
-        diagnosticsLogManager->log(LiveBus::DiagnosticSeverity::Error,
-                                   LiveBus::DiagnosticCategory::Device,
-                                   "Audio device error: " + errorMessage);
-    }
-    log("Audio device error: " + errorMessage);
+        if (safeComponent == nullptr)
+            return;
+        if (safeComponent->audioPerformanceMonitor != nullptr)
+            safeComponent->audioPerformanceMonitor->recordDeviceError(errorMessage.toRawUTF8());
+        if (safeComponent->diagnosticsLogManager != nullptr)
+            safeComponent->diagnosticsLogManager->log(
+                LiveBus::DiagnosticSeverity::Error, LiveBus::DiagnosticCategory::Device,
+                "Audio device error: " + errorMessage);
+        safeComponent->log("Audio device error: " + errorMessage);
+    });
 }
 
 // ==============================================================================
@@ -2831,6 +3359,16 @@ void MainComponent::refreshChannelInputSourceCombos()
 void MainComponent::timerCallback()
 {
     syncSharedUIFromModel();
+    updateLatencyCompensation();
+    if (++fxStatusRefreshTicks >= 8)
+    {
+        fxStatusRefreshTicks = 0;
+        updateFxStripIndicators();
+    }
+    const bool latencyOutOfRange = latencyCompensationOutOfRange.load(std::memory_order_acquire);
+    if (latencyOutOfRange && !latencyCompensationWarningLogged)
+        log("Plugin delay compensation exceeds the supported delay limit; affected routes are left uncompensated.");
+    latencyCompensationWarningLogged = latencyOutOfRange;
 
     // Drain real-time lock-free queue into DiagnosticsLogManager
     if (diagnosticsLogManager != nullptr)
@@ -3034,6 +3572,18 @@ void MainComponent::syncSharedUIFromModel()
         if (i < 4 && !matrixStereoCombos[i].isPopupActive())
             matrixStereoCombos[i].setSelectedId((int)state.stereoMode.load(std::memory_order_relaxed) + 1,
                                                 juce::dontSendNotification);
+        if (!ui.outputRouteCombo.isPopupActive())
+        {
+            const int submix = state.submixGroup.load(std::memory_order_relaxed);
+            int routeId = submix >= 0 && submix < maxSubmixBuses ? 5 + submix : 4;
+            if (submix < 0)
+            {
+                const bool toStream = state.routeEnable[0].load(std::memory_order_relaxed);
+                const bool toMonitor = state.routeEnable[1].load(std::memory_order_relaxed);
+                routeId = toStream ? (toMonitor ? 1 : 2) : (toMonitor ? 3 : 4);
+            }
+            ui.outputRouteCombo.setSelectedId(routeId, juce::dontSendNotification);
+        }
 
         for (int bus = 0; bus < numBuses; ++bus)
         {
@@ -3159,12 +3709,6 @@ void MainComponent::paint(juce::Graphics& g)
         int stripsAreaW = areaW - dspRackW - 10;
         int stripW = (stripsAreaW - (5 * 6)) / 6;
 
-        const juce::Colour bannerColors[4] = {
-            juce::Colour(0xff2563eb), // Blue
-            juce::Colour(0xff16a34a), // Green
-            juce::Colour(0xffdc2626), // Red
-            juce::Colour(0xffea580c)  // Orange
-        };
         const int firstVisibleChannel = channelScrollPosition;
 
         // Top Tier Channel Strips
@@ -3179,7 +3723,9 @@ void MainComponent::paint(juce::Graphics& g)
             g.drawRoundedRectangle((float)sx, (float)areaY, (float)stripW, (float)topTierH, 4.0f, 1.0f);
 
             // Banner
-            g.setColour(bannerColors[slot]);
+            g.setColour(juce::isPositiveAndBelow(channelIndex, maxInputs)
+                            ? inputUIs[(size_t)channelIndex].accentColour
+                            : juce::Colour(0xff2563eb));
             g.fillRoundedRectangle((float)sx, (float)areaY, (float)stripW, 20.0f, 4.0f);
             g.fillRect((float)sx, (float)(areaY + 12), (float)stripW, 8.0f);
 
@@ -3417,13 +3963,15 @@ void MainComponent::resized()
         const int sx = areaX + visibleSlot * (stripW + 6) + 6;
         const int sy = areaY + 28;
 
-        ch.numLabel.setBounds(sx + 6, sy, channelStripW - 12, 16);
+        ch.channelColorButton.setBounds(sx + 6, sy, channelStripW - 12, 16);
         ch.nameEditor.setBounds(sx + 6, sy + 17, channelStripW - 12, 18);
         ch.iconLabel.setBounds(sx + (channelStripW - 54) / 2, sy + 36, 54, 16);
         ch.inputSourceCombo.setBounds(sx + 4, sy + 54, channelStripW - 8, 20);
 
-        const int faderY = sy + 76;
-        const int faderH = juce::jmax(60, channelStripH - 292);
+        ch.outputRouteCombo.setBounds(sx + 4, sy + 76, channelStripW - 8, 20);
+
+        const int faderY = sy + 98;
+        const int faderH = juce::jmax(60, channelStripH - 314);
         if (channelPeakMeters[i])
         {
             channelPeakMeters[i]->setBounds(sx + 8, faderY, 24, faderH);
@@ -3456,9 +4004,10 @@ void MainComponent::resized()
         ch.monitorRouteToggle.setButtonText("MON");
         ch.monitorRouteToggle.setTooltip("Send to Monitor Bus");
         ch.monitorRouteToggle.setBounds(sx + 9 + routeButtonW, routeY, routeButtonW, 18);
-        ch.bottomPillBtn.setBounds(sx + 8, routeY + 18, channelStripW - 16, 18);
+        ch.bottomPillBtn.setBounds(sx + 8, routeY + 18, juce::jmax(0, channelStripW - 62), 18);
+        ch.dspSelectBtn.setBounds(sx + channelStripW - 46, routeY + 18, 38, 18);
 
-        ch.numLabel.setVisible(isVisible);
+        ch.channelColorButton.setVisible(isVisible);
         ch.nameEditor.setVisible(isVisible);
         ch.iconLabel.setVisible(isVisible);
         ch.inputSourceHeaderLabel.setVisible(false);
@@ -3472,6 +4021,7 @@ void MainComponent::resized()
         ch.muteBtn.setVisible(isVisible);
         ch.soloBtn.setVisible(isVisible);
         ch.linkBtn.setVisible(isVisible);
+        ch.outputRouteCombo.setVisible(isVisible);
         ch.bottomPillBtn.setVisible(isVisible);
         ch.streamRouteToggle.setVisible(isVisible);
         ch.streamSendKnob.setVisible(false);
@@ -3479,7 +4029,7 @@ void MainComponent::resized()
         ch.monitorRouteToggle.setVisible(isVisible);
         ch.monitorSendKnob.setVisible(false);
         ch.monitorSendValue.setVisible(false);
-        ch.dspSelectBtn.setVisible(false);
+        ch.dspSelectBtn.setVisible(isVisible);
     }
 
     // Keep channel controls in the sidebar so they never cover strip headers.
@@ -3532,7 +4082,8 @@ void MainComponent::resized()
     int mBtnW = (stripW - 24) / 2;
     masterUIs[0].muteBtn.setBounds(s0X + 8, mBtnY, mBtnW, 20);
     masterUIs[0].linkBtn.setBounds(s0X + 8 + mBtnW + 4, mBtnY, mBtnW, 20);
-    masterUIs[0].bottomPillBtn.setBounds(s0X + 8, mBtnY + 24, stripW - 16, 22);
+    masterUIs[0].bottomPillBtn.setBounds(s0X + 8, mBtnY + 24, juce::jmax(0, stripW - 60), 22);
+    masterUIs[0].dspSelectBtn.setBounds(s0X + stripW - 48, mBtnY + 24, 40, 22);
 
     masterUIs[0].headerLabel.setVisible(false);
     masterUIs[0].iconLabel.setVisible(isMixerActive);
@@ -3542,7 +4093,7 @@ void MainComponent::resized()
     masterUIs[0].linkBtn.setVisible(isMixerActive);
     masterUIs[0].bottomPillBtn.setVisible(isMixerActive);
     masterUIs[0].outputTagLabel.setVisible(false);
-    masterUIs[0].dspSelectBtn.setVisible(false);
+    masterUIs[0].dspSelectBtn.setVisible(isMixerActive);
 
     // Master Bus 1: MONITOR BUS
     int s1X = areaX + 5 * (stripW + 6);
@@ -3557,7 +4108,8 @@ void MainComponent::resized()
 
     masterUIs[1].muteBtn.setBounds(s1X + 8, mBtnY, mBtnW, 20);
     masterUIs[1].linkBtn.setBounds(s1X + 8 + mBtnW + 4, mBtnY, mBtnW, 20);
-    masterUIs[1].bottomPillBtn.setBounds(s1X + 8, mBtnY + 24, stripW - 16, 22);
+    masterUIs[1].bottomPillBtn.setBounds(s1X + 8, mBtnY + 24, juce::jmax(0, stripW - 60), 22);
+    masterUIs[1].dspSelectBtn.setBounds(s1X + stripW - 48, mBtnY + 24, 40, 22);
 
     masterUIs[1].headerLabel.setVisible(false);
     masterUIs[1].iconLabel.setVisible(isMixerActive);
@@ -3567,7 +4119,7 @@ void MainComponent::resized()
     masterUIs[1].linkBtn.setVisible(isMixerActive);
     masterUIs[1].bottomPillBtn.setVisible(isMixerActive);
     masterUIs[1].outputTagLabel.setVisible(false);
-    masterUIs[1].dspSelectBtn.setVisible(false);
+    masterUIs[1].dspSelectBtn.setVisible(isMixerActive);
 
     // -------------------------------------------------------------------------
     // Right DSP Rack Layout
@@ -4190,6 +4742,10 @@ void MainComponent::buttonClicked(juce::Button* b)
                 refreshSceneList();
                 log("Imported presets from ZIP successfully.");
             }
+            else
+            {
+                log("Failed to import preset ZIP. Existing scenes were preserved.");
+            }
         }
         else
         {
@@ -4259,12 +4815,12 @@ void MainComponent::buttonClicked(juce::Button* b)
     {
         if (b == &inputUIs[i].dspSelectBtn)
         {
-            selectDSPTarget(i);
+            openFloatingFxRack(i);
             break;
         }
     }
-    if (b == &masterUIs[0].dspSelectBtn) selectDSPTarget(maxInputs);
-    if (b == &masterUIs[1].dspSelectBtn) selectDSPTarget(maxInputs + 1);
+    if (b == &masterUIs[0].dspSelectBtn) openFloatingFxRack(maxInputs);
+    if (b == &masterUIs[1].dspSelectBtn) openFloatingFxRack(maxInputs + 1);
 
     // DSP Sub-Tabs
     for (int s = 0; s < 6; ++s)
@@ -4326,6 +4882,9 @@ void MainComponent::selectDSPTarget(int targetIndex)
         if (effectsConsoleComponent->getSelectedTarget() != targetIndex)
             effectsConsoleComponent->selectTarget(targetIndex);
     }
+    if (floatingFxRackComponent &&
+        floatingFxRackComponent->getSelectedTarget() != targetIndex)
+        floatingFxRackComponent->selectTarget(targetIndex);
 
     if (vocalDSPRackComponent)
     {
@@ -4338,6 +4897,145 @@ void MainComponent::selectDSPTarget(int targetIndex)
             (LiveBus::EightBandEQComponent::TargetIndex)targetIndex);
     }
     repaint();
+}
+
+void MainComponent::openFloatingFxRack(int targetIndex)
+{
+    if (targetIndex < 0 || targetIndex >= LiveBus::VST3HostEngine::NumTargets ||
+        vst3HostEngine == nullptr)
+        return;
+
+    if (floatingFxRackComponent == nullptr)
+    {
+        floatingFxRackComponent = std::make_unique<LiveBus::EffectsConsoleComponent>(
+            *vst3HostEngine, pluginHostClient);
+        floatingFxRackComponent->onTargetSelected = [this](int selectedIndex) {
+            selectDSPTarget(selectedIndex);
+        };
+    }
+
+    selectDSPTarget(targetIndex);
+
+    if (floatingFxRackWindow == nullptr)
+    {
+        floatingFxRackWindow = std::make_unique<FloatingFxRackWindow>();
+        floatingFxRackWindow->setContentNonOwned(floatingFxRackComponent.get(), false);
+    }
+
+    floatingFxRackWindow->setVisible(true);
+    floatingFxRackWindow->toFront(true);
+}
+
+void MainComponent::showFxChainMenu(int targetIndex, juce::Component& targetComponent)
+{
+    if (vst3HostEngine == nullptr ||
+        targetIndex < 0 || targetIndex >= LiveBus::VST3HostEngine::NumTargets)
+        return;
+
+    const int slotCount = vst3HostEngine->getNumPluginsInTarget(targetIndex);
+    juce::PopupMenu menu;
+    menu.addSectionHeader(LiveBus::VST3HostEngine::getTargetName(targetIndex));
+
+    if (slotCount == 0)
+    {
+        menu.addItem(1, "No insert effects loaded", false);
+    }
+    else
+    {
+        menu.addItem(1, "Bypass all inserts");
+        menu.addItem(2, "Enable all inserts");
+        menu.addSeparator();
+
+        for (int slotIndex = 0; slotIndex < slotCount; ++slotIndex)
+        {
+            const auto slot = vst3HostEngine->getSlotInfo(targetIndex, slotIndex);
+            const auto label = juce::String(slotIndex + 1) + ". " + slot.pluginName +
+                (slot.isBypassed ? "  [Bypassed]" : "  [Active]");
+            menu.addItem(100 + slotIndex, label, true, !slot.isBypassed);
+        }
+    }
+
+    juce::Component::SafePointer<MainComponent> safeThis(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&targetComponent),
+        [safeThis, targetIndex, slotCount](int result)
+        {
+            if (safeThis == nullptr || safeThis->vst3HostEngine == nullptr || result == 0)
+                return;
+
+            if (result == 1 && slotCount > 0)
+            {
+                for (int slotIndex = 0; slotIndex < slotCount; ++slotIndex)
+                    safeThis->vst3HostEngine->setSlotBypassed(targetIndex, slotIndex, true);
+                return;
+            }
+
+            if (result == 2)
+            {
+                for (int slotIndex = 0; slotIndex < slotCount; ++slotIndex)
+                    safeThis->vst3HostEngine->setSlotBypassed(targetIndex, slotIndex, false);
+                return;
+            }
+
+            const int slotIndex = result - 100;
+            if (slotIndex >= 0 && slotIndex < slotCount)
+            {
+                const bool bypassed = safeThis->vst3HostEngine->isSlotBypassed(targetIndex, slotIndex);
+                safeThis->vst3HostEngine->setSlotBypassed(targetIndex, slotIndex, !bypassed);
+            }
+        });
+}
+
+void MainComponent::updateFxStripIndicators()
+{
+    if (vst3HostEngine == nullptr)
+        return;
+
+    auto updateButton = [this](juce::TextButton& button, int targetIndex)
+    {
+        const int slotCount = vst3HostEngine->getNumPluginsInTarget(targetIndex);
+        juce::String tooltip = LiveBus::VST3HostEngine::getTargetName(targetIndex);
+        bool anyActive = false;
+
+        if (slotCount == 0)
+        {
+            tooltip += "\nNo insert effects loaded.";
+        }
+        else
+        {
+            tooltip += "\nInsert chain:";
+            for (int slotIndex = 0; slotIndex < slotCount; ++slotIndex)
+            {
+                const auto slot = vst3HostEngine->getSlotInfo(targetIndex, slotIndex);
+                tooltip += "\n" + juce::String(slotIndex + 1) + ". " + slot.pluginName +
+                           (slot.isBypassed ? " [Bypassed]" : "");
+                anyActive = anyActive || !slot.isBypassed;
+            }
+        }
+        tooltip += "\nClick to open the effects rack.";
+
+        const auto buttonText = slotCount > 0
+            ? "FX " + juce::String(slotCount)
+            : "FX";
+        const auto buttonColour = slotCount == 0
+            ? juce::Colour(0xff164e63)
+            : (anyActive ? juce::Colour(0xff065f46) : juce::Colour(0xff92400e));
+
+        if (button.getButtonText() != buttonText)
+            button.setButtonText(buttonText);
+        if (button.getTooltip() != tooltip)
+            button.setTooltip(tooltip);
+        if (button.findColour(juce::TextButton::buttonColourId) != buttonColour)
+            button.setColour(juce::TextButton::buttonColourId, buttonColour);
+    };
+
+    const int firstVisibleChannel = channelScrollPosition;
+    const int visibleEnd = juce::jmin(firstVisibleChannel + 4,
+                                      routingMatrix.getNumActiveChannels());
+    for (int channelIndex = firstVisibleChannel; channelIndex < visibleEnd; ++channelIndex)
+        updateButton(inputUIs[(size_t)channelIndex].dspSelectBtn, channelIndex);
+
+    updateButton(masterUIs[0].dspSelectBtn, maxInputs);
+    updateButton(masterUIs[1].dspSelectBtn, maxInputs + 1);
 }
 
 void MainComponent::applyDSPControls(int targetIndex)
@@ -5065,10 +5763,58 @@ void MainComponent::refreshSceneList()
     sceneListBox.repaint();
 }
 
+void MainComponent::syncChannelRouteUiState(int channelIndex)
+{
+    auto& state = routingMatrix.getChannel(channelIndex);
+    const bool toStream = state.routeEnable[0].load(std::memory_order_relaxed);
+    const bool toMonitor = state.routeEnable[1].load(std::memory_order_relaxed);
+    const int submix = state.submixGroup.load(std::memory_order_relaxed);
+
+    inputUIs[(size_t)channelIndex].streamRouteToggle.setToggleState(toStream, juce::dontSendNotification);
+    inputUIs[(size_t)channelIndex].monitorRouteToggle.setToggleState(toMonitor, juce::dontSendNotification);
+    if (channelIndex < 4)
+    {
+        matrixStreamToggles[(size_t)channelIndex].setToggleState(toStream, juce::dontSendNotification);
+        matrixMonitorToggles[(size_t)channelIndex].setToggleState(toMonitor, juce::dontSendNotification);
+    }
+    routingStreamChecks[(size_t)channelIndex].setToggleState(toStream, juce::dontSendNotification);
+    routingMonitorChecks[(size_t)channelIndex].setToggleState(toMonitor, juce::dontSendNotification);
+
+    if (submix >= 0 && submix < maxSubmixBuses)
+        inputUIs[(size_t)channelIndex].outputRouteCombo.setSelectedId(submix + 5, juce::dontSendNotification);
+    else if (toStream && toMonitor)
+        inputUIs[(size_t)channelIndex].outputRouteCombo.setSelectedId(1, juce::dontSendNotification);
+    else if (toStream)
+        inputUIs[(size_t)channelIndex].outputRouteCombo.setSelectedId(2, juce::dontSendNotification);
+    else if (toMonitor)
+        inputUIs[(size_t)channelIndex].outputRouteCombo.setSelectedId(3, juce::dontSendNotification);
+    else
+        inputUIs[(size_t)channelIndex].outputRouteCombo.setSelectedId(4, juce::dontSendNotification);
+}
+
 void MainComponent::applySceneToUI(const SceneData& data)
 {
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < maxInputs; ++i)
     {
+        auto& channel = inputUIs[(size_t)i];
+        channel.accentColour = data.channels[(size_t)i].accentColour != 0
+                                   ? juce::Colour(data.channels[(size_t)i].accentColour)
+                                   : defaultChannelAccent(i);
+        channel.channelColorButton.setColour(juce::TextButton::buttonColourId,
+                                             channel.accentColour.withAlpha(0.22f));
+        channel.channelColorButton.setColour(juce::TextButton::textColourOffId,
+                                             channel.accentColour.brighter(0.35f));
+        channel.gainSlider.setColour(juce::Slider::rotarySliderFillColourId, channel.accentColour);
+        channel.panSlider.setColour(juce::Slider::rotarySliderFillColourId, channel.accentColour);
+        if (i < 4)
+        {
+            matrixChannelPills[(size_t)i].setColour(juce::Label::backgroundColourId,
+                                                    channel.accentColour.withAlpha(0.2f));
+            matrixChannelPills[(size_t)i].setColour(juce::Label::textColourId,
+                                                    channel.accentColour.brighter(0.4f));
+            matrixPanSliders[(size_t)i].setColour(juce::Slider::rotarySliderFillColourId,
+                                                  channel.accentColour);
+        }
         if (data.channels[i].name.isNotEmpty())
         {
             inputUIs[i].nameEditor.setText(data.channels[i].name, false);
@@ -5079,16 +5825,20 @@ void MainComponent::applySceneToUI(const SceneData& data)
         inputUIs[i].muteBtn.setToggleState(data.channels[i].mute, juce::sendNotification);
         inputUIs[i].soloBtn.setToggleState(data.channels[i].solo, juce::sendNotification);
 
-        inputUIs[i].streamRouteToggle.setToggleState(data.channels[i].streamRoute, juce::sendNotification);
-        routingStreamChecks[i].setToggleState(data.channels[i].streamRoute, juce::dontSendNotification);
-        routingMatrix.getChannel(i).routeEnable[0].store(data.channels[i].streamRoute);
+        const bool toStream = data.channels[i].streamRoute;
+        const bool toMonitor = data.channels[i].monitorRoute;
+        auto& state = routingMatrix.getChannel(i);
+        state.routeEnable[0].store(toStream, std::memory_order_release);
+        state.routeEnable[1].store(toMonitor, std::memory_order_release);
+        if ((toStream || toMonitor) && state.submixGroup.load(std::memory_order_relaxed) >= 0)
+            state.submixGroup.store(-1, std::memory_order_release);
 
-        inputUIs[i].monitorRouteToggle.setToggleState(data.channels[i].monitorRoute, juce::sendNotification);
-        routingMonitorChecks[i].setToggleState(data.channels[i].monitorRoute, juce::dontSendNotification);
-        routingMatrix.getChannel(i).routeEnable[1].store(data.channels[i].monitorRoute);
+        syncChannelRouteUiState(i);
 
         inputUIs[i].streamSendKnob.setValue(data.channels[i].streamSend, juce::sendNotification);
         inputUIs[i].monitorSendKnob.setValue(data.channels[i].monitorSend, juce::sendNotification);
+        state.sendLevel[0].store(data.channels[i].streamSend, std::memory_order_release);
+        state.sendLevel[1].store(data.channels[i].monitorSend, std::memory_order_release);
     }
     masterUIs[0].masterFader.setValue(data.buses[0].masterGain, juce::sendNotification);
     masterUIs[0].muteBtn.setToggleState(data.buses[0].masterMute, juce::sendNotification);
@@ -5261,6 +6011,8 @@ void MainComponent::applySceneToUI(const SceneData& data)
         if (routingMatrixComponent)
             routingMatrixComponent->updateUIFromMatrix();
     }
+    if (routingMatrixComponent != nullptr)
+        routingMatrixComponent->setRoutingGraphLayoutXml(data.routingGraphLayoutXml);
 
     mixerTopPanelProportion = juce::jlimit(0.35f, 0.75f, data.mixerTopPanelProportion);
     channelScrollPosition = juce::jlimit(0,
@@ -5279,17 +6031,22 @@ void MainComponent::captureSceneFromUI(SceneData& data)
     data.numActiveChannels = numInputs;
     data.mixerFirstVisibleChannel = channelScrollPosition;
     data.mixerTopPanelProportion = mixerTopPanelProportion;
-    for (int i = 0; i < 4; ++i)
+    if (routingMatrixComponent != nullptr)
+        data.routingGraphLayoutXml = routingMatrixComponent->getRoutingGraphLayoutXml();
+    for (int i = 0; i < maxInputs; ++i)
     {
-        data.channels[i].name = inputUIs[i].nameEditor.getText();
-        data.channels[i].gain = (float)inputUIs[i].gainSlider.getValue();
-        data.channels[i].pan = (float)inputUIs[i].panSlider.getValue();
-        data.channels[i].mute = inputUIs[i].muteBtn.getToggleState();
-        data.channels[i].solo = inputUIs[i].soloBtn.getToggleState();
-        data.channels[i].streamRoute = inputUIs[i].streamRouteToggle.getToggleState();
-        data.channels[i].monitorRoute = inputUIs[i].monitorRouteToggle.getToggleState();
-        data.channels[i].streamSend = (float)inputUIs[i].streamSendKnob.getValue();
-        data.channels[i].monitorSend = (float)inputUIs[i].monitorSendKnob.getValue();
+        const auto& state = routingMatrix.getChannel(i);
+        auto& sceneChannel = data.channels[(size_t)i];
+        sceneChannel.name = inputUIs[(size_t)i].nameEditor.getText();
+        sceneChannel.accentColour = inputUIs[(size_t)i].accentColour.getARGB();
+        sceneChannel.gain = (float)inputUIs[(size_t)i].gainSlider.getValue();
+        sceneChannel.pan = (float)inputUIs[(size_t)i].panSlider.getValue();
+        sceneChannel.mute = inputUIs[(size_t)i].muteBtn.getToggleState();
+        sceneChannel.solo = inputUIs[(size_t)i].soloBtn.getToggleState();
+        sceneChannel.streamRoute = state.routeEnable[0].load(std::memory_order_relaxed);
+        sceneChannel.monitorRoute = state.routeEnable[1].load(std::memory_order_relaxed);
+        sceneChannel.streamSend = state.sendLevel[0].load(std::memory_order_relaxed);
+        sceneChannel.monitorSend = state.sendLevel[1].load(std::memory_order_relaxed);
     }
 
     for (int b = 0; b < 2; ++b)
@@ -5474,7 +6231,7 @@ void MainComponent::showAudioSettings()
 // ==============================================================================
 // Channel Strip Add / Remove
 // ==============================================================================
-void MainComponent::handleAddChannel()
+void MainComponent::handleAddChannel(juce::Component* menuTarget)
 {
     juce::PopupMenu menu;
     menu.addSectionHeader("Choose channel input");
@@ -5485,7 +6242,8 @@ void MainComponent::handleAddChannel()
     menu.addItem(5, "Disabled Channel");
 
     juce::Component::SafePointer<MainComponent> safeThis(this);
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&addChannelBtn),
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(
+                           menuTarget != nullptr ? menuTarget : &addChannelBtn),
         [safeThis](int result)
         {
             if (safeThis == nullptr || result < 1 || result > 5)

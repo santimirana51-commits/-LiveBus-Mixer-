@@ -18,6 +18,13 @@ enum class OBSRoutingMode
     CombinedAudition           // Stereo Audition mix: Ch 1-2 receives Stream + Monitor (audition mode)
 };
 
+enum class SecondaryOutputBus
+{
+    Stream = 0,
+    Monitor,
+    StreamAndMonitor
+};
+
 /**
  * Information about a detected audio device.
  */
@@ -71,9 +78,23 @@ public:
     juce::String getSecondaryDeviceName() const;
     double getSecondarySampleRate() const;
     int getSecondaryBufferSize() const;
+    bool hasNativeVirtualAudioDriver() const noexcept { return nativeVirtualAudioDriverInstalled.load(std::memory_order_relaxed); }
+    void setNativeVirtualAudioDriverInstalled(bool installed) noexcept
+    {
+        nativeVirtualAudioDriverInstalled.store(installed, std::memory_order_release);
+        notifyStatusChanged();
+    }
+    juce::String getDriverReadinessSummary() const;
 
     juce::String openSecondaryVirtualDevice(const juce::String& deviceName);
+    juce::String openSecondaryOutputDevice(const juce::String& deviceName);
     void closeSecondaryDevice();
+    void setSecondaryOutputBus(SecondaryOutputBus bus) noexcept { secondaryOutputBus.store(bus, std::memory_order_relaxed); }
+    SecondaryOutputBus getSecondaryOutputBus() const noexcept { return secondaryOutputBus.load(std::memory_order_relaxed); }
+    void setSecondaryOutputGain(float gain) noexcept { secondaryOutputGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
+    float getSecondaryOutputGain() const noexcept { return secondaryOutputGain.load(std::memory_order_relaxed); }
+    void setSecondaryOutputMuted(bool muted) noexcept { secondaryOutputMuted.store(muted, std::memory_order_relaxed); }
+    bool isSecondaryOutputMuted() const noexcept { return secondaryOutputMuted.load(std::memory_order_relaxed); }
 
     // =========================================================================
     // Audio Pipeline & FIFO Bridging (Real-Time Safe)
@@ -83,6 +104,9 @@ public:
      * the lock-free FIFO for the secondary streaming device.
      */
     void pushStreamAudioBlock(const juce::AudioBuffer<float>& streamBuffer, int numSamples);
+    void pushOutputAudioBlock(const juce::AudioBuffer<float>& streamBuffer,
+                              const juce::AudioBuffer<float>& monitorBuffer,
+                              int numSamples);
 
     // juce::AudioIODeviceCallback implementation for Secondary Device
     void audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
@@ -129,9 +153,15 @@ private:
     juce::AudioDeviceManager& primaryDeviceManager;
     std::unique_ptr<juce::AudioDeviceManager> secondaryDeviceManager;
 
-    std::atomic<OBSRoutingMode> currentRoutingMode{OBSRoutingMode::PrimaryMultiChannel};
+    // A stereo primary device can only carry one independent bus pair. Default to
+    // monitoring on the primary device while Stream uses an optional secondary output.
+    std::atomic<OBSRoutingMode> currentRoutingMode{OBSRoutingMode::DedicatedSecondaryDevice};
+    std::atomic<SecondaryOutputBus> secondaryOutputBus{SecondaryOutputBus::Stream};
+    std::atomic<float> secondaryOutputGain{1.0f};
+    std::atomic<bool> secondaryOutputMuted{false};
     std::atomic<bool> streamRunning{false};
     std::atomic<bool> deviceErrorState{false};
+    std::atomic<bool> nativeVirtualAudioDriverInstalled{false};
     juce::String lastErrorMessage;
     juce::String chosenVirtualDeviceName;
 

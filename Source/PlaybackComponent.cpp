@@ -786,6 +786,9 @@ void PlaybackComponent::formatTimeText(double currentSecs, double totalSecs)
 
 void PlaybackComponent::timerCallback()
 {
+    if (audioPlayer.consumeAutoNextRequest())
+        audioPlayer.nextTrack();
+
     // Update playhead and digital timestamp
     if (audioPlayer.isPlaying() || audioPlayer.isPaused())
     {

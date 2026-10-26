@@ -36,6 +36,7 @@ public:
 
     void setLevelMeter(float peakL, float peakR, float rmsL, float rmsR);
     void setGainDb(float gainDb);
+    void setChannelName(const juce::String& name);
     float getGainDb() const;
 
     juce::Slider fader;
@@ -101,8 +102,9 @@ private:
     // Top Control / Status Bar
     juce::Label titleLabel{"title", "OBS Studio Integration"};
     juce::Label statusPill;
-    juce::Label deviceLabel{"dev", "Stream Bus Output:"};
+    juce::Label deviceLabel{"dev", "Endpoint Output:"};
     juce::ComboBox streamDeviceCombo;
+    juce::ComboBox endpointBusCombo;
     juce::Label routingModeLabel{"mode", "Routing Mode:"};
     juce::ComboBox routingModeCombo;
 
@@ -117,6 +119,9 @@ private:
     std::unique_ptr<OBSChannelStrip> guitarStrip;
     std::unique_ptr<OBSChannelStrip> musicStrip;
     std::unique_ptr<OBSChannelStrip> monitorStrip;
+    std::unique_ptr<OBSChannelStrip> endpointOutputStrip;
+    juce::StringArray outputDeviceNames;
+    bool updatingOutputDevices = false;
 
     // Overlay Guide Dialog
     std::unique_ptr<OBSGuideComponent> guideComponent;
