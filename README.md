@@ -37,6 +37,17 @@ cmake --build build --config Release
 
 The mixer, VST3 helper, and test executable are generated under their respective `build/*_artefacts/Release` directories.
 
+## Run on another PC
+
+To share the app without source code or Visual Studio:
+
+1. Build the Release binaries, then run `.\package_release.ps1` from the repository root in PowerShell.
+2. Copy `dist\LiveBusMixer-Release-*.zip` to the other PC and extract the entire archive to a local folder.
+3. Run `Jalankan_LiveBusMixer.bat`. Python is not required; keep the `bin` folder beside the launcher so the VST3 helper can be found.
+4. If Windows reports a missing Visual C++ runtime, install the **Microsoft Visual C++ Redistributable 2015–2022 x64** from [Microsoft](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
+The release package targets Windows 10/11 x64 and includes the mixer and VST3 helper. ASIO drivers and third-party VST3 plugins are not included and must be installed on the target PC. `run_app.py` is an optional launcher for systems that have Python installed.
+
 ## Test
 
 ```powershell
