@@ -1,4 +1,4 @@
-# LiveBus Mixer v1.0 — Professional Broadcast & Monitor Console for Windows
+# LiveBus Mixer v1.1 — Professional Broadcast & Monitor Console for Windows
 
 LiveBus Mixer is a high-performance, real-time desktop audio mixer, DSP routing matrix, and VST3 host engineered with JUCE (C++17) and CMake for Windows 10/11 x64. It is designed specifically for live streaming, live music broadcasting, and vocal processing with OBS Studio integration and a professional DAW broadcast console interface.
 

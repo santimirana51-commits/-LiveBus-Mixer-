@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(LiveBusMixer VERSION 0.4.0 LANGUAGES C CXX)
+project(LiveBusMixer VERSION 1.1.0 LANGUAGES C CXX)
 enable_testing()
 
 if(NOT DEFINED JUCE_DIR)

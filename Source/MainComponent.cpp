@@ -249,7 +249,7 @@ MainComponent::MainComponent()
     setLookAndFeel(&consoleLookAndFeel);
 
     // 1. Top Header Bar
-    brandLabel.setText("LiveBus Mixer v1.0", juce::dontSendNotification);
+    brandLabel.setText("LiveBus Mixer v1.1", juce::dontSendNotification);
     brandLabel.setFont(juce::FontOptions(16.0f, juce::Font::bold));
     brandLabel.setColour(juce::Label::textColourId, juce::Colour(0xff00f5d4));
     addAndMakeVisible(brandLabel);
