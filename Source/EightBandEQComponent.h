@@ -2,6 +2,7 @@
 #include <JuceHeader.h>
 #include "EightBandEQ.h"
 #include "RoutingMatrix.h"
+#include "PresetManager.h"
 #include <array>
 #include <functional>
 #include <vector>
@@ -40,7 +41,8 @@ namespace LiveBus
             NumNavModules = 7
         };
 
-        explicit EightBandEQComponent(std::array<BusDSPProcessor*, NumTargets> targetDSPs);
+        explicit EightBandEQComponent(std::array<BusDSPProcessor*, NumTargets> targetDSPs,
+                                      PresetManager* presetManager = nullptr);
         explicit EightBandEQComponent(std::array<EightBandEQProcessor*, NumTargets> processors);
         ~EightBandEQComponent() override;
 
@@ -51,10 +53,12 @@ namespace LiveBus
         void comboBoxChanged(juce::ComboBox* combo) override;
         void buttonClicked(juce::Button* button) override;
         void timerCallback() override;
+        void refreshEQCatalogPresets();
 
         void setSelectedTarget(TargetIndex target);
         TargetIndex getSelectedTarget() const noexcept { return currentTarget; }
         std::function<void(TargetIndex)> onTargetSelected;
+        std::function<void(TargetIndex)> onParametersChanged;
 
         void setSelectedNavModule(DSPNavModule module);
         DSPNavModule getSelectedNavModule() const noexcept { return currentNavModule; }
@@ -168,6 +172,8 @@ namespace LiveBus
 
     private:
         std::array<BusDSPProcessor*, NumTargets> targetDSPs{};
+        PresetManager* presetManager = nullptr;
+        std::vector<PresetItem> catalogPresetItems;
         std::array<EightBandEQProcessor*, NumTargets> targetProcessors{};
         TargetIndex currentTarget = TargetStreamBus;
         DSPNavModule currentNavModule = NavEqualizer;
@@ -243,6 +249,8 @@ namespace LiveBus
 
         std::vector<EQPreset> userPresets;
         void loadFactoryPresets();
+        bool saveCurrentEQCatalogPreset(const juce::String& name,
+                                        const PresetItem* existingItem);
         void applyPreset(const EightBandEQParameters& params);
 
         // =====================================================================

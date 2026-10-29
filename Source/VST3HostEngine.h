@@ -54,6 +54,7 @@ public:
     void clearLibraryCache();
 
     std::vector<PluginInfoItem> getLibraryPlugins() const;
+    void registerBundledPlugin(const juce::PluginDescription& description);
     void setFavorite(const juce::String& identifier, bool favorite);
     void setDefaultPlugin(const juce::String& identifier);
     juce::String getDefaultPluginIdentifier() const { return defaultPluginId; }
@@ -84,6 +85,7 @@ public:
     PluginChainSlot getSlotInfo(int targetIndex, int slotIndex) const;
     juce::AudioPluginInstance* getPluginInstance(int targetIndex, int slotIndex) const;
     int getTargetTotalLatency(int targetIndex) const;
+    bool hasActivePluginNamed(int targetIndex, const juce::String& pluginName) const noexcept;
     juce::String getLastLoadError() const;
     double getCurrentSampleRate() const { return currentSampleRate.load(std::memory_order_relaxed); }
     PluginHostClient::PluginState getTargetIsolatedState(int targetIndex) const;

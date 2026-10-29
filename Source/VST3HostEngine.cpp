@@ -19,6 +19,11 @@ VST3HostEngine::VST3HostEngine(PluginHostClient& isolatedClient)
     scanSettings.customScanPaths.add("C:\\Program Files (x86)\\Common Files\\VST3");
 
     loadLibraryCache();
+    const auto bundledPluginsDirectory =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+            .getParentDirectory().getChildFile("Plugins");
+    scanSettings.customScanPaths.addIfNotAlreadyThere(
+        bundledPluginsDirectory.getFullPathName());
 }
 
 VST3HostEngine::~VST3HostEngine()
@@ -194,7 +199,25 @@ void VST3HostEngine::loadLibraryCache()
                 for (auto* c = pNode->getFirstChildElement(); c != nullptr; c = c->getNextElement())
                 {
                     if (c->hasTagName("PluginItem"))
-                        pluginLibrary.push_back(PluginInfoItem::fromXml(*c));
+                    {
+                        auto loadedItem = PluginInfoItem::fromXml(*c);
+                        const auto name = loadedItem.getDisplayName();
+                        const auto id = loadedItem.description.fileOrIdentifier;
+
+                        bool isDup = false;
+                        for (auto& existing : pluginLibrary)
+                        {
+                            if ((id.isNotEmpty() && existing.description.fileOrIdentifier == id) ||
+                                (name.isNotEmpty() && existing.getDisplayName() == name))
+                            {
+                                isDup = true;
+                                break;
+                            }
+                        }
+
+                        if (!isDup)
+                            pluginLibrary.push_back(std::move(loadedItem));
+                    }
                 }
             }
         }
@@ -253,6 +276,36 @@ std::vector<PluginInfoItem> VST3HostEngine::getLibraryPlugins() const
 {
     std::lock_guard<std::mutex> lock(libraryMutex);
     return pluginLibrary;
+}
+
+void VST3HostEngine::registerBundledPlugin(const juce::PluginDescription& description)
+{
+    knownPluginList.addType(description);
+    {
+        std::lock_guard<std::mutex> lock(libraryMutex);
+        const auto existing = std::find_if(pluginLibrary.begin(), pluginLibrary.end(),
+            [&description](const PluginInfoItem& item)
+            {
+                return item.description.isDuplicateOf(description) ||
+                       (description.name.isNotEmpty() && item.description.name == description.name) ||
+                       (description.fileOrIdentifier.isNotEmpty() && item.description.fileOrIdentifier == description.fileOrIdentifier);
+            });
+        if (existing != pluginLibrary.end())
+        {
+            existing->description = description;
+            existing->profile = "Bundled";
+        }
+        else
+        {
+            PluginInfoItem item;
+            item.description = description;
+            item.profile = "Bundled";
+            item.isFavorite = true;
+            pluginLibrary.push_back(std::move(item));
+        }
+    }
+    saveLibraryCache();
+    sendChangeMessage();
 }
 
 void VST3HostEngine::setFavorite(const juce::String& identifier, bool favorite)
@@ -723,6 +776,23 @@ int VST3HostEngine::getTargetTotalLatency(int targetIndex) const
             total += inst->latency.load(std::memory_order_relaxed);
     }
     return total;
+}
+
+bool VST3HostEngine::hasActivePluginNamed(int targetIndex,
+                                          const juce::String& pluginName) const noexcept
+{
+    if (targetIndex < 0 || targetIndex >= NumTargets)
+        return false;
+
+    const auto* chain = publishedChains[(size_t)targetIndex].load(std::memory_order_seq_cst);
+    if (chain == nullptr)
+        return false;
+
+    for (const auto& instance : *chain)
+        if (instance != nullptr && instance->slotInfo.pluginName == pluginName &&
+            !instance->isBypassed.load(std::memory_order_relaxed))
+            return true;
+    return false;
 }
 
 juce::String VST3HostEngine::getLastLoadError() const

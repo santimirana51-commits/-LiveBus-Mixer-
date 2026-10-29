@@ -1,4 +1,5 @@
 #include "SceneManager.h"
+#include <cmath>
 
 SceneManager::SceneManager()
 {
@@ -371,6 +372,134 @@ juce::String SceneManager::serializeToXmlString(const SceneData& data)
         }
     }
 
+    auto* puzuElem = xml.createNewChildElement("PUZU_EQS");
+    for (int t = 0; t < (int)data.puzuEQs.size(); ++t)
+    {
+        auto* targetElem = puzuElem->createNewChildElement("TARGET");
+        targetElem->setAttribute("index", t);
+        targetElem->setAttribute("masterEnabled", data.puzuEQs[(size_t)t].masterEnabled);
+        for (int b = 0; b < (int)data.puzuEQs[(size_t)t].bands.size(); ++b)
+        {
+            const auto& band = data.puzuEQs[(size_t)t].bands[(size_t)b];
+            auto* bandElem = targetElem->createNewChildElement("BAND");
+            bandElem->setAttribute("index", b);
+            bandElem->setAttribute("type", band.type);
+            bandElem->setAttribute("freq", (double)band.freq);
+            bandElem->setAttribute("gainDb", (double)band.gainDb);
+            bandElem->setAttribute("q", (double)band.q);
+            bandElem->setAttribute("enabled", band.enabled);
+        }
+    }
+
+    auto* graphicEQElem = xml.createNewChildElement("MONITOR_GRAPHIC_EQ_31");
+    graphicEQElem->setAttribute("enabled", data.monitorGraphicEQ31.enabled);
+    for (int band = 0; band < numMonitorGraphicEQBands; ++band)
+    {
+        auto* bandElem = graphicEQElem->createNewChildElement("BAND");
+        bandElem->setAttribute("index", band);
+        bandElem->setAttribute("freq", (double)monitorGraphicEQFrequencies[(size_t)band]);
+        bandElem->setAttribute("gainDb", (double)data.monitorGraphicEQ31.gainDb[(size_t)band]);
+    }
+
+    auto* mainOutputEQElem = xml.createNewChildElement("MAIN_OUTPUT_EQ_24");
+    mainOutputEQElem->setAttribute("enabled", data.mainOutputEQ24.enabled);
+    for (int band = 0; band < numMainOutputEQBands; ++band)
+    {
+        const auto& state = data.mainOutputEQ24.bands[(size_t)band];
+        auto* bandElem = mainOutputEQElem->createNewChildElement("BAND");
+        bandElem->setAttribute("index", band);
+        bandElem->setAttribute("type", (int)state.type);
+        bandElem->setAttribute("freq", (double)state.freq);
+        bandElem->setAttribute("gainDb", (double)state.gainDb);
+        bandElem->setAttribute("q", (double)state.q);
+        bandElem->setAttribute("enabled", state.enabled);
+        bandElem->setAttribute("dynamicEnabled", state.dynamicEnabled);
+        bandElem->setAttribute("dynamicThresholdDb", (double)state.dynamicThresholdDb);
+        bandElem->setAttribute("dynamicAttackMs", (double)state.dynamicAttackMs);
+        bandElem->setAttribute("dynamicReleaseMs", (double)state.dynamicReleaseMs);
+        bandElem->setAttribute("dynamicRangeDb", (double)state.dynamicRangeDb);
+        bandElem->setAttribute("dynamicDetector", (int)state.dynamicDetector);
+    }
+
+    auto* abElem = xml.createNewChildElement("EQ_AB_STATES");
+    auto* puzuABElem = abElem->createNewChildElement("PUZU");
+    for (int target = 0; target < (int)data.puzuEQABSlots.size(); ++target)
+    {
+        auto* targetElem = puzuABElem->createNewChildElement("TARGET");
+        targetElem->setAttribute("index", target);
+        targetElem->setAttribute("activeSlot",
+            juce::jlimit(0, 1, data.puzuEQActiveABSlots[(size_t)target]));
+        for (int slot = 0; slot < 2; ++slot)
+        {
+            const auto& eq = data.puzuEQABSlots[(size_t)target][(size_t)slot];
+            auto* slotElem = targetElem->createNewChildElement("SLOT");
+            slotElem->setAttribute("index", slot);
+            slotElem->setAttribute("enabled", eq.masterEnabled);
+            for (int band = 0; band < (int)eq.bands.size(); ++band)
+            {
+                const auto& bandState = eq.bands[(size_t)band];
+                auto* bandElem = slotElem->createNewChildElement("BAND");
+                bandElem->setAttribute("index", band);
+                bandElem->setAttribute("type", bandState.type);
+                bandElem->setAttribute("freq", (double)bandState.freq);
+                bandElem->setAttribute("gainDb", (double)bandState.gainDb);
+                bandElem->setAttribute("q", (double)bandState.q);
+                bandElem->setAttribute("enabled", bandState.enabled);
+            }
+        }
+    }
+
+    auto* monitorABElem = abElem->createNewChildElement("MONITOR_GRAPHIC_EQ");
+    monitorABElem->setAttribute("activeSlot",
+        juce::jlimit(0, 1, data.monitorGraphicEQ31ActiveABSlot));
+    for (int slot = 0; slot < 2; ++slot)
+    {
+        const auto& eq = data.monitorGraphicEQ31ABSlots[(size_t)slot];
+        auto* slotElem = monitorABElem->createNewChildElement("SLOT");
+        slotElem->setAttribute("index", slot);
+        slotElem->setAttribute("enabled", eq.enabled);
+        for (int band = 0; band < numMonitorGraphicEQBands; ++band)
+        {
+            auto* bandElem = slotElem->createNewChildElement("BAND");
+            bandElem->setAttribute("index", band);
+            bandElem->setAttribute("gainDb",
+                                   (double)eq.gainDb[(size_t)band]);
+        }
+    }
+
+    auto* mainABElem = abElem->createNewChildElement("MAIN_OUTPUT_EQ");
+    mainABElem->setAttribute("activeSlot",
+        juce::jlimit(0, 1, data.mainOutputEQ24ActiveABSlot));
+    for (int slot = 0; slot < 2; ++slot)
+    {
+        const auto& eq = data.mainOutputEQ24ABSlots[(size_t)slot];
+        auto* slotElem = mainABElem->createNewChildElement("SLOT");
+        slotElem->setAttribute("index", slot);
+        slotElem->setAttribute("enabled", eq.enabled);
+        for (int band = 0; band < numMainOutputEQBands; ++band)
+        {
+            const auto& state = eq.bands[(size_t)band];
+            auto* bandElem = slotElem->createNewChildElement("BAND");
+            bandElem->setAttribute("index", band);
+            bandElem->setAttribute("type", (int)state.type);
+            bandElem->setAttribute("freq", (double)state.freq);
+            bandElem->setAttribute("gainDb", (double)state.gainDb);
+            bandElem->setAttribute("q", (double)state.q);
+            bandElem->setAttribute("enabled", state.enabled);
+            bandElem->setAttribute("dynamicEnabled", state.dynamicEnabled);
+            bandElem->setAttribute("dynamicThresholdDb",
+                                   (double)state.dynamicThresholdDb);
+            bandElem->setAttribute("dynamicAttackMs",
+                                   (double)state.dynamicAttackMs);
+            bandElem->setAttribute("dynamicReleaseMs",
+                                   (double)state.dynamicReleaseMs);
+            bandElem->setAttribute("dynamicRangeDb",
+                                   (double)state.dynamicRangeDb);
+            bandElem->setAttribute("dynamicDetector",
+                                   (int)state.dynamicDetector);
+        }
+    }
+
     // Professional Vocal DSP Racks for all channel and bus targets
     auto* vrElem = xml.createNewChildElement("VOCAL_RACKS");
     for (int t = 0; t < (int)data.vocalRacks.size(); ++t)
@@ -613,6 +742,264 @@ bool SceneManager::deserializeFromXml(const juce::XmlElement& xml, SceneData& ou
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if (auto* puzuElem = xml.getChildByName("PUZU_EQS"))
+    {
+        outData.hasPuzuEQData = true;
+        for (auto* targetElem : puzuElem->getChildIterator())
+        {
+            if (!targetElem->hasTagName("TARGET"))
+                continue;
+
+            const int target = targetElem->getIntAttribute("index", -1);
+            if (target < 0 || target >= (int)outData.puzuEQs.size())
+                continue;
+
+            auto& eq = outData.puzuEQs[(size_t)target];
+            eq.masterEnabled = targetElem->getBoolAttribute("masterEnabled", false);
+            for (auto* bandElem : targetElem->getChildIterator())
+            {
+                if (!bandElem->hasTagName("BAND"))
+                    continue;
+
+                const int bandIndex = bandElem->getIntAttribute("index", -1);
+                if (bandIndex < 0 || bandIndex >= (int)eq.bands.size())
+                    continue;
+
+                auto& band = eq.bands[(size_t)bandIndex];
+                band.type = juce::jlimit(0, 5, bandElem->getIntAttribute("type", 2));
+                const float frequency = (float)bandElem->getDoubleAttribute(
+                    "freq", defaultPuzuFreqs[bandIndex]);
+                const float gainDb = (float)bandElem->getDoubleAttribute("gainDb", 0.0);
+                const float q = (float)bandElem->getDoubleAttribute(
+                    "q", defaultPuzuQs[bandIndex]);
+                band.freq = std::isfinite(frequency)
+                    ? juce::jlimit(20.0f, 20000.0f, frequency)
+                    : defaultPuzuFreqs[bandIndex];
+                band.gainDb = std::isfinite(gainDb)
+                    ? juce::jlimit(-18.0f, 18.0f, gainDb) : 0.0f;
+                band.q = std::isfinite(q)
+                    ? juce::jlimit(0.1f, 10.0f, q) : defaultPuzuQs[bandIndex];
+                band.enabled = bandElem->getBoolAttribute("enabled", true);
+            }
+        }
+    }
+
+    if (auto* graphicEQElem = xml.getChildByName("MONITOR_GRAPHIC_EQ_31"))
+    {
+        outData.hasMonitorGraphicEQ31Data = true;
+        outData.monitorGraphicEQ31.enabled =
+            graphicEQElem->getBoolAttribute("enabled", false);
+        for (auto* bandElem : graphicEQElem->getChildIterator())
+        {
+            if (!bandElem->hasTagName("BAND"))
+                continue;
+            const int index = bandElem->getIntAttribute("index", -1);
+            if (index < 0 || index >= numMonitorGraphicEQBands)
+                continue;
+            const float gainDb = (float)bandElem->getDoubleAttribute("gainDb", 0.0);
+            outData.monitorGraphicEQ31.gainDb[(size_t)index] =
+                std::isfinite(gainDb) ? juce::jlimit(-12.0f, 12.0f, gainDb) : 0.0f;
+        }
+    }
+
+    if (auto* mainOutputEQElem = xml.getChildByName("MAIN_OUTPUT_EQ_24"))
+    {
+        outData.hasMainOutputEQ24Data = true;
+        outData.mainOutputEQ24.enabled =
+            mainOutputEQElem->getBoolAttribute("enabled", false);
+        for (auto* bandElem : mainOutputEQElem->getChildIterator())
+        {
+            if (!bandElem->hasTagName("BAND"))
+                continue;
+            const int index = bandElem->getIntAttribute("index", -1);
+            if (index < 0 || index >= numMainOutputEQBands)
+                continue;
+            auto& state = outData.mainOutputEQ24.bands[(size_t)index];
+            state.type = (MainOutputEQFilterType)juce::jlimit(0, 5,
+                bandElem->getIntAttribute("type", (int)MainOutputEQFilterType::Bell));
+            const float frequency = (float)bandElem->getDoubleAttribute(
+                "freq", mainOutputEQFrequencies[(size_t)index]);
+            const float gainDb = (float)bandElem->getDoubleAttribute("gainDb", 0.0);
+            const float q = (float)bandElem->getDoubleAttribute("q", 0.707);
+            const float thresholdDb = (float)bandElem->getDoubleAttribute(
+                "dynamicThresholdDb", -24.0);
+            const float attackMs = (float)bandElem->getDoubleAttribute(
+                "dynamicAttackMs", 10.0);
+            const float releaseMs = (float)bandElem->getDoubleAttribute(
+                "dynamicReleaseMs", 100.0);
+            const float rangeDb = (float)bandElem->getDoubleAttribute(
+                "dynamicRangeDb", 6.0);
+            const int detector = bandElem->getIntAttribute("dynamicDetector", 0);
+            state.freq = std::isfinite(frequency)
+                ? juce::jlimit(20.0f, 20000.0f, frequency)
+                : mainOutputEQFrequencies[(size_t)index];
+            state.gainDb = std::isfinite(gainDb)
+                ? juce::jlimit(-18.0f, 18.0f, gainDb) : 0.0f;
+            state.q = std::isfinite(q) ? juce::jlimit(0.1f, 10.0f, q) : 0.707f;
+            state.enabled = bandElem->getBoolAttribute("enabled", true);
+            state.dynamicEnabled =
+                bandElem->getBoolAttribute("dynamicEnabled", false);
+            state.dynamicThresholdDb = std::isfinite(thresholdDb)
+                ? juce::jlimit(-80.0f, 0.0f, thresholdDb) : -24.0f;
+            state.dynamicAttackMs = std::isfinite(attackMs)
+                ? juce::jlimit(0.1f, 100.0f, attackMs) : 10.0f;
+            state.dynamicReleaseMs = std::isfinite(releaseMs)
+                ? juce::jlimit(5.0f, 1000.0f, releaseMs) : 100.0f;
+            state.dynamicRangeDb = std::isfinite(rangeDb)
+                ? juce::jlimit(0.0f, 18.0f, rangeDb) : 6.0f;
+            state.dynamicDetector = detector == (int)MainOutputEQDetector::RMS
+                ? MainOutputEQDetector::RMS : MainOutputEQDetector::Peak;
+        }
+    }
+
+    if (auto* abElem = xml.getChildByName("EQ_AB_STATES"))
+    {
+        if (auto* puzuElem = abElem->getChildByName("PUZU"))
+        {
+            outData.hasPuzuEQABData = true;
+            for (auto* targetElem : puzuElem->getChildIterator())
+            {
+                if (!targetElem->hasTagName("TARGET"))
+                    continue;
+                const int target = targetElem->getIntAttribute("index", -1);
+                if (target < 0 || target >= (int)outData.puzuEQABSlots.size())
+                    continue;
+                outData.puzuEQActiveABSlots[(size_t)target] =
+                    juce::jlimit(0, 1, targetElem->getIntAttribute("activeSlot", 0));
+                for (auto* slotElem : targetElem->getChildIterator())
+                {
+                    if (!slotElem->hasTagName("SLOT"))
+                        continue;
+                    const int slot = slotElem->getIntAttribute("index", -1);
+                    if (slot < 0 || slot > 1)
+                        continue;
+                    auto& eq = outData.puzuEQABSlots[(size_t)target][(size_t)slot];
+                    eq.masterEnabled = slotElem->getBoolAttribute("enabled", false);
+                    for (auto* bandElem : slotElem->getChildIterator())
+                    {
+                        if (!bandElem->hasTagName("BAND"))
+                            continue;
+                        const int bandIndex = bandElem->getIntAttribute("index", -1);
+                        if (bandIndex < 0 || bandIndex >= (int)eq.bands.size())
+                            continue;
+                        auto& band = eq.bands[(size_t)bandIndex];
+                        band.type = juce::jlimit(0, 5,
+                            bandElem->getIntAttribute("type", 2));
+                        const float frequency = (float)bandElem->getDoubleAttribute(
+                            "freq", defaultPuzuFreqs[bandIndex]);
+                        const float gainDb =
+                            (float)bandElem->getDoubleAttribute("gainDb", 0.0);
+                        const float q = (float)bandElem->getDoubleAttribute(
+                            "q", defaultPuzuQs[bandIndex]);
+                        band.freq = std::isfinite(frequency)
+                            ? juce::jlimit(20.0f, 20000.0f, frequency)
+                            : defaultPuzuFreqs[bandIndex];
+                        band.gainDb = std::isfinite(gainDb)
+                            ? juce::jlimit(-18.0f, 18.0f, gainDb) : 0.0f;
+                        band.q = std::isfinite(q)
+                            ? juce::jlimit(0.1f, 10.0f, q)
+                            : defaultPuzuQs[bandIndex];
+                        band.enabled = bandElem->getBoolAttribute("enabled", true);
+                    }
+                }
+            }
+        }
+
+        if (auto* monitorElem = abElem->getChildByName("MONITOR_GRAPHIC_EQ"))
+        {
+            outData.hasMonitorGraphicEQ31ABData = true;
+            outData.monitorGraphicEQ31ActiveABSlot = juce::jlimit(
+                0, 1, monitorElem->getIntAttribute("activeSlot", 0));
+            for (auto* slotElem : monitorElem->getChildIterator())
+            {
+                if (!slotElem->hasTagName("SLOT"))
+                    continue;
+                const int slot = slotElem->getIntAttribute("index", -1);
+                if (slot < 0 || slot > 1)
+                    continue;
+                auto& eq = outData.monitorGraphicEQ31ABSlots[(size_t)slot];
+                eq.enabled = slotElem->getBoolAttribute("enabled", false);
+                for (auto* bandElem : slotElem->getChildIterator())
+                {
+                    if (!bandElem->hasTagName("BAND"))
+                        continue;
+                    const int band = bandElem->getIntAttribute("index", -1);
+                    if (band < 0 || band >= numMonitorGraphicEQBands)
+                        continue;
+                    const float gainDb =
+                        (float)bandElem->getDoubleAttribute("gainDb", 0.0);
+                    eq.gainDb[(size_t)band] = std::isfinite(gainDb)
+                        ? juce::jlimit(-12.0f, 12.0f, gainDb) : 0.0f;
+                }
+            }
+        }
+
+        if (auto* mainElem = abElem->getChildByName("MAIN_OUTPUT_EQ"))
+        {
+            outData.hasMainOutputEQ24ABData = true;
+            outData.mainOutputEQ24ActiveABSlot = juce::jlimit(
+                0, 1, mainElem->getIntAttribute("activeSlot", 0));
+            for (auto* slotElem : mainElem->getChildIterator())
+            {
+                if (!slotElem->hasTagName("SLOT"))
+                    continue;
+                const int slot = slotElem->getIntAttribute("index", -1);
+                if (slot < 0 || slot > 1)
+                    continue;
+                auto& eq = outData.mainOutputEQ24ABSlots[(size_t)slot];
+                eq.enabled = slotElem->getBoolAttribute("enabled", false);
+                for (auto* bandElem : slotElem->getChildIterator())
+                {
+                    if (!bandElem->hasTagName("BAND"))
+                        continue;
+                    const int index = bandElem->getIntAttribute("index", -1);
+                    if (index < 0 || index >= numMainOutputEQBands)
+                        continue;
+                    auto& state = eq.bands[(size_t)index];
+                    state.type = (MainOutputEQFilterType)juce::jlimit(0, 5,
+                        bandElem->getIntAttribute(
+                            "type", (int)MainOutputEQFilterType::Bell));
+                    const float frequency = (float)bandElem->getDoubleAttribute(
+                        "freq", mainOutputEQFrequencies[(size_t)index]);
+                    const float gainDb =
+                        (float)bandElem->getDoubleAttribute("gainDb", 0.0);
+                    const float q =
+                        (float)bandElem->getDoubleAttribute("q", 0.707);
+                    state.freq = std::isfinite(frequency)
+                        ? juce::jlimit(20.0f, 20000.0f, frequency)
+                        : mainOutputEQFrequencies[(size_t)index];
+                    state.gainDb = std::isfinite(gainDb)
+                        ? juce::jlimit(-18.0f, 18.0f, gainDb) : 0.0f;
+                    state.q = std::isfinite(q)
+                        ? juce::jlimit(0.1f, 10.0f, q) : 0.707f;
+                    state.enabled = bandElem->getBoolAttribute("enabled", true);
+                    state.dynamicEnabled =
+                        bandElem->getBoolAttribute("dynamicEnabled", false);
+                    const float thresholdDb = (float)bandElem->getDoubleAttribute(
+                        "dynamicThresholdDb", -24.0);
+                    const float attackMs = (float)bandElem->getDoubleAttribute(
+                        "dynamicAttackMs", 10.0);
+                    const float releaseMs = (float)bandElem->getDoubleAttribute(
+                        "dynamicReleaseMs", 100.0);
+                    const float rangeDb = (float)bandElem->getDoubleAttribute(
+                        "dynamicRangeDb", 6.0);
+                    state.dynamicThresholdDb = std::isfinite(thresholdDb)
+                        ? juce::jlimit(-80.0f, 0.0f, thresholdDb) : -24.0f;
+                    state.dynamicAttackMs = std::isfinite(attackMs)
+                        ? juce::jlimit(0.1f, 100.0f, attackMs) : 10.0f;
+                    state.dynamicReleaseMs = std::isfinite(releaseMs)
+                        ? juce::jlimit(5.0f, 1000.0f, releaseMs) : 100.0f;
+                    state.dynamicRangeDb = std::isfinite(rangeDb)
+                        ? juce::jlimit(0.0f, 18.0f, rangeDb) : 6.0f;
+                    state.dynamicDetector =
+                        bandElem->getIntAttribute("dynamicDetector", 0) ==
+                                (int)MainOutputEQDetector::RMS
+                            ? MainOutputEQDetector::RMS : MainOutputEQDetector::Peak;
                 }
             }
         }

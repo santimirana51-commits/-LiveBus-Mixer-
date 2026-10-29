@@ -9,39 +9,39 @@ public:
     bool moreThanOneInstanceAllowed() override { return true; }
     void initialise(const juce::String& commandLine) override
     {
-        juce::File initLog("C:\\Users\\miran\\Documents\\muli agen\\init_log.txt");
-        initLog.replaceWithText("commandLine arg: [" + commandLine + "]\n"
-                                + "getCommandLineParameters: [" + juce::JUCEApplication::getCommandLineParameters() + "]\n");
+        juce::File logFile = juce::File::getCurrentWorkingDirectory().getChildFile("launch_debug.txt");
+        logFile.replaceWithText("Initialise called with cmdLine: [" + commandLine + "]\n");
 
         window = std::make_unique<Window>();
-        juce::String cmd = commandLine + " " + juce::JUCEApplication::getCommandLineParameters() + " " + juce::String(GetCommandLineA());
+        logFile.appendText("Window created successfully.\n");
 
-        if (cmd.containsIgnoreCase("snapshot"))
+        if (commandLine.trim().equalsIgnoreCase("--snapshot"))
         {
-            initLog.appendText("Starting snapshot capture... cmd: " + cmd + "\n");
+            logFile.appendText("Snapshot flag matched. Quitting after capture.\n");
             if (auto* mc = dynamic_cast<MainComponent*>(window->getContentComponent()))
             {
                 juce::File currentDir = juce::File::getCurrentWorkingDirectory();
-                initLog.appendText("Current dir: " + currentDir.getFullPathName() + "\n");
                 mc->captureTabSnapshots(currentDir);
-
-                juce::File wsDir("C:\\Users\\miran\\Documents\\muli agen");
-                if (wsDir.exists() && wsDir != currentDir)
-                {
-                    initLog.appendText("Writing to ws dir: " + wsDir.getFullPathName() + "\n");
-                    mc->captureTabSnapshots(wsDir);
-                }
-                initLog.appendText("Snapshots done!\n");
-            }
-            else
-            {
-                initLog.appendText("Failed: content component is not MainComponent!\n");
             }
             quit();
         }
+        else
+        {
+            logFile.appendText("Normal launch: window visible=" + juce::String(window->isVisible() ? "true" : "false") + "\n");
+        }
     }
-    void shutdown() override { window.reset(); }
-    void systemRequestedQuit() override { quit(); }
+    void shutdown() override
+    {
+        juce::File logFile = juce::File::getCurrentWorkingDirectory().getChildFile("launch_debug.txt");
+        logFile.appendText("Shutdown callback entered.\n");
+        window.reset();
+    }
+    void systemRequestedQuit() override
+    {
+        juce::File logFile = juce::File::getCurrentWorkingDirectory().getChildFile("launch_debug.txt");
+        logFile.appendText("systemRequestedQuit() was triggered! Stack/quit requested.\n");
+        quit();
+    }
     void anotherInstanceStarted(const juce::String&) override {}
 
     class Window final : public juce::DocumentWindow
@@ -50,12 +50,16 @@ public:
         Window() : DocumentWindow("LiveBus Mixer v1.0", juce::Colour(0xff0e1217),
                                   DocumentWindow::allButtons)
         {
+            auto* mainComp = new MainComponent();
+            mainComp->setVisible(true);
             setUsingNativeTitleBar(true);
-            setContentOwned(new MainComponent(), true);
+            setContentOwned(mainComp, true);
             centreWithSize(1380, 860);
             setResizable(true, true);
             setResizeLimits(1280, 760, 10000, 10000);
             setVisible(true);
+            toFront(true);
+            juce::Process::makeForegroundProcess();
         }
         void closeButtonPressed() override
         {

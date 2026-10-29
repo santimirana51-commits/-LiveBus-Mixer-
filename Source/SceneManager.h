@@ -126,6 +126,60 @@ struct SceneData
     // Legacy indices 0-5 remain Stream, Monitor, and Channels 1-4; 6-17 are Channels 5-16.
     std::array<EightBandEQSceneData, maxInputs + 2> eightBandEQs;
 
+    struct PuzuEQSceneData
+    {
+        bool masterEnabled = false;
+        struct BandSceneData
+        {
+            int type = (int)PuzuFilterType::Bell;
+            float freq = 1000.0f;
+            float gainDb = 0.0f;
+            float q = 1.19f;
+            bool enabled = true;
+        };
+        std::array<BandSceneData, 15> bands;
+
+        PuzuEQSceneData()
+        {
+            for (int band = 0; band < 15; ++band)
+            {
+                bands[(size_t)band].freq = defaultPuzuFreqs[band];
+                bands[(size_t)band].q = defaultPuzuQs[band];
+            }
+        }
+    };
+    // Indices 0-1 are Stream and Monitor; 2-17 are input channels 1-16.
+    std::array<PuzuEQSceneData, maxInputs + 2> puzuEQs;
+    bool hasPuzuEQData = false;
+    std::array<std::array<PuzuEQSceneData, 2>, maxInputs + 2> puzuEQABSlots;
+    std::array<int, maxInputs + 2> puzuEQActiveABSlots{};
+    bool hasPuzuEQABData = false;
+
+    struct MonitorGraphicEQ31SceneData
+    {
+        bool enabled = false;
+        std::array<float, numMonitorGraphicEQBands> gainDb{};
+    } monitorGraphicEQ31;
+    bool hasMonitorGraphicEQ31Data = false;
+    std::array<MonitorGraphicEQ31SceneData, 2> monitorGraphicEQ31ABSlots{};
+    int monitorGraphicEQ31ActiveABSlot = 0;
+    bool hasMonitorGraphicEQ31ABData = false;
+
+    struct MainOutputEQ24SceneData
+    {
+        bool enabled = false;
+        std::array<MainOutputEQ24BandState, numMainOutputEQBands> bands{};
+        MainOutputEQ24SceneData()
+        {
+            for (int band = 0; band < numMainOutputEQBands; ++band)
+                bands[(size_t)band].freq = mainOutputEQFrequencies[(size_t)band];
+        }
+    } mainOutputEQ24;
+    bool hasMainOutputEQ24Data = false;
+    std::array<MainOutputEQ24SceneData, 2> mainOutputEQ24ABSlots{};
+    int mainOutputEQ24ActiveABSlot = 0;
+    bool hasMainOutputEQ24ABData = false;
+
     // Legacy indices 0-5 remain Stream, Monitor, and Channels 1-4; 6-17 are Channels 5-16.
     struct VocalDSPSceneData
     {

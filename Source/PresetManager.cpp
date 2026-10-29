@@ -1,7 +1,67 @@
 #include "PresetManager.h"
+#include "EQPresetCatalog.h"
 
 namespace LiveBus
 {
+namespace
+{
+
+juce::String sanitizePresetName(const juce::String& name)
+{
+    return name.retainCharacters(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-")
+        .trim();
+}
+
+bool writeTextAtomically(const juce::File& destination,
+                         const juce::String& contents,
+                         juce::String& error)
+{
+    if (!destination.getParentDirectory().createDirectory())
+    {
+        error = "Could not create preset directory.";
+        return false;
+    }
+
+    const auto temp = destination.getSiblingFile(
+        destination.getFileName() + "." +
+        juce::String(juce::Random::getSystemRandom().nextInt()) + ".tmp");
+    if (!temp.replaceWithText(contents))
+    {
+        error = "Could not write temporary preset file.";
+        return false;
+    }
+
+    const bool replaced = destination.existsAsFile()
+        ? temp.replaceFileIn(destination)
+        : temp.moveFileTo(destination);
+    if (!replaced)
+    {
+        temp.deleteFile();
+        error = "Could not atomically replace preset file.";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool isEQUserFile(const PresetItem& item, const juce::File& expectedDirectory)
+{
+    return item.category == PresetCategory::EQCatalog &&
+           !item.isFactory &&
+           item.userFile.existsAsFile() &&
+           item.userFile.getParentDirectory().getFullPathName() ==
+               expectedDirectory.getFullPathName();
+}
+
+juce::String userEQPresetId(const juce::String& name)
+{
+    return "user." + name.toLowerCase()
+        .retainCharacters("abcdefghijklmnopqrstuvwxyz0123456789 ")
+        .trim().replace(" ", "-");
+}
+
+} // namespace
 
 PresetManager::PresetManager()
 {
@@ -60,6 +120,15 @@ std::vector<PresetItem> PresetManager::getFactoryPresets(PresetCategory cat) con
             list.push_back({ "Club Broadcast Punch", cat, true, "Punchy comp 4:1, low shelf punch, limiter ceiling -0.5dB" });
             break;
 
+        case PresetCategory::EQCatalog:
+            for (const auto& preset : EQPresetCatalog::getFactoryPresets())
+            {
+                PresetItem item{ preset.name, cat, true, preset.description };
+                item.factoryId = preset.id;
+                list.push_back(std::move(item));
+            }
+            break;
+
         default:
             break;
     }
@@ -71,28 +140,301 @@ std::vector<PresetItem> PresetManager::getPresetsForCategory(PresetCategory cat)
     // Start with Factory presets
     auto presets = getFactoryPresets(cat);
 
-    // Append User presets from directory
-    auto dir = getCategoryDirectory(cat);
-    auto files = dir.findChildFiles(juce::File::findFiles, false, "*.xml");
-    for (const auto& f : files)
+    if (cat == PresetCategory::EQCatalog)
     {
-        PresetItem item;
-        item.name = f.getFileNameWithoutExtension();
-        item.category = cat;
-        item.isFactory = false;
-        item.userFile = f;
-        item.description = "User Preset";
+        auto favoritesFile = getCategoryDirectory(cat).getChildFile("favorites.xml");
+        auto favoriteXml = juce::XmlDocument::parse(favoritesFile);
+        juce::StringArray factoryFavorites;
+        if (favoriteXml && favoriteXml->hasTagName("LIVEBUS_EQ_FAVORITES"))
+            for (auto* favorite = favoriteXml->getFirstChildElement();
+                 favorite != nullptr; favorite = favorite->getNextElement())
+                if (favorite->hasTagName("PRESET"))
+                    factoryFavorites.add(
+                        favorite->getStringAttribute("id"));
 
-        auto xml = juce::XmlDocument::parse(f);
-        if (xml)
+        for (auto& item : presets)
+            item.isFavorite = factoryFavorites.contains(item.factoryId);
+
+        auto dir = getCategoryDirectory(cat);
+        auto files = dir.findChildFiles(juce::File::findFiles, false, "*.xml");
+        for (const auto& file : files)
         {
-            auto desc = xml->getStringAttribute("description", "");
-            if (desc.isNotEmpty())
-                item.description = desc;
+            if (file == favoritesFile)
+                continue;
+            PresetItem item;
+            item.category = cat;
+            item.userFile = file;
+            item.isFactory = false;
+            EQPresetDefinition definition;
+            juce::String error;
+            if (loadEQCatalogPreset(item, definition, error))
+            {
+                item.name = definition.name;
+                item.description = definition.description;
+                auto xml = juce::XmlDocument::parse(file);
+                item.isFavorite = xml != nullptr &&
+                                  xml->getBoolAttribute("favorite", false);
+            }
+            else
+            {
+                item.name = file.getFileNameWithoutExtension();
+                item.description = "Invalid EQ preset: " + error;
+            }
+            presets.push_back(std::move(item));
         }
-        presets.push_back(item);
+        return presets;
+    }
+
+    if (cat != PresetCategory::EQCatalog)
+    {
+        auto dir = getCategoryDirectory(cat);
+        auto files = dir.findChildFiles(juce::File::findFiles, false, "*.xml");
+        for (const auto& f : files)
+        {
+            PresetItem item;
+            item.name = f.getFileNameWithoutExtension();
+            item.category = cat;
+            item.isFactory = false;
+            item.userFile = f;
+            item.description = "User Preset";
+
+            auto xml = juce::XmlDocument::parse(f);
+            if (xml)
+            {
+                auto desc = xml->getStringAttribute("description", "");
+                if (desc.isNotEmpty())
+                    item.description = desc;
+            }
+            presets.push_back(item);
+        }
     }
     return presets;
+}
+
+juce::String PresetManager::serializeEQCatalogPreset(
+    const EQPresetDefinition& preset, const juce::String& description,
+    bool isFavorite) const
+{
+    juce::XmlElement xml("LIVEBUS_EQ_PRESET");
+    xml.setAttribute("formatVersion", preset.formatVersion);
+    xml.setAttribute("name", preset.name);
+    xml.setAttribute("description", description);
+    xml.setAttribute("category", (int)preset.category);
+    xml.setAttribute("favorite", isFavorite);
+    for (size_t index = 0; index < preset.bands.size(); ++index)
+    {
+        const auto& band = preset.bands[index];
+        auto* bandXml = xml.createNewChildElement("BAND");
+        bandXml->setAttribute("index", (int)index);
+        bandXml->setAttribute("type", (int)band.type);
+        bandXml->setAttribute("frequencyHz", (double)band.frequencyHz);
+        bandXml->setAttribute("gainDb", (double)band.gainDb);
+        bandXml->setAttribute("q", (double)band.q);
+        bandXml->setAttribute("enabled", band.enabled);
+    }
+    return xml.toString();
+}
+
+bool PresetManager::deserializeEQCatalogPreset(
+    const juce::XmlElement& xml, EQPresetDefinition& outPreset,
+    bool& outFavorite, juce::String& outError) const
+{
+    if (!xml.hasTagName("LIVEBUS_EQ_PRESET"))
+    {
+        outError = "Invalid EQ preset root element.";
+        return false;
+    }
+    if (xml.getIntAttribute("formatVersion", 0) != 1)
+    {
+        outError = "Unsupported EQ preset XML version.";
+        return false;
+    }
+    if (!xml.hasAttribute("name") || !xml.hasAttribute("description") ||
+        !xml.hasAttribute("category") || !xml.hasAttribute("favorite"))
+    {
+        outError = "EQ preset metadata is incomplete.";
+        return false;
+    }
+
+    EQPresetDefinition candidate;
+    candidate.name = xml.getStringAttribute("name");
+    candidate.description = xml.getStringAttribute("description");
+    if (candidate.name.length() > 80 ||
+        candidate.description.length() > 2048)
+    {
+        outError = "EQ preset name or description exceeds its size limit.";
+        return false;
+    }
+    candidate.category = (EQPresetCategory)xml.getIntAttribute("category", -1);
+    candidate.formatVersion = 1;
+    candidate.id = userEQPresetId(candidate.name);
+    outFavorite = xml.getBoolAttribute("favorite", false);
+
+    std::array<bool, 8> seenBands{};
+    size_t bandCount = 0;
+    for (auto* bandXml = xml.getFirstChildElement();
+         bandXml != nullptr; bandXml = bandXml->getNextElement())
+    {
+        if (!bandXml->hasTagName("BAND"))
+            continue;
+        const int index = bandXml->getIntAttribute("index", -1);
+        if (index < 0 || index >= (int)candidate.bands.size() ||
+            !bandXml->hasAttribute("type") ||
+            !bandXml->hasAttribute("frequencyHz") ||
+            !bandXml->hasAttribute("gainDb") ||
+            !bandXml->hasAttribute("q") ||
+            !bandXml->hasAttribute("enabled") ||
+            seenBands[(size_t)index])
+        {
+            outError = "EQ preset band data is incomplete or duplicated.";
+            return false;
+        }
+        seenBands[(size_t)index] = true;
+        auto& band = candidate.bands[(size_t)index];
+        band.type = (EQPresetFilterType)bandXml->getIntAttribute("type", -1);
+        band.frequencyHz = (float)bandXml->getDoubleAttribute("frequencyHz");
+        band.gainDb = (float)bandXml->getDoubleAttribute("gainDb");
+        band.q = (float)bandXml->getDoubleAttribute("q");
+        band.enabled = bandXml->getBoolAttribute("enabled", true);
+        ++bandCount;
+    }
+    if (bandCount != candidate.bands.size())
+    {
+        outError = "EQ preset must contain exactly 8 bands.";
+        return false;
+    }
+    if (!EQPresetCatalog::validate(candidate, outError))
+        return false;
+
+    outPreset = std::move(candidate);
+    outError.clear();
+    return true;
+}
+
+bool PresetManager::saveEQCatalogPreset(
+    const juce::String& name, const EQPresetDefinition& preset,
+    const juce::String& description, bool isFavorite, bool overwrite,
+    juce::String& outError)
+{
+    const auto safeName = sanitizePresetName(name);
+    if (safeName.isEmpty() || safeName.length() > 80 ||
+        description.length() > 2048)
+    {
+        outError = "Preset name or description is empty or too long.";
+        return false;
+    }
+
+    auto candidate = preset;
+    candidate.id = userEQPresetId(safeName);
+    candidate.name = safeName;
+    candidate.description = description;
+    candidate.formatVersion = 1;
+    if (!EQPresetCatalog::validate(candidate, outError))
+        return false;
+
+    const auto file = getCategoryDirectory(PresetCategory::EQCatalog)
+                          .getChildFile(safeName + ".xml");
+    if (file.existsAsFile() && !overwrite)
+    {
+        outError = "A preset with that name already exists.";
+        return false;
+    }
+    return writeTextAtomically(
+        file, serializeEQCatalogPreset(candidate, description, isFavorite),
+        outError);
+}
+
+bool PresetManager::loadEQCatalogPreset(
+    const PresetItem& item, EQPresetDefinition& outPreset,
+    juce::String& outError) const
+{
+    if (item.category != PresetCategory::EQCatalog)
+    {
+        outError = "The selected item is not an EQ catalog preset.";
+        return false;
+    }
+
+    if (item.isFactory)
+    {
+        const auto* factory = EQPresetCatalog::findFactoryPreset(item.factoryId);
+        if (factory == nullptr)
+        {
+            outError = "Factory EQ preset ID was not found.";
+            return false;
+        }
+        outPreset = *factory;
+        outError.clear();
+        return true;
+    }
+
+    if (!isEQUserFile(item, getCategoryDirectory(PresetCategory::EQCatalog)))
+    {
+        outError = "EQ preset file is missing or outside the preset directory.";
+        return false;
+    }
+    if (item.userFile.getSize() > 256 * 1024)
+    {
+        outError = "EQ preset file exceeds the 256 KiB size limit.";
+        return false;
+    }
+    auto xml = juce::XmlDocument::parse(item.userFile);
+    if (!xml)
+    {
+        outError = "Could not parse EQ preset XML.";
+        return false;
+    }
+    bool favorite = false;
+    return deserializeEQCatalogPreset(*xml, outPreset, favorite, outError);
+}
+
+bool PresetManager::setEQCatalogPresetFavorite(
+    const PresetItem& item, bool isFavorite, juce::String& outError)
+{
+    if (item.category != PresetCategory::EQCatalog)
+    {
+        outError = "The selected item is not an EQ catalog preset.";
+        return false;
+    }
+    if (!item.isFactory)
+    {
+        EQPresetDefinition preset;
+        if (!loadEQCatalogPreset(item, preset, outError))
+            return false;
+        return writeTextAtomically(
+            item.userFile,
+            serializeEQCatalogPreset(preset, preset.description, isFavorite),
+            outError);
+    }
+
+    const auto favoritesFile =
+        getCategoryDirectory(PresetCategory::EQCatalog)
+            .getChildFile("favorites.xml");
+    juce::StringArray ids;
+    if (favoritesFile.existsAsFile())
+    {
+        auto xml = juce::XmlDocument::parse(favoritesFile);
+        if (!xml || !xml->hasTagName("LIVEBUS_EQ_FAVORITES"))
+        {
+            outError = "The EQ favorites file is invalid.";
+            return false;
+        }
+        for (auto* child = xml->getFirstChildElement();
+             child != nullptr; child = child->getNextElement())
+            if (child->hasTagName("PRESET"))
+                ids.addIfNotAlreadyThere(child->getStringAttribute("id"));
+    }
+    ids.removeString(item.factoryId);
+    if (isFavorite)
+        ids.addIfNotAlreadyThere(item.factoryId);
+
+    juce::XmlElement favorites("LIVEBUS_EQ_FAVORITES");
+    favorites.setAttribute("formatVersion", 1);
+    for (const auto& id : ids)
+    {
+        auto* child = favorites.createNewChildElement("PRESET");
+        child->setAttribute("id", id);
+    }
+    return writeTextAtomically(favoritesFile, favorites.toString(), outError);
 }
 
 // ==============================================================================
@@ -793,6 +1135,12 @@ bool PresetManager::loadBusDSPPreset(const PresetItem& item, SceneData::BusScene
 bool PresetManager::deleteUserPreset(const PresetItem& item)
 {
     if (item.isFactory) return false; // Factory presets cannot be deleted
+    if (item.category == PresetCategory::EQCatalog)
+    {
+        if (!isEQUserFile(item, getCategoryDirectory(PresetCategory::EQCatalog)))
+            return false;
+        return item.userFile.deleteFile();
+    }
     if (item.userFile.existsAsFile())
         return item.userFile.deleteFile();
     return false;
@@ -801,10 +1149,32 @@ bool PresetManager::deleteUserPreset(const PresetItem& item)
 bool PresetManager::renameUserPreset(const PresetItem& item, const juce::String& newName)
 {
     if (item.isFactory) return false;
-    auto safe = newName.retainCharacters("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-").trim();
+    auto safe = sanitizePresetName(newName);
     if (safe.isEmpty()) return false;
 
     auto newFile = item.userFile.getSiblingFile(safe + ".xml");
+    if (item.category == PresetCategory::EQCatalog)
+    {
+        if (!isEQUserFile(item, getCategoryDirectory(PresetCategory::EQCatalog)) ||
+            newFile.existsAsFile())
+            return false;
+        EQPresetDefinition preset;
+        juce::String error;
+        if (!loadEQCatalogPreset(item, preset, error))
+            return false;
+        preset.name = safe;
+        preset.id = userEQPresetId(safe);
+        const auto xml = serializeEQCatalogPreset(
+            preset, preset.description, item.isFavorite);
+        if (!writeTextAtomically(newFile, xml, error))
+            return false;
+        if (!item.userFile.deleteFile())
+        {
+            newFile.deleteFile();
+            return false;
+        }
+        return true;
+    }
     if (item.userFile.existsAsFile() && !newFile.existsAsFile())
     {
         return item.userFile.moveFileTo(newFile);
@@ -814,11 +1184,24 @@ bool PresetManager::renameUserPreset(const PresetItem& item, const juce::String&
 
 bool PresetManager::duplicateUserPreset(const PresetItem& item, const juce::String& newName)
 {
-    auto safe = newName.retainCharacters("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-").trim();
+    auto safe = sanitizePresetName(newName);
     if (safe.isEmpty()) return false;
 
     auto newFile = getCategoryDirectory(item.category).getChildFile(safe + ".xml");
     if (newFile.existsAsFile()) return false;
+
+    if (item.category == PresetCategory::EQCatalog)
+    {
+        EQPresetDefinition preset;
+        juce::String error;
+        if (!loadEQCatalogPreset(item, preset, error))
+            return false;
+        preset.name = safe;
+        preset.id = userEQPresetId(safe);
+        return saveEQCatalogPreset(safe, preset,
+                                   "User copy of " + item.name,
+                                   false, false, error);
+    }
 
     if (item.isFactory)
     {
@@ -870,6 +1253,19 @@ bool PresetManager::duplicateUserPreset(const PresetItem& item, const juce::Stri
 
 bool PresetManager::exportPresetToFile(const PresetItem& item, const juce::File& destFile)
 {
+    if (item.category == PresetCategory::EQCatalog)
+    {
+        EQPresetDefinition preset;
+        juce::String error;
+        if (!loadEQCatalogPreset(item, preset, error))
+            return false;
+        return writeTextAtomically(
+            destFile,
+            serializeEQCatalogPreset(preset, preset.description,
+                                     item.isFavorite),
+            error);
+    }
+
     if (item.isFactory)
     {
         // Export by serializing factory values
@@ -925,8 +1321,37 @@ bool PresetManager::importPresetFromFile(PresetCategory cat, const juce::File& s
         outError = "File does not exist: " + srcFile.getFullPathName();
         return false;
     }
+    if (cat == PresetCategory::EQCatalog &&
+        srcFile.getSize() > 256 * 1024)
+    {
+        outError = "EQ preset import exceeds the 256 KiB size limit.";
+        return false;
+    }
 
     auto xml = juce::XmlDocument::parse(srcFile);
+    if (cat == PresetCategory::EQCatalog)
+    {
+        if (!xml)
+        {
+            outError = "Could not parse EQ preset XML.";
+            return false;
+        }
+        EQPresetDefinition preset;
+        bool favorite = false;
+        if (!deserializeEQCatalogPreset(*xml, preset, favorite, outError))
+            return false;
+        outName = sanitizePresetName(preset.name);
+        if (outName.isEmpty())
+        {
+            outError = "Imported EQ preset name is invalid.";
+            return false;
+        }
+        if (!saveEQCatalogPreset(outName, preset, preset.description,
+                                 favorite, false, outError))
+            return false;
+        return true;
+    }
+
     if (!xml || !xml->hasTagName("LIVEBUS_PRESET"))
     {
         outError = "Invalid preset format. Expected LIVEBUS_PRESET root tag.";

@@ -39,6 +39,7 @@ public:
     void syncFromMatrix();
     void updateUIFromMatrix() { refreshFromMatrix(); }
     void showRoutingGraph();
+    void refreshRoutingGraph();
     void focusRoutingGraphNode(const juce::String& typeId, int index);
     void updateAvailableHardwareInputs(int count, const juce::StringArray& inputNames);
     void updateAvailableHardwareOutputs(int count, const juce::StringArray& outputNames);

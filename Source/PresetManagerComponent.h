@@ -28,6 +28,8 @@ public:
     // Callbacks to apply/capture presets from the live mixer engine
     std::function<void(PresetCategory, int targetIndex, const PresetItem&)> onLoadPresetToTarget;
     std::function<void(PresetCategory, int targetIndex, juce::String& outName)> onSavePresetFromTarget;
+    std::function<bool(int targetIndex, EQPresetDefinition& outPreset,
+                       juce::String& outError)> onCaptureEQPresetFromTarget;
 
     PresetCategory getSelectedCategory() const;
     int getSelectedTargetIndex() const;
@@ -38,9 +40,11 @@ private:
     // Controls
     juce::ComboBox categoryCombo;
     juce::ComboBox targetCombo;
+    juce::ComboBox eqCategoryCombo;
     juce::ListBox presetListBox;
     juce::TextEditor searchBox;
     juce::Label descriptionLabel;
+    juce::ToggleButton favoritesOnlyToggle{"Favorites only"};
 
     juce::TextButton loadBtn{ "Load Preset" };
     juce::TextButton saveBtn{ "Save" };
@@ -50,6 +54,7 @@ private:
     juce::TextButton deleteBtn{ "Delete" };
     juce::TextButton importBtn{ "Import..." };
     juce::TextButton exportBtn{ "Export..." };
+    juce::TextButton favoriteBtn{ "Add Favorite" };
 
     juce::Label statusLabel;
 
@@ -58,6 +63,10 @@ private:
 
     void updateFilteredList();
     void updateTargetOptions();
+    void updateActionButtons();
+    bool saveEQPresetFromTarget(const juce::String& name,
+                                const PresetItem* existingItem,
+                                bool overwrite);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PresetManagerComponent)
 };

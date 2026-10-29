@@ -280,6 +280,8 @@ namespace LiveBus
                     std::memory_order_relaxed);
             eq.updateCoefficients();
             repaint();
+            if (owner.onParametersChanged)
+                owner.onParametersChanged(owner.currentTarget);
         }
     }
 
@@ -813,6 +815,9 @@ namespace LiveBus
         else if (slider == &limCeilingSlider) proc.params.limiterCeilingDb.store((float)slider->getValue());
         else if (slider == &limReleaseSlider) proc.params.limiterReleaseMs.store((float)slider->getValue());
         else if (slider == &outputGainSlider) proc.params.outputGainDb.store((float)slider->getValue());
+
+        if (onParametersChanged)
+            onParametersChanged(currentTarget);
     }
 
     void VocalDSPRackComponent::buttonClicked(juce::Button* b)
@@ -835,6 +840,8 @@ namespace LiveBus
                 default: break;
             }
             updateUIFromProcessor();
+            if (onParametersChanged)
+                onParametersChanged(currentTarget);
             return;
         }
 
@@ -911,6 +918,8 @@ namespace LiveBus
         }
 
         updateUIFromProcessor();
+        if (onParametersChanged)
+            onParametersChanged(currentTarget);
     }
 
     void VocalDSPRackComponent::comboBoxChanged(juce::ComboBox* combo)
@@ -924,10 +933,14 @@ namespace LiveBus
         else if (combo == &presetCombo)
         {
             applyPreset(presetCombo.getSelectedId());
+            if (onParametersChanged)
+                onParametersChanged(currentTarget);
         }
         else if (combo == &hpfSlopeCombo)
         {
             getCurrentProcessor().params.hpfSlope.store(hpfSlopeCombo.getSelectedId() - 1);
+            if (onParametersChanged)
+                onParametersChanged(currentTarget);
         }
     }
 

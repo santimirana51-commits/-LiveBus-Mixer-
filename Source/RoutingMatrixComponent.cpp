@@ -1516,6 +1516,12 @@ void RoutingMatrixComponent::focusRoutingGraphNode(const juce::String& typeId, i
         routingGraph->focusNode(typeId, index);
 }
 
+void RoutingMatrixComponent::refreshRoutingGraph()
+{
+    if (routingGraph != nullptr)
+        routingGraph->refresh();
+}
+
 void RoutingMatrixComponent::showRoutingGraph()
 {
     signalFlowBtn.setToggleState(true, juce::dontSendNotification);
@@ -2001,6 +2007,7 @@ void RoutingMatrixComponent::comboBoxChanged(juce::ComboBox* c)
             {
                 ch.inputSource.store(ChannelInputSource::Disabled);
             }
+            matrix.validateAvailableInputs(matrix.getNumAvailableHardwareInputs());
             matrix.updateDuplicateWarnings();
             if ((int)i == selectedChannelIndex)
                 updateInspectorForSelectedChannel();
@@ -2008,8 +2015,7 @@ void RoutingMatrixComponent::comboBoxChanged(juce::ComboBox* c)
         }
         if (c == &rowUIs[i]->stereoModeCombo)
         {
-            auto& ch = matrix.getChannel((int)i);
-            ch.stereoMode.store((ChannelStereoMode)(c->getSelectedId() - 1));
+            matrix.setChannelStereoMode((int)i, (ChannelStereoMode)(c->getSelectedId() - 1));
             if ((int)i == selectedChannelIndex)
                 inspectorStereoModeCombo.setSelectedId(c->getSelectedId(), juce::dontSendNotification);
             return;
@@ -2034,17 +2040,19 @@ void RoutingMatrixComponent::comboBoxChanged(juce::ComboBox* c)
         else if (typeId == 3) chState.inputSource.store(ChannelInputSource::TestSignal);
         else if (typeId == 5) chState.inputSource.store(ChannelInputSource::YouTube);
         else chState.inputSource.store(ChannelInputSource::Disabled);
+        matrix.validateAvailableInputs(matrix.getNumAvailableHardwareInputs());
         matrix.updateDuplicateWarnings();
     }
     else if (c == &inspectorHardwarePortCombo)
     {
         chState.hardwareInputChannel.store(c->getSelectedId() - 1);
         chState.inputSource.store(ChannelInputSource::Hardware);
+        matrix.validateAvailableInputs(matrix.getNumAvailableHardwareInputs());
         matrix.updateDuplicateWarnings();
     }
     else if (c == &inspectorStereoModeCombo)
     {
-        chState.stereoMode.store((ChannelStereoMode)(c->getSelectedId() - 1));
+        matrix.setChannelStereoMode(selectedChannelIndex, (ChannelStereoMode)(c->getSelectedId() - 1));
     }
     else if (c == &inspectorSubmixCombo)
     {

@@ -1,72 +1,33 @@
-$ErrorActionPreference = "Stop"
+param()
 
-$root = $PSScriptRoot
-$buildRoot = Join-Path $root "build"
-$releaseFiles = @{
-    "LiveBusMixer.exe" = Join-Path $buildRoot "LiveBusMixer_artefacts\Release\LiveBusMixer.exe"
-    "LiveBusPluginHost.exe" = Join-Path $buildRoot "LiveBusPluginHost_artefacts\Release\LiveBusPluginHost.exe"
-}
-$demoFiles = @("Cello_Solo.wav", "Guitar_Riff.wav")
-$documentationFiles = @("FEATURES-AND-LIMITATIONS.md", "FINAL_HARDWARE_CHECKLIST.md")
+$exportDir = "c:\Users\miran\Documents\mixer\build\export"
+$rootDir = "c:\Users\miran\Documents\mixer"
 
-foreach ($name in $releaseFiles.Keys) {
-    if (-not (Test-Path -LiteralPath $releaseFiles[$name] -PathType Leaf)) {
-        throw "Required Release binary is missing: $($releaseFiles[$name])"
-    }
+if (-not (Test-Path $exportDir)) {
+    New-Item -ItemType Directory -Force -Path $exportDir | Out-Null
 }
 
-foreach ($name in $demoFiles + $documentationFiles) {
-    if (-not (Test-Path -LiteralPath (Join-Path $root $name) -PathType Leaf)) {
-        throw "Required release file is missing: $(Join-Path $root $name)"
-    }
-}
+Remove-Item -Path "$exportDir\LiveBus_Alesis_Release_VST3.zip","$exportDir\LiveBus_All_VST3_Plugins_Bundle.zip" -Force -ErrorAction SilentlyContinue
 
-$releaseName = "LiveBusMixer-Release-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-$staging = Join-Path $root "dist\$releaseName"
-$zipPath = "$staging.zip"
-if ((Test-Path -LiteralPath $staging) -or (Test-Path -LiteralPath $zipPath)) {
-    throw "Release output already exists; refusing to overwrite it: $releaseName"
-}
+# 1. Package Alesis
+$alesisFolder = "$exportDir\LiveBus_Alesis_Package"
+Remove-Item -Recurse -Force $alesisFolder -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path "$alesisFolder\Plugins" | Out-Null
+Copy-Item -Recurse -Force "$rootDir\build\LiveBusMixer_artefacts\Release\Plugins\LiveBus Alesis.vst3" "$alesisFolder\Plugins\LiveBus Alesis.vst3"
+Copy-Item "$rootDir\install_vst3_plugins.bat" "$alesisFolder\install_vst3_plugins.bat"
+Copy-Item "$rootDir\install_vst3_plugins.ps1" "$alesisFolder\install_vst3_plugins.ps1"
+Compress-Archive -Path "$alesisFolder\*" -DestinationPath "$exportDir\LiveBus_Alesis_Release_VST3.zip" -Force
+Remove-Item -Recurse -Force $alesisFolder
 
-$bin = Join-Path $staging "bin"
-New-Item -ItemType Directory -Path $bin -Force | Out-Null
-foreach ($name in $releaseFiles.Keys) {
-    Copy-Item -LiteralPath $releaseFiles[$name] -Destination (Join-Path $bin $name)
-}
-foreach ($name in $demoFiles) {
-    Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $bin $name)
-}
-Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $staging
-Copy-Item -LiteralPath (Join-Path $root "Jalankan_LiveBusMixer.bat") -Destination $staging
-Copy-Item -LiteralPath (Join-Path $root "run_app.py") -Destination $staging
-foreach ($name in $documentationFiles) {
-    Copy-Item -LiteralPath (Join-Path $root $name) -Destination $staging
-}
+# 2. Package Master Bundle
+$bundleFolder = "$exportDir\LiveBus_Master_Bundle"
+Remove-Item -Recurse -Force $bundleFolder -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path "$bundleFolder\Plugins" | Out-Null
+Copy-Item -Recurse -Force "$rootDir\build\LiveBusMixer_artefacts\Release\Plugins\*" "$bundleFolder\Plugins"
+Copy-Item "$rootDir\install_vst3_plugins.bat" "$bundleFolder\install_vst3_plugins.bat"
+Copy-Item "$rootDir\install_vst3_plugins.ps1" "$bundleFolder\install_vst3_plugins.ps1"
+Compress-Archive -Path "$bundleFolder\*" -DestinationPath "$exportDir\LiveBus_All_VST3_Plugins_Bundle.zip" -Force
+Remove-Item -Recurse -Force $bundleFolder
 
-Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $zipPath -CompressionLevel Optimal
-
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-try {
-    $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
-    foreach ($entry in @(
-        "bin/LiveBusMixer.exe",
-        "bin/LiveBusPluginHost.exe",
-        "bin/Cello_Solo.wav",
-        "bin/Guitar_Riff.wav",
-        "Jalankan_LiveBusMixer.bat",
-        "run_app.py",
-        "README.md",
-        "FEATURES-AND-LIMITATIONS.md",
-        "FINAL_HARDWARE_CHECKLIST.md"
-    )) {
-        if ($entries -notcontains $entry) {
-            throw "Release archive verification failed; missing entry: $entry"
-        }
-    }
-}
-finally {
-    $archive.Dispose()
-}
-
-Get-Item -LiteralPath $zipPath | Select-Object FullName, Length, LastWriteTime
+Write-Host "Packaging Complete!"
+Get-ChildItem -Path $exportDir | Select-Object Name, Length, LastWriteTime

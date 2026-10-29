@@ -1,6 +1,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "SceneManager.h"
+#include "EQPresetCatalog.h"
 #include <vector>
 
 namespace LiveBus
@@ -12,8 +13,13 @@ enum class PresetCategory
     EightBandEQ,
     ChannelStrip,
     BusDSP,
+    EQCatalog,
     Count
 };
+
+inline constexpr int eqCatalogPuzuTargetOffset = 100;
+inline constexpr int eqCatalogMonitor31Target = 200;
+inline constexpr int eqCatalogMain24Target = 201;
 
 inline juce::String getCategoryName(PresetCategory cat)
 {
@@ -23,6 +29,7 @@ inline juce::String getCategoryName(PresetCategory cat)
         case PresetCategory::EightBandEQ: return "8-Band EQ";
         case PresetCategory::ChannelStrip:return "Channel Strip";
         case PresetCategory::BusDSP:      return "Bus Master DSP";
+        case PresetCategory::EQCatalog:   return "EQ Preset Catalog";
         default:                          return "Unknown";
     }
 }
@@ -35,6 +42,7 @@ inline juce::String getCategoryDirectoryName(PresetCategory cat)
         case PresetCategory::EightBandEQ: return "EightBandEQ";
         case PresetCategory::ChannelStrip:return "ChannelStrip";
         case PresetCategory::BusDSP:      return "BusDSP";
+        case PresetCategory::EQCatalog:   return "EQCatalog";
         default:                          return "Misc";
     }
 }
@@ -46,6 +54,8 @@ struct PresetItem
     bool isFactory = false;
     juce::String description;
     juce::File userFile; // exists if user preset
+    juce::String factoryId;
+    bool isFavorite = false;
 };
 
 /**
@@ -80,6 +90,18 @@ public:
     bool saveBusDSPPreset(const juce::String& name, const SceneData::BusSceneDSP& data, const juce::String& description = "");
     bool loadBusDSPPreset(const PresetItem& item, SceneData::BusSceneDSP& outData, juce::String& outError);
 
+    bool saveEQCatalogPreset(const juce::String& name,
+                             const EQPresetDefinition& preset,
+                             const juce::String& description,
+                             bool isFavorite,
+                             bool overwrite,
+                             juce::String& outError);
+    bool loadEQCatalogPreset(const PresetItem& item,
+                             EQPresetDefinition& outPreset,
+                             juce::String& outError) const;
+    bool setEQCatalogPresetFavorite(const PresetItem& item, bool isFavorite,
+                                    juce::String& outError);
+
     // --- User Preset CRUD ---
     bool deleteUserPreset(const PresetItem& item);
     bool renameUserPreset(const PresetItem& item, const juce::String& newName);
@@ -104,6 +126,13 @@ private:
 
     juce::String serializeBusDSP(const SceneData::BusSceneDSP& data, const juce::String& name, const juce::String& desc);
     bool deserializeBusDSP(const juce::XmlElement& xml, SceneData::BusSceneDSP& outData, juce::String& outName);
+    juce::String serializeEQCatalogPreset(const EQPresetDefinition& preset,
+                                          const juce::String& description,
+                                          bool isFavorite) const;
+    bool deserializeEQCatalogPreset(const juce::XmlElement& xml,
+                                    EQPresetDefinition& outPreset,
+                                    bool& outFavorite,
+                                    juce::String& outError) const;
 };
 
 } // namespace LiveBus

@@ -372,6 +372,8 @@ namespace LiveBus
 
         proc.updateCoefficients();
         owner.updateUIFromProcessor();
+        if (owner.onParametersChanged)
+            owner.onParametersChanged(owner.currentTarget);
         repaint();
     }
 
@@ -785,8 +787,10 @@ namespace LiveBus
     // =========================================================================
     // EightBandEQComponent Implementation
     // =========================================================================
-    EightBandEQComponent::EightBandEQComponent(std::array<BusDSPProcessor*, NumTargets> processors)
-        : targetDSPs(processors)
+    EightBandEQComponent::EightBandEQComponent(
+        std::array<BusDSPProcessor*, NumTargets> processors,
+        PresetManager* presets)
+        : targetDSPs(processors), presetManager(presets)
     {
         for (int t = 0; t < NumTargets; ++t)
         {
@@ -1162,6 +1166,8 @@ namespace LiveBus
     void EightBandEQComponent::setSelectedNavModule(DSPNavModule module)
     {
         currentNavModule = module;
+        if (module == NavEqualizer)
+            refreshEQCatalogPresets();
 
         juce::TextButton* navBtns[] = {
             &eqNavBtn, &hpfNavBtn, &gateNavBtn, &compNavBtn, &limiterNavBtn, &reverbNavBtn, &delayNavBtn
@@ -1740,7 +1746,58 @@ namespace LiveBus
 
         if (combo == &presetCombo)
         {
-            const int idx = presetCombo.getSelectedId() - 1;
+            const int selectedId = presetCombo.getSelectedId();
+            if (selectedId >= 1000)
+            {
+                const int catalogIndex = selectedId - 1000;
+                if (presetManager == nullptr ||
+                    catalogIndex < 0 ||
+                    catalogIndex >= (int)catalogPresetItems.size())
+                    return;
+
+                const auto& item =
+                    catalogPresetItems[(size_t)catalogIndex];
+                EQPresetDefinition definition;
+                juce::String error;
+                if (!presetManager->loadEQCatalogPreset(item, definition, error))
+                {
+                    juce::AlertWindow::showMessageBox(
+                        juce::AlertWindow::WarningIcon, "EQ Preset Error",
+                        "Could not load EQ preset '" + item.name + "': " + error,
+                        "OK");
+                    presetCombo.setSelectedId(1, juce::dontSendNotification);
+                    return;
+                }
+
+                SceneData::EightBandEQSceneData mappedState;
+                if (!EQPresetCatalog::mapToEightBand(
+                        definition, mappedState, error))
+                {
+                    juce::AlertWindow::showMessageBox(
+                        juce::AlertWindow::WarningIcon, "EQ Preset Error",
+                        "Could not map EQ preset '" + item.name + "': " + error,
+                        "OK");
+                    presetCombo.setSelectedId(1, juce::dontSendNotification);
+                    return;
+                }
+
+                EightBandEQParameters mappedParameters;
+                mappedParameters.masterEnabled.store(mappedState.masterEnabled);
+                for (int band = 0; band < numEQBands; ++band)
+                {
+                    const auto& source = mappedState.bands[(size_t)band];
+                    auto& target = mappedParameters.bands[(size_t)band];
+                    target.type.store((EQFilterType)source.type);
+                    target.freq.store(source.freq);
+                    target.gainDb.store(source.gainDb);
+                    target.q.store(source.q);
+                    target.enabled.store(source.enabled);
+                }
+                applyPreset(mappedParameters);
+                return;
+            }
+
+            const int idx = selectedId - 1;
             if (idx >= 0 && idx < (int)userPresets.size())
             {
                 applyPreset(userPresets[idx].params);
@@ -2030,28 +2087,64 @@ namespace LiveBus
 
         if (button == &savePresetBtn || button == &saveAsPresetBtn)
         {
-            EQPreset newPreset;
-            newPreset.name = "Custom " + juce::String(userPresets.size() + 1);
-            newPreset.params = getCurrentProcessor().params;
-            userPresets.push_back(newPreset);
+            const int selectedId = presetCombo.getSelectedId();
+            const PresetItem* existingItem = nullptr;
+            if (button == &savePresetBtn && selectedId >= 1000)
+            {
+                const int catalogIndex = selectedId - 1000;
+                if (catalogIndex >= 0 &&
+                    catalogIndex < (int)catalogPresetItems.size() &&
+                    !catalogPresetItems[(size_t)catalogIndex].isFactory)
+                    existingItem = &catalogPresetItems[(size_t)catalogIndex];
+            }
 
-            presetCombo.clear();
-            for (size_t i = 0; i < userPresets.size(); ++i)
-                presetCombo.addItem(userPresets[i].name, (int)i + 1);
-            presetCombo.setSelectedId((int)userPresets.size(), juce::dontSendNotification);
+            if (button == &savePresetBtn && existingItem != nullptr)
+            {
+                if (saveCurrentEQCatalogPreset(existingItem->name, existingItem))
+                    refreshEQCatalogPresets();
+                return;
+            }
+
+            juce::AlertWindow alert("Save EQ Preset As",
+                                    "Enter a name for this EQ preset:",
+                                    juce::AlertWindow::QuestionIcon);
+            alert.addTextEditor("name", "My EQ Preset");
+            alert.addButton("Save", 1);
+            alert.addButton("Cancel", 0);
+            if (alert.runModalLoop() == 1)
+            {
+                const auto name = alert.getTextEditorContents("name").trim();
+                if (name.isNotEmpty() && saveCurrentEQCatalogPreset(name, nullptr))
+                    refreshEQCatalogPresets();
+            }
             return;
         }
 
         if (button == &deletePresetBtn)
         {
-            int sel = presetCombo.getSelectedId() - 1;
-            if (sel >= 6 && sel < (int)userPresets.size())
+            const int selectedId = presetCombo.getSelectedId();
+            if (selectedId >= 1000 && presetManager != nullptr)
             {
-                userPresets.erase(userPresets.begin() + sel);
-                presetCombo.clear();
-                for (size_t i = 0; i < userPresets.size(); ++i)
-                    presetCombo.addItem(userPresets[i].name, (int)i + 1);
-                presetCombo.setSelectedId(1, juce::dontSendNotification);
+                const int catalogIndex = selectedId - 1000;
+                if (catalogIndex >= 0 &&
+                    catalogIndex < (int)catalogPresetItems.size())
+                {
+                    const auto item =
+                        catalogPresetItems[(size_t)catalogIndex];
+                    if (item.isFactory)
+                    {
+                        juce::AlertWindow::showMessageBox(
+                            juce::AlertWindow::WarningIcon, "Factory Preset",
+                            "Factory EQ presets cannot be deleted.", "OK");
+                        return;
+                    }
+                    if (juce::AlertWindow::showOkCancelBox(
+                            juce::AlertWindow::QuestionIcon, "Delete EQ Preset",
+                            "Delete preset '" + item.name + "'?",
+                            "Delete", "Cancel") &&
+                        presetManager->deleteUserPreset(item))
+                        refreshEQCatalogPresets();
+                }
             }
             return;
         }
@@ -2160,10 +2253,96 @@ namespace LiveBus
         p5.params.setToFlat();
         userPresets.push_back(p5);
 
-        presetCombo.clear();
+        refreshEQCatalogPresets();
+    }
+
+    void EightBandEQComponent::refreshEQCatalogPresets()
+    {
+        presetCombo.clear(juce::dontSendNotification);
         for (size_t i = 0; i < userPresets.size(); ++i)
             presetCombo.addItem(userPresets[i].name, (int)i + 1);
+
+        catalogPresetItems.clear();
+        if (presetManager != nullptr)
+        {
+            catalogPresetItems = presetManager->getPresetsForCategory(
+                PresetCategory::EQCatalog);
+            bool hasFactoryHeading = false;
+            bool hasUserHeading = false;
+            for (size_t i = 0; i < catalogPresetItems.size(); ++i)
+            {
+                const auto& item = catalogPresetItems[i];
+                if (item.isFactory && !hasFactoryHeading)
+                {
+                    presetCombo.addSectionHeading("EQ Catalog - Factory");
+                    hasFactoryHeading = true;
+                }
+                else if (!item.isFactory && !hasUserHeading)
+                {
+                    presetCombo.addSectionHeading("EQ Catalog - Your Presets");
+                    hasUserHeading = true;
+                }
+                presetCombo.addItem(item.name, 1000 + (int)i);
+            }
+        }
         presetCombo.setSelectedId(1, juce::dontSendNotification);
+    }
+
+    bool EightBandEQComponent::saveCurrentEQCatalogPreset(
+        const juce::String& name, const PresetItem* existingItem)
+    {
+        if (presetManager == nullptr)
+            return false;
+
+        EQPresetDefinition definition;
+        definition.name = name;
+        definition.category = EQPresetCategory::Vocal;
+        juce::String description =
+            "User-created starting curve. Adjust to the source and listener.";
+        bool favorite = false;
+        if (existingItem != nullptr)
+        {
+            EQPresetDefinition previous;
+            juce::String error;
+            if (!presetManager->loadEQCatalogPreset(*existingItem, previous, error))
+            {
+                juce::AlertWindow::showMessageBox(
+                    juce::AlertWindow::WarningIcon, "EQ Preset Error",
+                    "Could not load the selected preset: " + error, "OK");
+                return false;
+            }
+            definition.category = previous.category;
+            description = previous.description;
+            favorite = existingItem->isFavorite;
+        }
+
+        const auto& parameters = getCurrentProcessor().params;
+        for (int band = 0; band < numEQBands; ++band)
+        {
+            auto& target = definition.bands[(size_t)band];
+            const auto& source = parameters.bands[(size_t)band];
+            target.type = (EQPresetFilterType)
+                source.type.load(std::memory_order_relaxed);
+            target.frequencyHz =
+                source.freq.load(std::memory_order_relaxed);
+            target.gainDb =
+                source.gainDb.load(std::memory_order_relaxed);
+            target.q = source.q.load(std::memory_order_relaxed);
+            target.enabled =
+                source.enabled.load(std::memory_order_relaxed);
+        }
+
+        juce::String error;
+        if (!presetManager->saveEQCatalogPreset(
+                name, definition, description, favorite,
+                existingItem != nullptr, error))
+        {
+            juce::AlertWindow::showMessageBox(
+                juce::AlertWindow::WarningIcon, "Could Not Save EQ Preset",
+                error, "OK");
+            return false;
+        }
+        return true;
     }
 
     void EightBandEQComponent::applyPreset(const EightBandEQParameters& p)

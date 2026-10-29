@@ -5,6 +5,31 @@
 namespace LiveBus
 {
 
+inline void copyPlaybackInputChannel(const juce::AudioBuffer<float>& source,
+                                     int sourceChannel,
+                                     juce::AudioBuffer<float>& destination,
+                                     int numSamples) noexcept
+{
+    const int samples = juce::jmin(numSamples, source.getNumSamples(), destination.getNumSamples());
+    if (samples <= 0 || source.getNumChannels() < 2 || destination.getNumChannels() < 2)
+        return;
+
+    destination.clear(0, 0, samples);
+    destination.clear(1, 0, samples);
+
+    if (sourceChannel == 0 || sourceChannel == 1)
+    {
+        destination.copyFrom(0, 0, source, sourceChannel, 0, samples);
+        destination.copyFrom(1, 0, source, sourceChannel, 0, samples);
+    }
+    else if (sourceChannel == 2)
+    {
+        destination.addFrom(0, 0, source, 0, 0, samples, 0.5f);
+        destination.addFrom(0, 0, source, 1, 0, samples, 0.5f);
+        destination.copyFrom(1, 0, destination, 0, 0, samples);
+    }
+}
+
 /**
  * Represents a timestamp marker on the playback timeline.
  */

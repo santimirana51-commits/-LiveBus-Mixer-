@@ -30,7 +30,7 @@ public:
 
     void setZoom(float newZoom)
     {
-        zoom = juce::jlimit(0.45f, 1.5f, newZoom);
+        zoom = juce::jlimit(0.45f, 2.0f, newZoom);
         updateSize();
         repaint();
     }
@@ -41,6 +41,11 @@ public:
     void setPanHandler(std::function<void(int, int)> handler)
     {
         panHandler = std::move(handler);
+    }
+
+    void setZoomHandler(std::function<void(float, juce::Point<float>)> handler)
+    {
+        zoomHandler = std::move(handler);
     }
 
     void setFocusChangedHandler(std::function<void()> handler)
@@ -477,12 +482,11 @@ public:
     void mouseWheelMove(const juce::MouseEvent& event,
                         const juce::MouseWheelDetails& wheel) override
     {
-        if (event.mods.isCtrlDown())
-        {
-            setZoom(zoom * (wheel.deltaY > 0.0f ? 1.1f : 0.9f));
-            return;
-        }
-        juce::Component::mouseWheelMove(event, wheel);
+        const float direction = wheel.deltaY > 0.0f ? 1.1f : 0.9f;
+        if (zoomHandler)
+            zoomHandler(zoom * direction, event.position);
+        else
+            setZoom(zoom * direction);
     }
 
     bool keyPressed(const juce::KeyPress& key) override
@@ -2208,8 +2212,8 @@ private:
                         channel.playbackChannel.store(result - 10, std::memory_order_relaxed);
                 }
                 else if (result >= 20 && result <= 22)
-                    channel.stereoMode.store(static_cast<ChannelStereoMode>(result - 20),
-                                             std::memory_order_relaxed);
+                    safeThis->matrix.setChannelStereoMode(
+                        channelIndex, static_cast<ChannelStereoMode>(result - 20));
                 safeThis->matrix.validateAvailableInputs(
                     safeThis->matrix.getNumAvailableHardwareInputs());
                 safeThis->matrix.updateDuplicateWarnings();
@@ -2378,6 +2382,11 @@ private:
                      bounds.getWidth() - 24.0f, 3.0f, level, node.colour);
             g.setFont(juce::FontOptions(8.0f, juce::Font::bold));
             g.setColour(juce::Colour(0xff94a3b8));
+            g.drawText("PRE-DSP INPUT",
+                       juce::Rectangle<float>(bounds.getX() + 12.0f,
+                                              bounds.getBottom() - 17.0f,
+                                              bounds.getWidth() - 24.0f, 10.0f),
+                       juce::Justification::centredLeft);
             const float gain = channel->gain.load(std::memory_order_relaxed);
             const auto gainText = gain <= 0.0001f ? juce::String("-inf dB")
                 : juce::String(juce::Decibels::gainToDecibels(gain), 1) + " dB";
@@ -2492,6 +2501,16 @@ private:
                 level = matrix.getMasterBusPeak(target == maxInputs ? 0 : 1);
             drawMeter(g, bounds.getX() + 12.0f, bounds.getBottom() - 7.0f,
                      bounds.getWidth() - 24.0f, 3.0f, juce::jlimit(0.0f, 1.0f, level), node.colour);
+            g.setFont(juce::FontOptions(8.0f, juce::Font::bold));
+            g.setColour(juce::Colour(0xff94a3b8));
+            const auto meterLabel = target < maxInputs
+                ? (node.type == NodeType::DSP ? "PRE-DSP INPUT" : "POST-CHAIN OUTPUT")
+                : "BUS OUTPUT";
+            g.drawText(meterLabel,
+                       juce::Rectangle<float>(bounds.getX() + 12.0f,
+                                              bounds.getBottom() - 19.0f,
+                                              bounds.getWidth() - 24.0f, 10.0f),
+                       juce::Justification::centredLeft);
         }
         else if (node.type == NodeType::Submix || node.type == NodeType::Aux)
         {
@@ -2738,6 +2757,7 @@ private:
     std::vector<Connection> buildConnections(bool includeHiddenNodes = false) const
     {
         std::vector<Connection> result;
+        const auto soloState = getRoutingGraphSoloState(matrix);
         const auto addByNodeIndex = [this, &result, includeHiddenNodes](
             int source, int target, juce::Colour colour, bool active)
         {
@@ -2769,32 +2789,42 @@ private:
             const auto& state = matrix.getChannel(channel);
             const bool canPass = state.isEnabled.load() && !state.mute.load() &&
                 state.inputSource.load() != ChannelInputSource::Disabled &&
-                state.isSourceAvailable.load();
+                state.isSourceAvailable.load() &&
+                routingGraphChannelPassesSoloGate(matrix, soloState, channel);
             const int submix = state.submixGroup.load();
             if (submix >= 0 && submix < maxSubmixBuses)
                 addByNodeIndex(chainLastNode(channel), findNode(NodeType::Submix, submix),
-                               juce::Colour(0xfff59e0b), canPass);
+                               juce::Colour(0xfff59e0b),
+                               canPass && routingGraphChannelRoutePassesSolo(
+                                   soloState, channel, RoutingGraphNodeType::Submix, submix));
             else
             {
                 if (state.routeEnable[0].load())
                     addByNodeIndex(chainLastNode(channel), findNode(NodeType::DSP, maxInputs),
-                                   juce::Colour(0xffc084fc), canPass);
+                                   juce::Colour(0xffc084fc),
+                                   canPass && routingGraphChannelRoutePassesSolo(
+                                       soloState, channel, RoutingGraphNodeType::Stream, 0));
                 if (state.routeEnable[1].load())
                     addByNodeIndex(chainLastNode(channel), findNode(NodeType::DSP, maxInputs + 1),
-                                   juce::Colour(0xff22d3ee), canPass);
+                                   juce::Colour(0xff22d3ee),
+                                   canPass && routingGraphChannelRoutePassesSolo(
+                                       soloState, channel, RoutingGraphNodeType::Monitor, 0));
             }
 
             for (int aux = 0; aux < maxAuxBuses; ++aux)
                 if (state.auxRouteEnable[(size_t)aux].load())
                     addByNodeIndex(chainLastNode(channel), findNode(NodeType::Aux, aux),
                                    juce::Colour(0xffa78bfa),
-                                   canPass && state.auxSendLevel[(size_t)aux].load() > 0.0f);
+                                   canPass && routingGraphChannelRoutePassesSolo(
+                                       soloState, channel, RoutingGraphNodeType::Aux, aux) &&
+                                       state.auxSendLevel[(size_t)aux].load() > 0.0f);
         }
 
         for (int submix = 0; submix < maxSubmixBuses; ++submix)
         {
             const auto& state = matrix.getSubmixBus(submix);
-            const bool canPass = !state.mute.load() && state.gain.load() > 0.0f;
+            const bool canPass = !state.mute.load() && state.gain.load() > 0.0f &&
+                routingGraphBusPassesSolo(soloState, RoutingGraphNodeType::Submix, submix);
             if (state.routeToStream.load())
                 add(NodeType::Submix, submix, NodeType::DSP, maxInputs,
                     juce::Colour(0xffc084fc), canPass);
@@ -2806,7 +2836,8 @@ private:
         for (int aux = 0; aux < maxAuxBuses; ++aux)
         {
             const auto& state = matrix.getAuxBus(aux);
-            const bool canPass = !state.mute.load() && state.returnLevel.load() > 0.0f;
+            const bool canPass = !state.mute.load() && state.returnLevel.load() > 0.0f &&
+                routingGraphBusPassesSolo(soloState, RoutingGraphNodeType::Aux, aux);
             if (state.sendToStream.load())
                 add(NodeType::Aux, aux, NodeType::DSP, maxInputs,
                     juce::Colour(0xffc084fc), canPass);
@@ -3017,6 +3048,7 @@ private:
     RoutingGraphComponent::MasterBusControlCallbacks masterBusControlCallbacks;
     RoutingGraphComponent::DSPControlCallbacks dspControlCallbacks;
     std::function<void(int, int)> panHandler;
+    std::function<void(float, juce::Point<float>)> zoomHandler;
     std::function<void()> focusChangedHandler;
     std::vector<Node> nodes;
     std::vector<SavedNodePosition> unfocusedNodePositions;
@@ -3078,6 +3110,7 @@ RoutingGraphComponent::RoutingGraphComponent(RoutingMatrix& routingMatrix,
 {
     addInputCallback = std::move(onAddInputRequested);
     setOpaque(true);
+    canvas->setZoom(zoom);
     addAndMakeVisible(viewport);
     viewport.setViewedComponent(canvas.get(), false);
     viewport.setScrollBarsShown(true, true);
@@ -3088,6 +3121,10 @@ RoutingGraphComponent::RoutingGraphComponent(RoutingMatrix& routingMatrix,
         viewPositionX = viewport.getViewPositionX();
         viewPositionY = viewport.getViewPositionY();
     });
+    canvas->setZoomHandler([this](float newZoom, juce::Point<float> canvasPosition)
+    {
+        setZoomAt(newZoom, canvasPosition);
+    });
     canvas->setFocusChangedHandler([this] { fitToView(); });
 
     for (auto* button : { &zoomOutButton, &zoomInButton, &fitButton, &addNodeButton,
@@ -3097,15 +3134,17 @@ RoutingGraphComponent::RoutingGraphComponent(RoutingMatrix& routingMatrix,
         button->setColour(juce::TextButton::textColourOffId, juce::Colour(0xffe2e8f0));
         addAndMakeVisible(button);
     }
-    zoomOutButton.onClick = [this] { setZoom(zoom * 0.85f); };
-    zoomInButton.onClick = [this] { setZoom(zoom * 1.18f); };
+    zoomOutButton.onClick = [this] { setZoom(zoom / 1.2f); };
+    zoomInButton.onClick = [this] { setZoom(zoom * 1.2f); };
     fitButton.onClick = [this] { fitToView(); };
     showAllButton.onClick = [this]
     {
-        if (canvas != nullptr)
-            canvas->showAllNodes();
-        fitToView();
+        showAllNodes();
     };
+    zoomOutButton.setTooltip("Zoom out of the graph");
+    zoomInButton.setTooltip("Zoom in; maximum 200%");
+    fitButton.setTooltip("Fit the complete graph into the canvas");
+    showAllButton.setTooltip("Show every node at 100% zoom");
     addNodeButton.onClick = [this]
     {
         if (matrix.getNumActiveChannels() >= maxInputs)
@@ -3124,7 +3163,7 @@ RoutingGraphComponent::RoutingGraphComponent(RoutingMatrix& routingMatrix,
             callback();
     };
 
-    helpLabel.setText("Click a node to focus its route; in channel focus, click other channels to add or remove them. Click empty space to clear selection; use Show All to restore the full graph. Click DSP / EQ or VST3 to edit.",
+    helpLabel.setText("120% view. Mouse wheel zooms at the cursor; middle-drag or scrollbars move around. Fit shows the whole graph; Show All restores every node.",
                       juce::dontSendNotification);
     helpLabel.setFont(juce::FontOptions(10.0f));
     helpLabel.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
@@ -3383,7 +3422,7 @@ bool RoutingGraphComponent::restoreLayout(const juce::String& xmlText)
     if (xmlText.isEmpty())
     {
         resetLayout();
-        helpLabel.setText("Click a node to focus its route; in channel focus, click other channels to add or remove them. Click empty space to clear selection; use Show All to restore the full graph. Click DSP / EQ or VST3 to edit.",
+        helpLabel.setText("120% view. Mouse wheel zooms at the cursor; middle-drag or scrollbars move around. Fit shows the whole graph; Show All restores every node.",
                           juce::dontSendNotification);
         return true;
     }
@@ -3428,7 +3467,7 @@ bool RoutingGraphComponent::restoreLayout(const juce::String& xmlText)
                           juce::dontSendNotification);
         return false;
     }
-    zoom = juce::jlimit(0.45f, 1.5f, restoredZoom);
+    zoom = juce::jlimit(0.45f, 2.0f, restoredZoom);
     viewPositionX = juce::jmax(0, layout->getIntAttribute("viewX", 0));
     viewPositionY = juce::jmax(0, layout->getIntAttribute("viewY", 0));
     hasRestoredLayout = true;
@@ -3445,13 +3484,13 @@ void RoutingGraphComponent::paint(juce::Graphics& g)
 void RoutingGraphComponent::resized()
 {
     auto area = getLocalBounds();
-    auto toolbar = area.removeFromTop(32);
-    fitButton.setBounds(toolbar.removeFromRight(54).reduced(2));
-    showAllButton.setBounds(toolbar.removeFromRight(78).reduced(2));
-    signalFlowButton.setBounds(toolbar.removeFromRight(92).reduced(2));
-    addNodeButton.setBounds(toolbar.removeFromRight(82).reduced(2));
-    zoomInButton.setBounds(toolbar.removeFromRight(36).reduced(2));
-    zoomOutButton.setBounds(toolbar.removeFromRight(36).reduced(2));
+    auto toolbar = area.removeFromTop(38);
+    fitButton.setBounds(toolbar.removeFromRight(58).reduced(2));
+    showAllButton.setBounds(toolbar.removeFromRight(82).reduced(2));
+    signalFlowButton.setBounds(toolbar.removeFromRight(100).reduced(2));
+    addNodeButton.setBounds(toolbar.removeFromRight(88).reduced(2));
+    zoomInButton.setBounds(toolbar.removeFromRight(62).reduced(2));
+    zoomOutButton.setBounds(toolbar.removeFromRight(62).reduced(2));
     helpLabel.setBounds(toolbar.reduced(4, 0));
 
     auto dockArea = area.removeFromBottom(54);
@@ -3472,8 +3511,6 @@ void RoutingGraphComponent::resized()
 
     viewport.setBounds(area.reduced(4, 0));
     viewport.setViewPosition(viewPositionX, viewPositionY);
-    if (!hasRestoredLayout && zoom == 1.0f && canvas != nullptr)
-        fitToView();
 }
 
 void RoutingGraphComponent::refresh()
@@ -3527,13 +3564,37 @@ void RoutingGraphComponent::showAllNodes()
 {
     if (canvas != nullptr)
         canvas->showAllNodes();
-    fitToView();
+    hasFocusedViewSnapshot = false;
+    zoom = 1.2f;
+    if (canvas != nullptr)
+        canvas->setZoom(zoom);
+    viewport.setViewPosition(0, 0);
+    viewPositionX = 0;
+    viewPositionY = 0;
 }
 
 void RoutingGraphComponent::setZoom(float newZoom)
 {
-    zoom = juce::jlimit(0.45f, 1.5f, newZoom);
+    zoom = juce::jlimit(0.45f, 2.0f, newZoom);
     canvas->setZoom(zoom);
+    viewPositionX = viewport.getViewPositionX();
+    viewPositionY = viewport.getViewPositionY();
+}
+
+void RoutingGraphComponent::setZoomAt(float newZoom, juce::Point<float> canvasPosition)
+{
+    const float boundedZoom = juce::jlimit(0.45f, 2.0f, newZoom);
+    if (boundedZoom == zoom)
+        return;
+
+    const float graphX = canvasPosition.x / zoom;
+    const float graphY = canvasPosition.y / zoom;
+    const int viewportX = juce::roundToInt(canvasPosition.x) - viewport.getViewPositionX();
+    const int viewportY = juce::roundToInt(canvasPosition.y) - viewport.getViewPositionY();
+    setZoom(boundedZoom);
+    viewport.setViewPosition(
+        juce::jmax(0, juce::roundToInt(graphX * zoom) - viewportX),
+        juce::jmax(0, juce::roundToInt(graphY * zoom) - viewportY));
     viewPositionX = viewport.getViewPositionX();
     viewPositionY = viewport.getViewPositionY();
 }
@@ -3541,7 +3602,7 @@ void RoutingGraphComponent::setZoom(float newZoom)
 void RoutingGraphComponent::resetLayout()
 {
     canvas->resetPositions();
-    zoom = 1.0f;
+    zoom = 1.2f;
     viewPositionX = 0;
     viewPositionY = 0;
     hasRestoredLayout = false;

@@ -56,6 +56,7 @@ namespace LiveBus
         void setSelectedTarget(TargetIndex target);
         TargetIndex getSelectedTarget() const noexcept { return currentTarget; }
         std::function<void(TargetIndex)> onTargetSelected;
+        std::function<void(TargetIndex)> onParametersChanged;
 
         void updateUIFromProcessor();
         void applyPreset(int presetIndex);

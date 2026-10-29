@@ -66,6 +66,48 @@ namespace LiveBus
         std::atomic<float> limiterCeilingDb{-1.0f};      // -20.0 to 0.0 dBFS
         std::atomic<float> limiterReleaseMs{50.0f};      // 1.0 to 500.0 ms
         std::atomic<float> outputGainDb{0.0f};           // -18.0 to +18.0 dB
+
+        void setToDefault() noexcept
+        {
+            masterEnabled.store(false, std::memory_order_relaxed);
+            hpfBypassed.store(false, std::memory_order_relaxed);
+            gateBypassed.store(false, std::memory_order_relaxed);
+            eqBypassed.store(false, std::memory_order_relaxed);
+            deEsserBypassed.store(false, std::memory_order_relaxed);
+            compBypassed.store(false, std::memory_order_relaxed);
+            limiterBypassed.store(false, std::memory_order_relaxed);
+            inputGainDb.store(0.0f, std::memory_order_relaxed);
+            hpfFreq.store(80.0f, std::memory_order_relaxed);
+            hpfSlope.store(1, std::memory_order_relaxed);
+            gateMode.store(ModeGate, std::memory_order_relaxed);
+            gateOpenThresholdDb.store(-42.0f, std::memory_order_relaxed);
+            gateCloseThresholdDb.store(-50.0f, std::memory_order_relaxed);
+            gateAttackMs.store(1.0f, std::memory_order_relaxed);
+            gateHoldMs.store(20.0f, std::memory_order_relaxed);
+            gateReleaseMs.store(100.0f, std::memory_order_relaxed);
+            gateFloorDb.store(-60.0f, std::memory_order_relaxed);
+            gateKeySource.store(0, std::memory_order_relaxed);
+            gateKeyHpfFreq.store(70.0f, std::memory_order_relaxed);
+            gateKeyLpfFreq.store(4000.0f, std::memory_order_relaxed);
+            deEsserType.store(TypeBell, std::memory_order_relaxed);
+            deEsserThresholdDb.store(-16.0f, std::memory_order_relaxed);
+            deEsserFreq.store(5500.0f, std::memory_order_relaxed);
+            deEsserRangeDb.store(-8.0f, std::memory_order_relaxed);
+            compThresholdDb.store(-24.0f, std::memory_order_relaxed);
+            compRatio.store(3.0f, std::memory_order_relaxed);
+            compAttackMs.store(10.0f, std::memory_order_relaxed);
+            compReleaseMs.store(120.0f, std::memory_order_relaxed);
+            compKnee.store(KneeNormal, std::memory_order_relaxed);
+            compReleaseMode.store(ReleaseManual, std::memory_order_relaxed);
+            compMakeupDb.store(3.0f, std::memory_order_relaxed);
+            compMixPercent.store(100.0f, std::memory_order_relaxed);
+            compKeySource.store(0, std::memory_order_relaxed);
+            compKeyHpfFreq.store(60.0f, std::memory_order_relaxed);
+            compKeyLpfFreq.store(15000.0f, std::memory_order_relaxed);
+            limiterCeilingDb.store(-1.0f, std::memory_order_relaxed);
+            limiterReleaseMs.store(50.0f, std::memory_order_relaxed);
+            outputGainDb.store(0.0f, std::memory_order_relaxed);
+        }
     };
 
     /**

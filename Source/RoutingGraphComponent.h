@@ -107,6 +107,7 @@ private:
     };
 
     void setZoom(float newZoom);
+    void setZoomAt(float newZoom, juce::Point<float> canvasPosition);
     void fitToView();
     void resetLayout();
     void rebuildPaletteItems();
@@ -124,8 +125,8 @@ private:
     int viewPositionX = 0;
     int viewPositionY = 0;
     bool hasRestoredLayout = false;
-    juce::TextButton zoomOutButton{"-"};
-    juce::TextButton zoomInButton{"+"};
+    juce::TextButton zoomOutButton{"Zoom -"};
+    juce::TextButton zoomInButton{"Zoom +"};
     juce::TextButton fitButton{"Fit"};
     juce::TextButton addNodeButton{"+ Input"};
     juce::TextButton signalFlowButton{"Signal Flow"};
@@ -149,8 +150,8 @@ private:
     std::function<void(juce::Component*)> addInputCallback;
     int selectedPaletteCategory = 0;
     int dockChannelCount = 0;
-    float zoom = 1.0f;
-    float preFocusZoom = 1.0f;
+    float zoom = 1.2f;
+    float preFocusZoom = 1.2f;
     int preFocusViewX = 0;
     int preFocusViewY = 0;
     bool hasFocusedViewSnapshot = false;

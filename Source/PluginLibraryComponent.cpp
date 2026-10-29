@@ -190,7 +190,20 @@ void PluginLibraryComponent::rebuildFilteredList()
             }
         }
 
-        filteredPlugins.push_back(item);
+        // Avoid visual duplication in table rows
+        bool alreadyInList = false;
+        for (const auto& existing : filteredPlugins)
+        {
+            if (existing.getDisplayName() == item.getDisplayName() &&
+                existing.getManufacturer() == item.getManufacturer())
+            {
+                alreadyInList = true;
+                break;
+            }
+        }
+
+        if (!alreadyInList)
+            filteredPlugins.push_back(item);
     }
 
     // Refresh Combos if empty

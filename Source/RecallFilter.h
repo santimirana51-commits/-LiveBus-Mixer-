@@ -23,7 +23,7 @@ struct ChannelRecallFilter
 /** Granular recall filter for an individual master bus. */
 struct BusRecallFilter
 {
-    bool processing = true;     // Bus DSP (HPF, 4-band, Gate, Comp, Limiter, Reverb, Delay) + 8-Band EQ + Vocal DSP
+    bool processing = true;     // Bus DSP (HPF, EQ, Gate, Comp, Limiter, Reverb, Delay) + Vocal DSP
     bool mute = true;           // Master mute
     bool level = true;          // Master fader level
     bool pan = true;            // Master pan

@@ -255,7 +255,6 @@ AudioSettingsComponent::AudioSettingsComponent(AudioDeviceService& devService)
     };
     addAndMakeVisible(bufferSizeCombo);
 
-    // Diagnostics & Footer
     latencyNoteLabel.setText("Note: Buffer duration is single-buffer processing time, not total round-trip latency.", juce::dontSendNotification);
     latencyNoteLabel.setFont(juce::FontOptions(11.0f));
     latencyNoteLabel.setColour(juce::Label::textColourId, juce::Colour(0xff8896aa));
@@ -529,7 +528,7 @@ void AudioSettingsComponent::resized()
     card.removeFromTop(gap);
 
     // 4. Audio Output Channels
-    const int chBoxH = 140;
+    const int chBoxH = 130;
     auto row4 = card.removeFromTop(chBoxH);
     outputChannelsLabel.setBounds(row4.removeFromLeft(labelW).removeFromTop(rowH));
     if (outputChannelsBox) outputChannelsBox->setBounds(row4);

@@ -4,6 +4,8 @@
 #include "PluginLibraryComponent.h"
 #include "PluginEditorWindow.h"
 
+class RNNoiseVST3Plugin;
+
 namespace LiveBus
 {
 
@@ -87,6 +89,9 @@ private:
 
     // Plug-in Library Overlay View
     std::unique_ptr<PluginLibraryComponent> libraryComponent;
+
+    // Direct bundled plugin processor instance for editing when running in out-of-process isolation
+    std::unique_ptr<RNNoiseVST3Plugin> internalRNNoisePlugin;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(EffectsConsoleComponent)
 };

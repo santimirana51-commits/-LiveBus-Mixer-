@@ -3,6 +3,7 @@
 #include "../Source/RoutingMatrix.h"
 #include "../Source/RoutingGraphRouting.h"
 #include "../Source/ChannelStripDSP.h"
+#include "../Source/EQFrequencyAnalyzer.h"
 #include "../Source/SceneManager.h"
 #include "../Source/PluginHostProtocol.h"
 #include "../Source/PluginHostClient.h"
@@ -15,6 +16,7 @@
 #include "../Source/AudioDeviceService.h"
 #include "../Source/RecallFilter.h"
 #include "../Source/PresetManager.h"
+#include "../Source/EQPresetCatalog.h"
 #include "../Source/OBSIntegrationService.h"
 #include "../Source/MasterOutputRouter.h"
 #include "../Source/OBSWebSocketClient.h"
@@ -27,6 +29,9 @@
 #include "../Source/PluginLibraryModel.h"
 #include "../Source/VST3HostEngine.h"
 #include "../Source/PerformanceDiagnosticsModel.h"
+#include "../Source/RealtimeAudioBlockQueue.h"
+#include "../Source/AsyncAudioWorker.h"
+#include "../Source/RNNoiseNoiseSuppressor.h"
 #include "../Source/AudioPerformanceMonitor.h"
 #include "../Source/DiagnosticsLogManager.h"
 #include "../Source/AutoDucker.h"
@@ -35,6 +40,8 @@
 #include "../Source/MacroEngine.h"
 #include "../Source/YouTubeAudioCaptureService.h"
 #include "../Source/YouTubePlayerComponent.h"
+#include "../Source/VocalFXPro/PitchDetector.h"
+#include "../Source/VocalFXPro/PitchCorrection.h"
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -257,6 +264,59 @@ void testRoutingGraphEditsUpdateAudioEngine()
                     !matrix.getChannel(0).routeEnable[0].load() &&
                     !matrix.getChannel(0).routeEnable[1].load(),
                 "Removing a Submix cable does not restore stale direct routes");
+}
+
+void testRoutingGraphSoloIndicatorsMatchAudioRouting()
+{
+    RoutingMatrix matrix;
+    auto& channel0 = matrix.getChannel(0);
+    auto& channel1 = matrix.getChannel(1);
+
+    channel0.routeEnable[0].store(true);
+    channel1.routeEnable[0].store(true);
+    channel0.solo.store(true);
+    auto soloState = LiveBus::getRoutingGraphSoloState(matrix);
+    TEST_ASSERT(LiveBus::routingGraphChannelRoutePassesSolo(
+                    soloState, 0, LiveBus::RoutingGraphNodeType::Stream, 0),
+                "Soloed channel keeps its direct Stream route active in the graph");
+    TEST_ASSERT(!LiveBus::routingGraphChannelPassesSoloGate(matrix, soloState, 1) &&
+                    !LiveBus::routingGraphChannelRoutePassesSolo(
+                        soloState, 1, LiveBus::RoutingGraphNodeType::Stream, 0),
+                "Non-solo channel direct route is shown inactive when another channel is soloed");
+
+    channel0.solo.store(false);
+    channel1.auxRouteEnable[0].store(true);
+    matrix.getAuxBus(0).solo.store(true);
+    soloState = LiveBus::getRoutingGraphSoloState(matrix);
+    TEST_ASSERT(LiveBus::routingGraphChannelPassesSoloGate(matrix, soloState, 1) &&
+                    LiveBus::routingGraphChannelRoutePassesSolo(
+                        soloState, 1, LiveBus::RoutingGraphNodeType::Aux, 0),
+                "Channel feeding a soloed Aux remains active on that Aux path");
+    TEST_ASSERT(!LiveBus::routingGraphChannelRoutePassesSolo(
+                    soloState, 1, LiveBus::RoutingGraphNodeType::Stream, 0) &&
+                    LiveBus::routingGraphBusPassesSolo(
+                        soloState, LiveBus::RoutingGraphNodeType::Aux, 0),
+                "Soloed Aux return remains active while unrelated direct master routes are gated");
+
+    matrix.getAuxBus(0).solo.store(false);
+    channel1.auxRouteEnable[0].store(false);
+    channel1.submixGroup.store(0);
+    matrix.getSubmixBus(0).solo.store(true);
+    soloState = LiveBus::getRoutingGraphSoloState(matrix);
+    TEST_ASSERT(LiveBus::routingGraphChannelPassesSoloGate(matrix, soloState, 1) &&
+                    LiveBus::routingGraphChannelRoutePassesSolo(
+                        soloState, 1, LiveBus::RoutingGraphNodeType::Submix, 0) &&
+                    LiveBus::routingGraphBusPassesSolo(
+                        soloState, LiveBus::RoutingGraphNodeType::Submix, 0),
+                "Soloed Submix keeps its member channel path and bus output active");
+
+    matrix.getSubmixBus(0).solo.store(false);
+    channel1.solo.store(true);
+    soloState = LiveBus::getRoutingGraphSoloState(matrix);
+    TEST_ASSERT(soloState.submixHasSoloChannel[0] &&
+                    LiveBus::routingGraphBusPassesSolo(
+                        soloState, LiveBus::RoutingGraphNodeType::Submix, 0),
+                "Submix containing a soloed member keeps its bus output active");
 }
 
 void testIndependentStreamMonitorRestore()
@@ -679,6 +739,37 @@ void testSceneSerializationAndDeserialization()
 
     original.eightBandEQs[(size_t)maxInputs + 1].bands[3].gainDb = 7.5f;
     original.vocalRacks[(size_t)maxInputs + 1].compThresholdDb = -31.0f;
+    original.monitorGraphicEQ31.enabled = true;
+    original.monitorGraphicEQ31.gainDb[17] = 4.5f;
+    original.monitorGraphicEQ31.gainDb[30] = -3.0f;
+    original.mainOutputEQ24.enabled = true;
+    original.mainOutputEQ24.bands[9].type = MainOutputEQFilterType::HighShelf;
+    original.mainOutputEQ24.bands[9].freq = 7200.0f;
+    original.mainOutputEQ24.bands[9].gainDb = 5.5f;
+    original.mainOutputEQ24.bands[9].q = 1.4f;
+    original.mainOutputEQ24.bands[9].enabled = false;
+    original.mainOutputEQ24.bands[9].dynamicEnabled = true;
+    original.mainOutputEQ24.bands[9].dynamicThresholdDb = -31.0f;
+    original.mainOutputEQ24.bands[9].dynamicAttackMs = 4.0f;
+    original.mainOutputEQ24.bands[9].dynamicReleaseMs = 180.0f;
+    original.mainOutputEQ24.bands[9].dynamicRangeDb = 8.0f;
+    original.mainOutputEQ24.bands[9].dynamicDetector = MainOutputEQDetector::RMS;
+    original.hasPuzuEQABData = true;
+    original.puzuEQActiveABSlots[0] = 1;
+    original.puzuEQABSlots[0][1].masterEnabled = true;
+    original.puzuEQABSlots[0][1].bands[6].type =
+        (int)PuzuFilterType::Notch;
+    original.puzuEQABSlots[0][1].bands[6].freq = 740.0f;
+    original.puzuEQABSlots[0][1].bands[6].gainDb = -5.0f;
+    original.hasMonitorGraphicEQ31ABData = true;
+    original.monitorGraphicEQ31ActiveABSlot = 1;
+    original.monitorGraphicEQ31ABSlots[1].enabled = true;
+    original.monitorGraphicEQ31ABSlots[1].gainDb[13] = 3.25f;
+    original.hasMainOutputEQ24ABData = true;
+    original.mainOutputEQ24ActiveABSlot = 1;
+    original.mainOutputEQ24ABSlots[1].enabled = true;
+    original.mainOutputEQ24ABSlots[1].bands[4].freq = 49.0f;
+    original.mainOutputEQ24ABSlots[1].bands[4].dynamicEnabled = true;
     xmlText = manager.serializeToXmlString(original);
     xmlDoc = juce::XmlDocument::parse(xmlText);
     TEST_ASSERT(xmlDoc != nullptr, "Expanded DSP target scene parsed");
@@ -689,6 +780,60 @@ void testSceneSerializationAndDeserialization()
                 "Channel 16 EQ scene state preserved");
     TEST_ASSERT(std::abs(expandedRestored.vocalRacks[(size_t)maxInputs + 1].compThresholdDb + 31.0f) < 1e-4f,
                 "Channel 16 Vocal DSP scene state preserved");
+    TEST_ASSERT(expandedRestored.hasMonitorGraphicEQ31Data &&
+                    expandedRestored.monitorGraphicEQ31.enabled,
+                "Monitor 31-band Graphic EQ scene enable restored");
+    TEST_ASSERT(std::abs(expandedRestored.monitorGraphicEQ31.gainDb[17] - 4.5f) < 1e-4f &&
+                    std::abs(expandedRestored.monitorGraphicEQ31.gainDb[30] + 3.0f) < 1e-4f,
+                "Monitor 31-band Graphic EQ gains restored");
+    TEST_ASSERT(expandedRestored.hasMainOutputEQ24Data &&
+                    expandedRestored.mainOutputEQ24.enabled,
+                "Main Output 24-band EQ scene enable restored");
+    TEST_ASSERT(expandedRestored.mainOutputEQ24.bands[9].type ==
+                    MainOutputEQFilterType::HighShelf &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].freq - 7200.0f) < 1e-4f &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].gainDb - 5.5f) < 1e-4f &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].q - 1.4f) < 1e-4f &&
+                    !expandedRestored.mainOutputEQ24.bands[9].enabled &&
+                    expandedRestored.mainOutputEQ24.bands[9].dynamicEnabled &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].dynamicThresholdDb + 31.0f) < 1e-4f &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].dynamicAttackMs - 4.0f) < 1e-4f &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].dynamicReleaseMs - 180.0f) < 1e-4f &&
+                    std::abs(expandedRestored.mainOutputEQ24.bands[9].dynamicRangeDb - 8.0f) < 1e-4f &&
+                    expandedRestored.mainOutputEQ24.bands[9].dynamicDetector ==
+                        MainOutputEQDetector::RMS,
+                "Main Output 24-band EQ band configuration restored");
+    TEST_ASSERT(expandedRestored.hasPuzuEQABData &&
+                    expandedRestored.puzuEQActiveABSlots[0] == 1 &&
+                    expandedRestored.puzuEQABSlots[0][1].masterEnabled &&
+                    expandedRestored.puzuEQABSlots[0][1].bands[6].type ==
+                        (int)PuzuFilterType::Notch &&
+                    std::abs(expandedRestored.puzuEQABSlots[0][1].bands[6].freq -
+                             740.0f) < 1e-4f &&
+                    std::abs(expandedRestored.puzuEQABSlots[0][1].bands[6].gainDb +
+                             5.0f) < 1e-4f,
+                "Puzu A/B slots and active slot round-trip through scene XML");
+    TEST_ASSERT(expandedRestored.hasMonitorGraphicEQ31ABData &&
+                    expandedRestored.monitorGraphicEQ31ActiveABSlot == 1 &&
+                    expandedRestored.monitorGraphicEQ31ABSlots[1].enabled &&
+                    std::abs(expandedRestored.monitorGraphicEQ31ABSlots[1].gainDb[13] -
+                             3.25f) < 1e-4f,
+                "Monitor Graphic EQ A/B slots round-trip through scene XML");
+    TEST_ASSERT(expandedRestored.hasMainOutputEQ24ABData &&
+                    expandedRestored.mainOutputEQ24ActiveABSlot == 1 &&
+                    expandedRestored.mainOutputEQ24ABSlots[1].enabled &&
+                    std::abs(expandedRestored.mainOutputEQ24ABSlots[1].bands[4].freq -
+                             49.0f) < 1e-4f &&
+                    expandedRestored.mainOutputEQ24ABSlots[1].bands[4].dynamicEnabled,
+                "Main Output EQ A/B slots round-trip through scene XML");
+
+    xmlDoc->removeChildElement(xmlDoc->getChildByName("EQ_AB_STATES"), true);
+    SceneData legacyABRestored;
+    TEST_ASSERT(manager.deserializeFromXml(*xmlDoc, legacyABRestored, err) &&
+                    !legacyABRestored.hasPuzuEQABData &&
+                    !legacyABRestored.hasMonitorGraphicEQ31ABData &&
+                    !legacyABRestored.hasMainOutputEQ24ABData,
+                "Legacy scenes without EQ A/B XML remain loadable");
 }
 
 void testSceneFileCorruptionRecovery()
@@ -906,6 +1051,7 @@ void testFourBandStudioEqualizer()
     dsp.prepare(48000.0, 512);
 
     // Flat response with 0dB gain
+    dsp.params.puzuEnabled.store(false);
     dsp.params.eqEnabled.store(true);
     dsp.params.hpfEnabled.store(false);
     dsp.params.eqLowGainDb.store(0.0f);
@@ -948,7 +1094,8 @@ void testFifteenBandPuzuEqualizerAndSlopeFilters()
     dsp.prepare(48000.0, 512);
 
     // 1. Verify 15-Band Flat Initialization
-    dsp.params.eqEnabled.store(true);
+    dsp.params.puzuEnabled.store(true);
+    dsp.params.eqEnabled.store(false);
     dsp.params.hpfEnabled.store(false);
     dsp.params.lpfEnabled.store(false);
     dsp.updateCoefficients();
@@ -961,6 +1108,23 @@ void testFifteenBandPuzuEqualizerAndSlopeFilters()
     dsp.updateCoefficients();
     float mag63 = dsp.getMagnitudeForFrequency(63.7f);
     TEST_ASSERT(mag63 > 4.8f && mag63 < 7.0f, "PUZU Band 2 boosts 63.7Hz by ~+6dB");
+
+    dsp.params.puzuBands[2].type.store(PuzuFilterType::Notch);
+    dsp.params.puzuBands[2].gainDb.store(0.0f);
+    dsp.updateCoefficients();
+    TEST_ASSERT(dsp.getMagnitudeForFrequency(63.7f) < -10.0f,
+                "PUZU notch filter attenuates its selected frequency");
+
+    dsp.params.puzuBands[2].enabled.store(false);
+    dsp.updateCoefficients();
+    TEST_ASSERT(std::abs(dsp.getMagnitudeForFrequency(63.7f)) < 0.1f,
+                "Disabling a PUZU band preserves its parameters and bypasses its response");
+
+    dsp.params.puzuEnabled.store(false);
+    dsp.params.puzuBands[2].enabled.store(true);
+    dsp.updateCoefficients();
+    TEST_ASSERT(std::abs(dsp.getMagnitudeForFrequency(63.7f)) < 0.1f,
+                "PUZU master bypass is independent of the legacy four-band EQ enable");
 
     // 3. Test HP Filter 12dB/Oct cutoff at 100Hz
     dsp.params.hpfEnabled.store(true);
@@ -977,6 +1141,1276 @@ void testFifteenBandPuzuEqualizerAndSlopeFilters()
     dsp.updateCoefficients();
     float magAir = dsp.getMagnitudeForFrequency(16000.0f);
     TEST_ASSERT(magAir < -10.0f, "LP Filter 24dB/Oct attenuates 16kHz significantly");
+}
+
+void testPuzuEQStateCopyRestoreAndValidation()
+{
+    BusDSPProcessor source;
+    BusDSPProcessor destination;
+    source.prepare(48000.0, 256);
+    destination.prepare(44100.0, 256);
+
+    source.params.puzuEnabled.store(true, std::memory_order_relaxed);
+    source.params.puzuBands[0].freq.store(120.0f, std::memory_order_relaxed);
+    source.params.puzuBands[0].q.store(2.5f, std::memory_order_relaxed);
+    source.params.puzuBands[0].gainDb.store(6.0f, std::memory_order_relaxed);
+    source.params.puzuBands[0].type.store(PuzuFilterType::LowShelf, std::memory_order_relaxed);
+    source.params.puzuBands[0].enabled.store(false, std::memory_order_relaxed);
+    source.params.puzuBands[14].type.store(PuzuFilterType::Notch, std::memory_order_relaxed);
+
+    const auto copiedState = source.getPuzuEQState();
+    destination.setPuzuEQState(copiedState);
+    auto restoredState = destination.getPuzuEQState();
+    TEST_ASSERT(restoredState.enabled, "EQ master enable is copied");
+    TEST_ASSERT(std::abs(restoredState.bands[0].freq - 120.0f) < 0.01f,
+                "Band frequency is copied");
+    TEST_ASSERT(std::abs(restoredState.bands[0].q - 2.5f) < 0.001f,
+                "Band Q is copied");
+    TEST_ASSERT(std::abs(restoredState.bands[0].gainDb - 6.0f) < 0.001f,
+                "Band gain is copied");
+    TEST_ASSERT(restoredState.bands[0].type == PuzuFilterType::LowShelf,
+                "Band filter type is copied");
+    TEST_ASSERT(!restoredState.bands[0].enabled, "Band enabled state is copied");
+    TEST_ASSERT(restoredState.bands[14].type == PuzuFilterType::Notch,
+                "Last band's filter type is copied");
+
+    auto invalidState = copiedState;
+    invalidState.bands[0].freq = std::numeric_limits<float>::quiet_NaN();
+    invalidState.bands[0].q = std::numeric_limits<float>::infinity();
+    invalidState.bands[0].gainDb = 100.0f;
+    invalidState.bands[0].type = static_cast<PuzuFilterType>(99);
+    destination.setPuzuEQState(invalidState);
+    restoredState = destination.getPuzuEQState();
+    TEST_ASSERT(std::abs(restoredState.bands[0].freq - defaultPuzuFreqs[0]) < 0.01f,
+                "Non-finite frequency uses its band's default");
+    TEST_ASSERT(std::abs(restoredState.bands[0].q - defaultPuzuQs[0]) < 0.001f,
+                "Non-finite Q uses its band's default");
+    TEST_ASSERT(std::abs(restoredState.bands[0].gainDb - 18.0f) < 0.001f,
+                "Gain is clamped to the filter engine's supported range");
+    TEST_ASSERT(restoredState.bands[0].type == PuzuFilterType::Bell,
+                "Invalid filter type falls back to Bell");
+}
+
+void testMonitorGraphicEQ31ResponseBypassAndTargetIsolation()
+{
+    BusDSPProcessor monitor;
+    BusDSPProcessor stream;
+    monitor.prepare(48000.0, 1024);
+    stream.prepare(48000.0, 1024);
+
+    MonitorGraphicEQ31State state;
+    state.enabled = true;
+    state.gainDb[17] = 6.0f;
+    monitor.setMonitorGraphicEQState(state);
+    TEST_ASSERT(monitor.getMonitorGraphicEQMagnitudeDb(1000.0f) > 5.5f,
+                "Graphic EQ curve represents its actual 1 kHz boost");
+    TEST_ASSERT(std::abs(monitor.getMonitorGraphicEQMagnitudeDb(100.0f)) < 0.1f,
+                "Graphic EQ remains flat away from the selected 1 kHz band");
+
+    juce::AudioBuffer<float> monitorBuffer(2, 1024);
+    juce::AudioBuffer<float> streamBuffer(2, 1024);
+    int samplePosition = 0;
+    float monitorPeak = 0.0f;
+    float streamPeak = 0.0f;
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int sample = 0; sample < monitorBuffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)samplePosition / 48000.0f);
+            monitorBuffer.setSample(0, sample, value);
+            monitorBuffer.setSample(1, sample, value);
+            streamBuffer.setSample(0, sample, value);
+            streamBuffer.setSample(1, sample, value);
+            ++samplePosition;
+        }
+        monitor.process(monitorBuffer, monitorBuffer.getNumSamples());
+        stream.process(streamBuffer, streamBuffer.getNumSamples());
+        monitorPeak = monitorBuffer.getMagnitude(0, 0, monitorBuffer.getNumSamples());
+        streamPeak = streamBuffer.getMagnitude(0, 0, streamBuffer.getNumSamples());
+    }
+    TEST_ASSERT(monitorPeak > streamPeak * 1.7f,
+                "Enabled Monitor Graphic EQ affects only its own processor");
+
+    state.enabled = false;
+    monitor.setMonitorGraphicEQState(state);
+    TEST_ASSERT(std::abs(monitor.getMonitorGraphicEQMagnitudeDb(1000.0f)) > 5.5f,
+                "Bypass preserves the saved EQ curve parameters");
+    float bypassPeak = 0.0f;
+    for (int block = 0; block < 3; ++block)
+    {
+        for (int sample = 0; sample < monitorBuffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)samplePosition / 48000.0f);
+            monitorBuffer.setSample(0, sample, value);
+            monitorBuffer.setSample(1, sample, value);
+            ++samplePosition;
+        }
+        monitor.process(monitorBuffer, monitorBuffer.getNumSamples());
+        bypassPeak = monitorBuffer.getMagnitude(0, 0, monitorBuffer.getNumSamples());
+    }
+    TEST_ASSERT(bypassPeak < monitorPeak * 0.75f,
+                "Smooth bypass returns output toward the un-EQ'd signal");
+
+    state.enabled = true;
+    state.gainDb[17] = std::numeric_limits<float>::quiet_NaN();
+    monitor.setMonitorGraphicEQState(state);
+    TEST_ASSERT(std::abs(monitor.params.monitorGraphicEQGainDb[17].load(
+                             std::memory_order_relaxed)) < 0.001f,
+                "Invalid Graphic EQ gain is safely reset to flat");
+}
+
+void testMonitorGraphicEQAnalyzerCapturesPreAndPostAudio()
+{
+    BusDSPProcessor monitor;
+    BusDSPProcessor stream;
+    monitor.prepare(48000.0, 1024);
+    stream.prepare(48000.0, 1024);
+
+    MonitorGraphicEQ31State state;
+    state.enabled = true;
+    state.gainDb[17] = 6.0f;
+    monitor.setMonitorGraphicEQState(state);
+    monitor.setMonitorGraphicEQAnalyzerEnabled(true);
+
+    juce::AudioBuffer<float> monitorBuffer(2, 1024);
+    juce::AudioBuffer<float> streamBuffer(2, 1024);
+    int samplePosition = 0;
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int sample = 0; sample < monitorBuffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)samplePosition / 48000.0f);
+            monitorBuffer.setSample(0, sample, value);
+            monitorBuffer.setSample(1, sample, value);
+            streamBuffer.setSample(0, sample, value);
+            streamBuffer.setSample(1, sample, value);
+            ++samplePosition;
+        }
+        monitor.process(monitorBuffer, monitorBuffer.getNumSamples());
+        stream.process(streamBuffer, streamBuffer.getNumSamples());
+    }
+
+    std::array<float, 2048> preSamples{};
+    std::array<float, 2048> postSamples{};
+    TEST_ASSERT(monitor.pullMonitorGraphicEQPreAnalyzer(
+                    preSamples.data(), (int)preSamples.size()),
+                "Monitor analyzer returns captured pre-EQ samples");
+    TEST_ASSERT(monitor.pullMonitorGraphicEQPostAnalyzer(
+                    postSamples.data(), (int)postSamples.size()),
+                "Monitor analyzer returns captured post-EQ samples");
+
+    float preEnergy = 0.0f;
+    float postEnergy = 0.0f;
+    for (size_t sample = 0; sample < preSamples.size(); ++sample)
+    {
+        preEnergy += preSamples[sample] * preSamples[sample];
+        postEnergy += postSamples[sample] * postSamples[sample];
+    }
+    TEST_ASSERT(postEnergy > preEnergy * 1.5f,
+                "Post-EQ analyzer samples reflect the Monitor EQ boost");
+    TEST_ASSERT(!stream.pullMonitorGraphicEQPreAnalyzer(
+                    preSamples.data(), (int)preSamples.size()),
+                "Monitor analyzer capture is isolated from the Stream processor");
+}
+
+void testMonitorGraphicEQStereoAnalyzerPreservesChannels()
+{
+    BusDSPProcessor monitor;
+    monitor.prepare(48000.0, 1024);
+    monitor.setMonitorGraphicEQAnalyzerEnabled(true);
+
+    juce::AudioBuffer<float> monitorBuffer(2, 1024);
+    int samplePosition = 0;
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int sample = 0; sample < monitorBuffer.getNumSamples(); ++sample)
+        {
+            monitorBuffer.setSample(0, sample, 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)samplePosition / 48000.0f));
+            monitorBuffer.setSample(1, sample, 0.2f * std::sin(
+                juce::MathConstants<float>::twoPi * 2300.0f *
+                (float)samplePosition / 48000.0f));
+            ++samplePosition;
+        }
+        monitor.process(monitorBuffer, monitorBuffer.getNumSamples());
+    }
+
+    std::array<float, 2048> leftSamples{};
+    std::array<float, 2048> rightSamples{};
+    TEST_ASSERT(monitor.pullMonitorGraphicEQPreAnalyzerStereo(
+                    leftSamples.data(), rightSamples.data(),
+                    (int)leftSamples.size()),
+                "Monitor stereo analyzer returns separate channel samples");
+
+    float leftEnergy = 0.0f;
+    float rightEnergy = 0.0f;
+    float channelDifference = 0.0f;
+    for (size_t sample = 0; sample < leftSamples.size(); ++sample)
+    {
+        leftEnergy += leftSamples[sample] * leftSamples[sample];
+        rightEnergy += rightSamples[sample] * rightSamples[sample];
+        const float difference = leftSamples[sample] - rightSamples[sample];
+        channelDifference += difference * difference;
+    }
+    TEST_ASSERT(leftEnergy > 0.1f && rightEnergy > 0.1f,
+                "Both Monitor analyzer channel streams contain audio");
+    TEST_ASSERT(channelDifference > 1.0f,
+                "Monitor stereo analyzer does not average left and right");
+}
+
+void testMainOutputEQ24ResponseBypassAndValidation()
+{
+    BusDSPProcessor mainOutput;
+    BusDSPProcessor monitor;
+    mainOutput.prepare(48000.0, 1024);
+    monitor.prepare(48000.0, 1024);
+
+    MainOutputEQ24State state;
+    state.enabled = true;
+    state.bands[17].freq = 1000.0f;
+    state.bands[17].q = 0.707f;
+    state.bands[17].gainDb = 6.0f;
+    state.bands[17].type = MainOutputEQFilterType::Bell;
+    mainOutput.setMainOutputEQ24State(state);
+    mainOutput.setMainOutputEQAnalyzerEnabled(true);
+    TEST_ASSERT(mainOutput.getMainOutputEQ24MagnitudeDb(1000.0f) > 5.5f,
+                "Main EQ 1 kHz bell boost is represented by the actual filter response");
+    TEST_ASSERT(std::abs(mainOutput.getMainOutputEQ24MagnitudeDb(100.0f)) < 0.25f,
+                "Main EQ response remains flat away from the selected bell band");
+
+    juce::AudioBuffer<float> mainBuffer(2, 1024);
+    juce::AudioBuffer<float> monitorBuffer(2, 1024);
+    int samplePosition = 0;
+    float mainPeak = 0.0f;
+    float monitorPeak = 0.0f;
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int sample = 0; sample < mainBuffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)samplePosition / 48000.0f);
+            mainBuffer.setSample(0, sample, value);
+            mainBuffer.setSample(1, sample, value);
+            monitorBuffer.setSample(0, sample, value);
+            monitorBuffer.setSample(1, sample, value);
+            ++samplePosition;
+        }
+        mainOutput.process(mainBuffer, mainBuffer.getNumSamples());
+        monitor.process(monitorBuffer, monitorBuffer.getNumSamples());
+        mainPeak = mainBuffer.getMagnitude(0, 0, mainBuffer.getNumSamples());
+        monitorPeak = monitorBuffer.getMagnitude(0, 0, monitorBuffer.getNumSamples());
+    }
+    TEST_ASSERT(mainPeak > monitorPeak * 1.7f,
+                "Main Output EQ does not process the independent Monitor Bus");
+    std::array<float, 1024> preAnalyzer{};
+    std::array<float, 1024> postAnalyzer{};
+    bool receivedAnalyzerData = false;
+    for (int block = 0; block < 4; ++block)
+        receivedAnalyzerData =
+            mainOutput.pullMainOutputEQPreAnalyzer(preAnalyzer.data(),
+                                                   (int)preAnalyzer.size()) &&
+            mainOutput.pullMainOutputEQPostAnalyzer(postAnalyzer.data(),
+                                                    (int)postAnalyzer.size());
+    float preEnergy = 0.0f;
+    float postEnergy = 0.0f;
+    for (size_t sample = 0; sample < preAnalyzer.size(); ++sample)
+    {
+        preEnergy += preAnalyzer[sample] * preAnalyzer[sample];
+        postEnergy += postAnalyzer[sample] * postAnalyzer[sample];
+    }
+    TEST_ASSERT(receivedAnalyzerData && postEnergy > preEnergy * 1.7f,
+                "Main EQ analyzer captures actual pre/post samples at the DSP insertion point");
+    mainOutput.setMainOutputEQAnalyzerEnabled(false);
+
+    state.enabled = false;
+    mainOutput.setMainOutputEQ24State(state);
+    TEST_ASSERT(mainOutput.getMainOutputEQ24MagnitudeDb(1000.0f) > 5.5f,
+                "Main EQ bypass preserves the configured filter response");
+    float bypassPeak = 0.0f;
+    for (int block = 0; block < 3; ++block)
+    {
+        for (int sample = 0; sample < mainBuffer.getNumSamples(); ++sample)
+        {
+            const float value = 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)samplePosition / 48000.0f);
+            mainBuffer.setSample(0, sample, value);
+            mainBuffer.setSample(1, sample, value);
+            ++samplePosition;
+        }
+        mainOutput.process(mainBuffer, mainBuffer.getNumSamples());
+        bypassPeak = mainBuffer.getMagnitude(0, 0, mainBuffer.getNumSamples());
+    }
+    TEST_ASSERT(bypassPeak < mainPeak * 0.75f,
+                "Main Output EQ bypass fades the signal back to dry");
+
+    state.enabled = true;
+    state.bands[17].freq = std::numeric_limits<float>::quiet_NaN();
+    state.bands[17].q = std::numeric_limits<float>::infinity();
+    state.bands[17].gainDb = 100.0f;
+    state.bands[17].type = static_cast<MainOutputEQFilterType>(99);
+    mainOutput.setMainOutputEQ24State(state);
+    const auto sanitized = mainOutput.getMainOutputEQ24State();
+    TEST_ASSERT(std::abs(sanitized.bands[17].freq - mainOutputEQFrequencies[17]) < 0.01f &&
+                    std::abs(sanitized.bands[17].q - 0.707f) < 0.001f &&
+                    std::abs(sanitized.bands[17].gainDb - 18.0f) < 0.001f &&
+                    sanitized.bands[17].type == MainOutputEQFilterType::Bell,
+                "Main Output EQ validates non-finite and out-of-range parameters");
+
+    state.bands[17].type = MainOutputEQFilterType::Notch;
+    state.bands[17].freq = 1000.0f;
+    state.bands[17].q = 3.0f;
+    state.bands[17].gainDb = 0.0f;
+    mainOutput.setMainOutputEQ24State(state);
+    TEST_ASSERT(mainOutput.getMainOutputEQ24MagnitudeDb(1000.0f) < -10.0f,
+                "Main Output EQ notch filter attenuates its center frequency");
+}
+
+void testMainOutputEQBandSoloAudition()
+{
+    BusDSPProcessor processor;
+    processor.prepare(48000.0, 1024);
+    MainOutputEQ24State state;
+    state.enabled = false;
+    state.bands[17].freq = 1000.0f;
+    state.bands[17].q = 2.0f;
+    state.bands[17].gainDb = 7.0f;
+    processor.setMainOutputEQ24State(state);
+    const auto beforeSolo = processor.getMainOutputEQ24State();
+    processor.setMainOutputEQSoloBand(17);
+    TEST_ASSERT(processor.getMainOutputEQSoloMagnitudeDb(1000.0f) > -1.0f &&
+                    processor.getMainOutputEQSoloMagnitudeDb(200.0f) < -10.0f,
+                "Band Solo filter coefficients target the configured center range");
+
+    juce::AudioBuffer<float> buffer(2, 1024);
+    int samplePosition = 0;
+    auto measureRms = [&](float frequency)
+    {
+        double energy = 0.0;
+        int measuredSamples = 0;
+        for (int block = 0; block < 4; ++block)
+        {
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+            {
+                const float value = 0.1f * std::sin(
+                    juce::MathConstants<float>::twoPi * frequency *
+                    (float)samplePosition / 48000.0f);
+                buffer.setSample(0, sample, value);
+                buffer.setSample(1, sample, value);
+                ++samplePosition;
+            }
+            processor.process(buffer, buffer.getNumSamples());
+            if (block >= 2)
+                for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+                {
+                    const double value = buffer.getSample(0, sample);
+                    energy += value * value;
+                    ++measuredSamples;
+                }
+        }
+        return std::sqrt(energy / (double)measuredSamples);
+    };
+
+    const double centerRms = measureRms(1000.0f);
+    const double outsideRms = measureRms(200.0f);
+    TEST_ASSERT(centerRms > outsideRms * 4.0,
+                "Band Solo auditions a band-pass range around the selected band");
+    TEST_ASSERT(processor.getMainOutputEQSoloBand() == 17,
+                "Band Solo exposes the active selected band");
+    const auto afterSolo = processor.getMainOutputEQ24State();
+    TEST_ASSERT(afterSolo.enabled == beforeSolo.enabled &&
+                    std::abs(afterSolo.bands[17].freq - beforeSolo.bands[17].freq) < 0.001f &&
+                    std::abs(afterSolo.bands[17].gainDb - beforeSolo.bands[17].gainDb) < 0.001f,
+                "Band Solo does not change saved EQ parameters");
+
+    processor.setMainOutputEQSoloBand(-1);
+    TEST_ASSERT(processor.getMainOutputEQSoloBand() == -1,
+                "Band Solo can be disabled to restore the normal signal");
+}
+
+void testMainOutputDynamicEQDetectorAndRange()
+{
+    BusDSPProcessor staticProcessor;
+    BusDSPProcessor dynamicProcessor;
+    staticProcessor.prepare(48000.0, 512);
+    dynamicProcessor.prepare(48000.0, 512);
+
+    MainOutputEQ24State staticState;
+    staticState.enabled = true;
+    staticState.bands[17].freq = 1000.0f;
+    staticState.bands[17].q = 2.0f;
+    staticState.bands[17].enabled = true;
+    staticState.bands[17].dynamicEnabled = false;
+    MainOutputEQ24State dynamicState = staticState;
+    dynamicState.bands[17].dynamicEnabled = true;
+    dynamicState.bands[17].dynamicThresholdDb = -30.0f;
+    dynamicState.bands[17].dynamicAttackMs = 0.5f;
+    dynamicState.bands[17].dynamicReleaseMs = 10.0f;
+    dynamicState.bands[17].dynamicRangeDb = 12.0f;
+    dynamicState.bands[17].dynamicDetector = MainOutputEQDetector::Peak;
+    staticProcessor.setMainOutputEQ24State(staticState);
+    dynamicProcessor.setMainOutputEQ24State(dynamicState);
+
+    auto measureRms = [](BusDSPProcessor& processor, float amplitude,
+                         int numBlocks, int firstMeasuredBlock)
+    {
+        juce::AudioBuffer<float> buffer(2, 512);
+        double energy = 0.0;
+        int measuredSamples = 0;
+        int position = 0;
+        for (int block = 0; block < numBlocks; ++block)
+        {
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+            {
+                const float value = amplitude * std::sin(
+                    juce::MathConstants<float>::twoPi * 1000.0f *
+                    (float)position / 48000.0f);
+                buffer.setSample(0, sample, value);
+                buffer.setSample(1, sample, value);
+                ++position;
+            }
+
+            processor.process(buffer, buffer.getNumSamples());
+            if (block >= firstMeasuredBlock)
+                for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+                {
+                    const double value = buffer.getSample(0, sample);
+                    energy += value * value;
+                    ++measuredSamples;
+                }
+        }
+        return std::sqrt(energy / (double)measuredSamples);
+    };
+
+    const double staticRms = measureRms(staticProcessor, 0.5f, 20, 15);
+    const double compressedRms = measureRms(dynamicProcessor, 0.5f, 20, 15);
+    TEST_ASSERT(compressedRms < staticRms * 0.45,
+                "Dynamic EQ reduces a sustained over-threshold tonal band");
+
+    const double releasedRms = measureRms(dynamicProcessor, 0.001f, 60, 55);
+    TEST_ASSERT(releasedRms > 0.00055,
+                "Dynamic EQ release recovers gain when the detector falls below threshold");
+
+    dynamicState.bands[17].dynamicDetector = MainOutputEQDetector::RMS;
+    dynamicState.bands[17].dynamicThresholdDb =
+        std::numeric_limits<float>::quiet_NaN();
+    dynamicState.bands[17].dynamicAttackMs =
+        std::numeric_limits<float>::infinity();
+    dynamicState.bands[17].dynamicReleaseMs = -1.0f;
+    dynamicState.bands[17].dynamicRangeDb = 90.0f;
+    dynamicProcessor.setMainOutputEQ24State(dynamicState);
+    const auto sanitized = dynamicProcessor.getMainOutputEQ24State().bands[17];
+    TEST_ASSERT(sanitized.dynamicDetector == MainOutputEQDetector::RMS &&
+                    std::abs(sanitized.dynamicThresholdDb + 24.0f) < 0.001f &&
+                    std::abs(sanitized.dynamicAttackMs - 10.0f) < 0.001f &&
+                    std::abs(sanitized.dynamicReleaseMs - 5.0f) < 0.001f &&
+                    std::abs(sanitized.dynamicRangeDb - 18.0f) < 0.001f,
+                "Dynamic EQ validates detector and timing/range parameters");
+}
+
+void testEQFrequencyPeakCandidateAnalysis()
+{
+    std::array<float, 180> spectrum{};
+    spectrum.fill(-60.0f);
+    spectrum[48] = -24.0f;
+    spectrum[49] = -31.0f;
+    spectrum[112] = -30.0f;
+    spectrum[111] = -36.0f;
+
+    const auto analysis = findEQFrequencyPeakCandidates(
+        spectrum, 20.0f, 20000.0f);
+    TEST_ASSERT(analysis.count == 2,
+                "Two prominent spectral peaks are returned as candidates");
+    TEST_ASSERT(analysis.candidates[0].prominenceDb >
+                    analysis.candidates[1].prominenceDb &&
+                    analysis.candidates[0].frequencyHz <
+                        analysis.candidates[1].frequencyHz,
+                "Candidates are ranked by prominence without changing EQ state");
+    TEST_ASSERT(std::abs(analysis.candidates[0].frequencyHz -
+                         20.0f * std::pow(1000.0f, 48.0f / 179.0f)) < 0.1f,
+                "Candidate frequency follows the analyzer's logarithmic scale");
+
+    spectrum.fill(-60.0f);
+    const auto quietAnalysis = findEQFrequencyPeakCandidates(
+        spectrum, 20.0f, 20000.0f);
+    TEST_ASSERT(quietAnalysis.count == 0,
+                "Flat/noise-floor spectrum does not produce peak suggestions");
+}
+
+void testEQSpectrumPeakHoldDecayAndRise()
+{
+    std::array<float, 4> spectrum{ -20.0f, -40.0f, -10.0f, -90.0f };
+    std::array<float, 4> peakHold{ -30.0f, -25.0f, -15.0f, -60.0f };
+
+    updateEQSpectrumPeakHold(spectrum, peakHold, 18.0f, 0.5f);
+    TEST_ASSERT(std::abs(peakHold[0] + 20.0f) < 0.001f &&
+                    std::abs(peakHold[1] + 34.0f) < 0.001f &&
+                    std::abs(peakHold[2] + 10.0f) < 0.001f &&
+                    std::abs(peakHold[3] + 69.0f) < 0.001f,
+                "Peak hold rises immediately and decays at the configured dB rate");
+
+    spectrum[1] = std::numeric_limits<float>::quiet_NaN();
+    updateEQSpectrumPeakHold(spectrum, peakHold, 18.0f, 0.0f);
+    TEST_ASSERT(std::isfinite(peakHold[1]) &&
+                    std::abs(peakHold[1] + 34.0f) < 0.001f,
+                "Peak hold ignores invalid spectrum values safely");
+}
+
+void testEQSpectrumAveragingTimeResponse()
+{
+    std::array<float, 2> current{ -20.0f, -90.0f };
+    std::array<float, 2> fastAverage{ -90.0f, -20.0f };
+    std::array<float, 2> slowAverage = fastAverage;
+
+    updateEQSpectrumAverage(current, fastAverage, true, 0.05f, 0.05f);
+    updateEQSpectrumAverage(current, slowAverage, true, 0.05f, 1.0f);
+    TEST_ASSERT(fastAverage[0] > slowAverage[0] &&
+                    fastAverage[0] < current[0] &&
+                    slowAverage[0] > -90.0f,
+                "Short averaging time reacts faster while longer time smooths transients");
+
+    std::array<float, 2> initialized{};
+    updateEQSpectrumAverage(current, initialized, false, 0.01f, 0.25f);
+    TEST_ASSERT(initialized == current,
+                "First analyzer frame initializes directly without stale-state blending");
+
+    current[0] = std::numeric_limits<float>::quiet_NaN();
+    updateEQSpectrumAverage(current, initialized, true, 0.0f, 0.25f);
+    TEST_ASSERT(std::isfinite(initialized[0]),
+                "Spectrum averaging remains finite for invalid input bins");
+}
+
+void testEQAnalyzerFFTSizeSelection()
+{
+    TEST_ASSERT(getEQAnalyzerFFTSize(1) == 1024 &&
+                    getEQAnalyzerFFTSize(2) == 2048 &&
+                    getEQAnalyzerFFTSize(3) == 4096,
+                "Analyzer FFT selection maps controls to preallocated transform sizes");
+    TEST_ASSERT(getEQAnalyzerFFTSize(0) == 2048 &&
+                    getEQAnalyzerFFTSize(99) == 2048,
+                "Invalid FFT selection safely falls back to 2048 points");
+}
+
+void testCrossfadingEQFilterBankTransition()
+{
+    using Coefficients = juce::dsp::IIR::Coefficients<float>;
+    auto flatCoefficients = Coefficients::makePeakFilter(
+        48000.0, 1000.0f, 0.707f, 1.0f);
+    auto boostedCoefficients = Coefficients::makePeakFilter(
+        48000.0, 1000.0f, 0.707f, 4.0f);
+    std::array<juce::ReferenceCountedObjectPtr<Coefficients>, 1> initial{
+        flatCoefficients
+    };
+    CrossfadingEQFilterBank<1> bank;
+    bank.prepare(initial);
+
+    CrossfadingEQFilterBank<1>::CoefficientSet nextCoefficients{};
+    for (int coefficient = 0; coefficient < 5; ++coefficient)
+        nextCoefficients[0][(size_t)coefficient] =
+            boostedCoefficients->coefficients[coefficient];
+    constexpr int transitionSamples = 480;
+    TEST_ASSERT(bank.beginTransition(nextCoefficients, transitionSamples) &&
+                    bank.isTransitioning(),
+                "EQ filter bank starts a transition for changed coefficients");
+
+    juce::dsp::IIR::Filter<float> oldFilter;
+    juce::dsp::IIR::Filter<float> nextFilter;
+    oldFilter.coefficients = new Coefficients(*flatCoefficients);
+    nextFilter.coefficients = new Coefficients(*boostedCoefficients);
+    oldFilter.reset();
+    nextFilter.reset();
+    const std::array<bool, 1> enabled{ true };
+    bool outputsMatchCrossfade = true;
+    for (int sample = 0; sample < transitionSamples; ++sample)
+    {
+        const float input = 0.1f * std::sin(
+            juce::MathConstants<float>::twoPi * 1000.0f *
+            (float)sample / 48000.0f);
+        const float oldOutput = oldFilter.processSample(input);
+        const float nextOutput = nextFilter.processSample(input);
+        const float proportion =
+            (float)sample / (float)transitionSamples;
+        const float expected = oldOutput + (nextOutput - oldOutput) * proportion;
+        const float actual = bank.processSample(0, input, enabled);
+        outputsMatchCrossfade = outputsMatchCrossfade &&
+            std::abs(actual - expected) < 1.0e-5f;
+        bank.advanceSample();
+    }
+
+    TEST_ASSERT(outputsMatchCrossfade && !bank.isTransitioning(),
+                "EQ band output blends both filter banks over the requested samples");
+    const float input = 0.1f;
+    TEST_ASSERT(std::abs(bank.processSample(0, input, enabled) -
+                         nextFilter.processSample(input)) < 1.0e-5f,
+                "Completed EQ transition retains the new filter bank");
+}
+
+void testEightBandEQPresetChangeCrossfade()
+{
+    LiveBus::EightBandEQProcessor eq;
+    eq.params.setToFlat();
+    eq.prepare(48000.0, 512);
+
+    constexpr float sampleRate = 48000.0f;
+    constexpr float frequency = 1000.0f;
+    constexpr float amplitude = 0.1f;
+    int samplePosition = 0;
+    auto makeToneBlock = [&samplePosition, sampleRate, frequency, amplitude](
+                             juce::AudioBuffer<float>& buffer)
+    {
+        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        {
+            const float value = amplitude * std::sin(
+                juce::MathConstants<float>::twoPi * frequency *
+                (float)samplePosition / sampleRate);
+            for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+                buffer.setSample(channel, sample, value);
+            ++samplePosition;
+        }
+    };
+
+    juce::AudioBuffer<float> warmup(2, 1024);
+    makeToneBlock(warmup);
+    eq.process(warmup, warmup.getNumSamples());
+
+    eq.params.bands[3].gainDb.store(12.0f, std::memory_order_relaxed);
+    eq.params.bands[3].q.store(1.0f, std::memory_order_relaxed);
+    eq.updateCoefficients();
+
+    juce::AudioBuffer<float> transition(2, 512);
+    makeToneBlock(transition);
+    eq.process(transition, transition.getNumSamples());
+
+    float maximumAdjacentDelta = std::abs(
+        transition.getSample(0, 0) -
+        warmup.getSample(0, warmup.getNumSamples() - 1));
+    for (int sample = 1; sample < transition.getNumSamples(); ++sample)
+        maximumAdjacentDelta = juce::jmax(
+            maximumAdjacentDelta,
+            std::abs(transition.getSample(0, sample) -
+                     transition.getSample(0, sample - 1)));
+
+    TEST_ASSERT(maximumAdjacentDelta < 0.1f,
+                "Applying a large 8-band EQ change keeps adjacent-sample jumps bounded");
+    TEST_ASSERT(eq.getMagnitudeForFrequency(frequency) > 8.0f,
+                "The new EQ coefficients are active after the 10 ms transition");
+}
+
+void testEQPresetCatalogAndTargetMappings()
+{
+    const auto& catalog = LiveBus::EQPresetCatalog::getFactoryPresets();
+    TEST_ASSERT(catalog.size() == 89,
+                "EQ factory catalog contains the requested 89 named presets");
+    LiveBus::PresetManager presetManager;
+    const auto browserPresets =
+        presetManager.getPresetsForCategory(LiveBus::PresetCategory::EQCatalog);
+    TEST_ASSERT(browserPresets.size() == catalog.size() &&
+                    browserPresets.front().factoryId.isNotEmpty(),
+                "Preset Manager exposes the complete read-only EQ catalog");
+
+    std::vector<juce::String> ids;
+    ids.reserve(catalog.size());
+    bool everyPresetIsValid = true;
+    juce::String validationError;
+    for (const auto& preset : catalog)
+    {
+        everyPresetIsValid =
+            everyPresetIsValid &&
+            LiveBus::EQPresetCatalog::validate(preset, validationError);
+        ids.push_back(preset.id);
+    }
+    std::sort(ids.begin(), ids.end());
+    const bool uniqueIds = std::adjacent_find(ids.begin(), ids.end()) == ids.end();
+    TEST_ASSERT(everyPresetIsValid && uniqueIds,
+                "Factory preset IDs are unique and all band parameters validate");
+
+    const auto* vocalPresence =
+        LiveBus::EQPresetCatalog::findFactoryPreset("vocal.vocal-presence");
+    const auto* flat = LiveBus::EQPresetCatalog::findFactoryPreset("music.flat");
+    const auto* monitorWarm =
+        LiveBus::EQPresetCatalog::findFactoryPreset("monitoring.monitor-warm");
+    const auto* monitorBright =
+        LiveBus::EQPresetCatalog::findFactoryPreset("monitoring.monitor-bright");
+    TEST_ASSERT(vocalPresence != nullptr && flat != nullptr &&
+                    monitorWarm != nullptr && monitorBright != nullptr,
+                "Named Vocal Presence, Flat, Monitor Warm, and Monitor Bright presets exist");
+
+    bool hasPreviousFactoryMonitorCurve = false;
+    for (const auto& preset : catalog)
+        if (preset.category == LiveBus::EQPresetCategory::Monitoring &&
+            preset.name == "Monitor Vocal Presence")
+            hasPreviousFactoryMonitorCurve = true;
+    TEST_ASSERT(hasPreviousFactoryMonitorCurve,
+                "The Monitor Vocal Presence factory curve remains available");
+
+    TEST_ASSERT(std::abs(LiveBus::EQPresetCatalog::getMagnitudeDb(
+                             *flat, 1000.0f)) < 0.001,
+                "Flat preset produces a neutral parametric response");
+
+    SceneData::EightBandEQSceneData eightBand;
+    PuzuEQState puzu;
+    MonitorGraphicEQ31State monitor;
+    MainOutputEQ24State mainOutput;
+    mainOutput.bands[10].dynamicEnabled = true;
+    mainOutput.bands[10].dynamicThresholdDb = -37.0f;
+    bool mapped = LiveBus::EQPresetCatalog::mapToEightBand(
+                      *vocalPresence, eightBand, validationError) &&
+                  LiveBus::EQPresetCatalog::mapToPuzu15Band(
+                      *vocalPresence, puzu, validationError) &&
+                  LiveBus::EQPresetCatalog::mapToMonitor31Band(
+                      *vocalPresence, monitor, validationError) &&
+                  LiveBus::EQPresetCatalog::mapToMainOutput24Band(
+                      *vocalPresence, mainOutput, validationError);
+    bool mappedValuesValid = mapped && eightBand.masterEnabled &&
+                             puzu.enabled && monitor.enabled &&
+                             mainOutput.enabled &&
+                             mainOutput.bands[10].dynamicEnabled &&
+                             std::abs(mainOutput.bands[10].dynamicThresholdDb +
+                                      37.0f) < 0.001f;
+    for (const auto& band : eightBand.bands)
+        mappedValuesValid = mappedValuesValid && std::isfinite(band.freq) &&
+            band.freq >= 20.0f && band.freq <= 20000.0f &&
+            std::isfinite(band.gainDb) && band.gainDb >= -18.0f &&
+            band.gainDb <= 18.0f && std::isfinite(band.q) &&
+            band.q >= 0.1f && band.q <= 10.0f;
+    for (const auto& band : puzu.bands)
+        mappedValuesValid = mappedValuesValid && std::isfinite(band.freq) &&
+            band.freq >= 20.0f && band.freq <= 20000.0f &&
+            std::isfinite(band.gainDb) && band.gainDb >= -18.0f &&
+            band.gainDb <= 18.0f && std::isfinite(band.q) &&
+            band.q >= 0.1f && band.q <= 10.0f;
+    for (const float gain : monitor.gainDb)
+        mappedValuesValid = mappedValuesValid && std::isfinite(gain) &&
+                            gain >= -12.0f && gain <= 12.0f;
+    for (const auto& band : mainOutput.bands)
+        mappedValuesValid = mappedValuesValid && std::isfinite(band.freq) &&
+            band.freq >= 20.0f && band.freq <= 20000.0f &&
+            std::isfinite(band.gainDb) && band.gainDb >= -18.0f &&
+            band.gainDb <= 18.0f && std::isfinite(band.q) &&
+            band.q >= 0.1f && band.q <= 10.0f;
+    TEST_ASSERT(mappedValuesValid,
+                "All four EQ module mappings stay within their DSP parameter ranges");
+
+    auto monitorPuzuTarget = std::make_unique<BusDSPProcessor>();
+    monitorPuzuTarget->prepare(48000.0, 256);
+    monitorPuzuTarget->setPuzuEQState(puzu);
+    const auto monitorPuzuRestored = monitorPuzuTarget->getPuzuEQState();
+    TEST_ASSERT(monitorPuzuRestored.enabled &&
+                    monitorPuzuRestored.bands[0].type ==
+                        puzu.bands[0].type &&
+                    std::abs(monitorPuzuRestored.bands[0].freq -
+                             puzu.bands[0].freq) < 0.01f,
+                "The Monitor target's Puzu processor receives mapped catalog state");
+    TEST_ASSERT(!monitorPuzuTarget->getMonitorGraphicEQState().enabled &&
+                    !monitorPuzuTarget->getMainOutputEQ24State().enabled,
+                "Applying a Puzu preset leaves other EQ modules on that processor untouched");
+
+    auto monitorGraphicTarget = std::make_unique<BusDSPProcessor>();
+    monitorGraphicTarget->prepare(48000.0, 256);
+    monitorGraphicTarget->setMonitorGraphicEQState(monitor);
+    TEST_ASSERT(monitorGraphicTarget->getMonitorGraphicEQState().enabled &&
+                    !monitorGraphicTarget->getMainOutputEQ24State().enabled,
+                "Monitor Graphic EQ mapping remains scoped to its own bus module");
+
+    auto streamProcessor = std::make_unique<BusDSPProcessor>();
+    streamProcessor->prepare(48000.0, 256);
+    streamProcessor->setMainOutputEQ24State(mainOutput);
+    TEST_ASSERT(streamProcessor->getMainOutputEQ24State().enabled &&
+                    !streamProcessor->getMonitorGraphicEQState().enabled,
+                "Main EQ mapping remains scoped to the Stream bus module");
+    TEST_ASSERT(std::isfinite(
+                    streamProcessor->getMainOutputEQ24MagnitudeDb(2800.0f)) &&
+                    streamProcessor->getMainOutputEQ24MagnitudeDb(2800.0f) > 0.0f,
+                "Mapped Main EQ preset yields a real DSP response");
+
+    auto invalidPreset = *vocalPresence;
+    invalidPreset.bands[3].q = std::numeric_limits<float>::quiet_NaN();
+    SceneData::EightBandEQSceneData rejectedDestination;
+    TEST_ASSERT(!LiveBus::EQPresetCatalog::mapToEightBand(
+                    invalidPreset, rejectedDestination, validationError) &&
+                    validationError.isNotEmpty(),
+                "Invalid preset parameters are rejected before mapping");
+
+    invalidPreset = *vocalPresence;
+    invalidPreset.category = static_cast<LiveBus::EQPresetCategory>(-1);
+    TEST_ASSERT(!LiveBus::EQPresetCatalog::validate(
+                    invalidPreset, validationError) &&
+                    validationError.isNotEmpty(),
+                "Invalid preset categories are rejected");
+
+    invalidPreset = *vocalPresence;
+    invalidPreset.bands[2].type =
+        static_cast<LiveBus::EQPresetFilterType>(-1);
+    TEST_ASSERT(!LiveBus::EQPresetCatalog::validate(
+                    invalidPreset, validationError) &&
+                    validationError.isNotEmpty(),
+                "Invalid filter types are rejected before DSP response evaluation");
+}
+
+void testEQCatalogPresetPersistenceAndFavorites()
+{
+    LiveBus::PresetManager manager;
+    const auto* factory =
+        LiveBus::EQPresetCatalog::findFactoryPreset("vocal.vocal-presence");
+    TEST_ASSERT(factory != nullptr, "Found a factory EQ preset for duplication");
+    if (factory == nullptr)
+        return;
+
+    const auto uniqueSuffix =
+        juce::String(juce::Random::getSystemRandom().nextInt())
+            .replace("-", "N");
+    const auto name = "EQCatalogRoundTrip_" + uniqueSuffix;
+    const auto duplicateName = name + "_Copy";
+    const auto renamedName = name + "_Renamed";
+    auto directory =
+        manager.getCategoryDirectory(LiveBus::PresetCategory::EQCatalog);
+    auto exportFile = juce::File::getSpecialLocation(
+        juce::File::tempDirectory).getChildFile(name + ".xml");
+
+    LiveBus::EQPresetDefinition custom = *factory;
+    custom.bands[3].gainDb = 3.25f;
+    juce::String error;
+    bool saved = manager.saveEQCatalogPreset(
+        name, custom, "Persistence test curve", false, false, error);
+    TEST_ASSERT(saved, "Saved a validated custom EQ preset");
+    if (!saved)
+        return;
+
+    auto findUser = [&manager](const juce::String& presetName)
+    {
+        const auto presets = manager.getPresetsForCategory(
+            LiveBus::PresetCategory::EQCatalog);
+        for (const auto& item : presets)
+            if (!item.isFactory && item.name == presetName)
+                return item;
+        return LiveBus::PresetItem{};
+    };
+
+    auto userItem = findUser(name);
+    LiveBus::EQPresetDefinition restored;
+    TEST_ASSERT(manager.loadEQCatalogPreset(userItem, restored, error) &&
+                    std::abs(restored.bands[3].gainDb - 3.25f) < 0.001f,
+                "Loaded XML restores the real EQ band values");
+    TEST_ASSERT(!manager.saveEQCatalogPreset(
+                    name, custom, "duplicate", false, false, error),
+                "Saving without overwrite does not replace an existing preset");
+
+    TEST_ASSERT(manager.setEQCatalogPresetFavorite(userItem, true, error),
+                "Marked a user EQ preset as favorite");
+    userItem = findUser(name);
+    TEST_ASSERT(userItem.isFavorite,
+                "Favorite state is restored from the EQ preset XML");
+
+    custom.bands[3].gainDb = -2.0f;
+    TEST_ASSERT(manager.saveEQCatalogPreset(
+                    name, custom, "Updated user curve", true, true, error),
+                "Save overwrites only the selected named user preset");
+    userItem = findUser(name);
+    TEST_ASSERT(manager.loadEQCatalogPreset(userItem, restored, error) &&
+                    std::abs(restored.bands[3].gainDb + 2.0f) < 0.001f &&
+                    userItem.isFavorite,
+                "Overwrite persists updated parameters and favorite metadata");
+
+    TEST_ASSERT(manager.duplicateUserPreset(userItem, duplicateName),
+                "Duplicated user EQ preset");
+    TEST_ASSERT(manager.renameUserPreset(userItem, renamedName),
+                "Renamed user EQ preset with updated XML metadata");
+    auto renamedItem = findUser(renamedName);
+    TEST_ASSERT(renamedItem.name == renamedName &&
+                    renamedItem.isFavorite &&
+                    manager.loadEQCatalogPreset(renamedItem, restored, error),
+                "Renamed preset remains valid and keeps favorite state");
+
+    TEST_ASSERT(manager.exportPresetToFile(renamedItem, exportFile),
+                "Exported EQ preset as versioned XML");
+    TEST_ASSERT(manager.deleteUserPreset(renamedItem),
+                "Deleted renamed user preset");
+    juce::String importedName;
+    TEST_ASSERT(manager.importPresetFromFile(
+                    LiveBus::PresetCategory::EQCatalog, exportFile,
+                    importedName, error) &&
+                    importedName == renamedName,
+                "Imported EQ XML through validation and safe storage");
+    auto importedItem = findUser(importedName);
+    TEST_ASSERT(manager.loadEQCatalogPreset(importedItem, restored, error) &&
+                    std::abs(restored.bands[3].gainDb + 2.0f) < 0.001f,
+                "Imported preset retains validated DSP values");
+
+    auto invalidFile = exportFile.getSiblingFile(name + "_invalid.xml");
+    TEST_ASSERT(invalidFile.replaceWithText(
+                    "<LIVEBUS_EQ_PRESET formatVersion=\"99\"/>") &&
+                    !manager.importPresetFromFile(
+                        LiveBus::PresetCategory::EQCatalog, invalidFile,
+                        importedName, error) &&
+                    error.isNotEmpty(),
+                "Import rejects unsupported or malformed EQ XML versions");
+
+    auto factoryItem = LiveBus::PresetItem{
+        factory->name, LiveBus::PresetCategory::EQCatalog, true,
+        factory->description, {}, factory->id, false
+    };
+    TEST_ASSERT(manager.setEQCatalogPresetFavorite(
+                    factoryItem, true, error),
+                "Factory preset favorite is persisted separately");
+    const auto factoryList = manager.getPresetsForCategory(
+        LiveBus::PresetCategory::EQCatalog);
+    bool factoryFavoriteRestored = false;
+    for (const auto& item : factoryList)
+        if (item.factoryId == factory->id)
+            factoryFavoriteRestored = item.isFavorite;
+    TEST_ASSERT(factoryFavoriteRestored,
+                "Factory favorite survives catalog refresh");
+    factoryItem.isFavorite = true;
+    manager.setEQCatalogPresetFavorite(factoryItem, false, error);
+
+    manager.deleteUserPreset(findUser(duplicateName));
+    manager.deleteUserPreset(importedItem);
+    exportFile.deleteFile();
+    invalidFile.deleteFile();
+    directory.getChildFile(name + ".xml").deleteFile();
+    directory.getChildFile(duplicateName + ".xml").deleteFile();
+}
+
+void testMainOutputEQStereoAnalyzerPreservesChannels()
+{
+    BusDSPProcessor processor;
+    processor.prepare(48000.0, 512);
+    processor.setMainOutputEQAnalyzerEnabled(true);
+
+    constexpr int blockSize = 512;
+    constexpr int totalSamples = blockSize * 2;
+    constexpr float leftFrequency = 700.0f;
+    constexpr float rightFrequency = 4500.0f;
+    constexpr float sampleRate = 48000.0f;
+    std::array<float, totalSamples> expectedLeft{};
+    std::array<float, totalSamples> expectedRight{};
+    int position = 0;
+    for (int blockIndex = 0; blockIndex < 2; ++blockIndex)
+    {
+        juce::AudioBuffer<float> buffer(2, blockSize);
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const float left = 0.2f * std::sin(
+                juce::MathConstants<float>::twoPi * leftFrequency *
+                (float)position / sampleRate);
+            const float right = 0.4f * std::sin(
+                juce::MathConstants<float>::twoPi * rightFrequency *
+                (float)position / sampleRate);
+            expectedLeft[(size_t)position] = left;
+            expectedRight[(size_t)position] = right;
+            buffer.setSample(0, sample, left);
+            buffer.setSample(1, sample, right);
+            ++position;
+        }
+        processor.process(buffer, blockSize);
+    }
+
+    std::array<float, totalSamples> preLeft{}, preRight{}, postLeft{}, postRight{};
+    const bool preReceived = processor.pullMainOutputEQPreAnalyzerStereo(
+        preLeft.data(), preRight.data(), totalSamples);
+    const bool postReceived = processor.pullMainOutputEQPostAnalyzerStereo(
+        postLeft.data(), postRight.data(), totalSamples);
+    TEST_ASSERT(preReceived && postReceived,
+                "Stereo analyzer returns synchronized pre/post channel blocks");
+
+    double leftError = 0.0;
+    double rightError = 0.0;
+    double channelDifference = 0.0;
+    for (int sample = 0; sample < totalSamples; ++sample)
+    {
+        leftError += std::abs(preLeft[(size_t)sample] -
+                              expectedLeft[(size_t)sample]);
+        rightError += std::abs(preRight[(size_t)sample] -
+                               expectedRight[(size_t)sample]);
+        channelDifference += std::abs(preLeft[(size_t)sample] -
+                                      preRight[(size_t)sample]);
+    }
+    TEST_ASSERT(leftError / totalSamples < 0.0001 &&
+                    rightError / totalSamples < 0.0001,
+                "Analyzer FIFO retains actual left/right samples rather than a mono sum");
+    TEST_ASSERT(channelDifference / totalSamples > 0.1,
+                "Distinct stereo input remains distinguishable to the analyzer");
+
+    std::array<float, totalSamples> legacyMono{};
+    processor.prepare(48000.0, 512);
+    processor.setMainOutputEQAnalyzerEnabled(true);
+    for (int blockIndex = 0; blockIndex < 2; ++blockIndex)
+    {
+        juce::AudioBuffer<float> buffer(2, blockSize);
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const int samplePosition = blockIndex * blockSize + sample;
+            buffer.setSample(0, sample, expectedLeft[(size_t)samplePosition]);
+            buffer.setSample(1, sample, expectedRight[(size_t)samplePosition]);
+        }
+        processor.process(buffer, blockSize);
+    }
+    TEST_ASSERT(processor.pullMainOutputEQPreAnalyzer(
+                    legacyMono.data(), totalSamples),
+                "Existing mono analyzer API remains compatible");
+    for (int sample = 0; sample < totalSamples; ++sample)
+        TEST_ASSERT(std::abs(legacyMono[(size_t)sample] -
+                    0.5f * (expectedLeft[(size_t)sample] +
+                            expectedRight[(size_t)sample])) < 0.0001f,
+                    "Legacy mono analyzer API averages stereo channels");
+}
+
+void testPuzuBypassTransitionSmoothing()
+{
+    BusDSPProcessor dsp;
+    dsp.prepare(48000.0, 1024);
+    dsp.params.puzuBands[8].freq.store(1000.0f);
+    dsp.params.puzuBands[8].q.store(2.0f);
+    dsp.params.puzuBands[8].gainDb.store(12.0f);
+    dsp.params.puzuEnabled.store(true);
+    dsp.updateCoefficients();
+
+    int sampleIndex = 0;
+    float previousOutput = 0.0f;
+    for (int blockIndex = 0; blockIndex < 4; ++blockIndex)
+    {
+        juce::AudioBuffer<float> block(1, 1024);
+        for (int sample = 0; sample < block.getNumSamples(); ++sample)
+        {
+            const float phase = juce::MathConstants<float>::twoPi * 1000.0f *
+                                (float)sampleIndex / 48000.0f;
+            block.setSample(0, sample, 0.25f * std::sin(phase));
+            ++sampleIndex;
+        }
+        dsp.process(block, block.getNumSamples());
+        previousOutput = block.getSample(0, block.getNumSamples() - 1);
+    }
+
+    dsp.params.puzuEnabled.store(false);
+    juce::AudioBuffer<float> bypassBlock(1, 128);
+    for (int sample = 0; sample < bypassBlock.getNumSamples(); ++sample)
+    {
+        const float phase = juce::MathConstants<float>::twoPi * 1000.0f *
+                            (float)sampleIndex / 48000.0f;
+        bypassBlock.setSample(0, sample, 0.25f * std::sin(phase));
+        ++sampleIndex;
+    }
+    dsp.process(bypassBlock, bypassBlock.getNumSamples());
+
+    TEST_ASSERT(std::abs(bypassBlock.getSample(0, 0) - previousOutput) < 0.08f,
+                "15-band bypass fades over time instead of abruptly switching the output");
+}
+
+void testPuzuProcessesAfterVocalRack()
+{
+    BusDSPProcessor withPuzu;
+    BusDSPProcessor withoutPuzu;
+    withPuzu.prepare(48000.0, 1024);
+    withoutPuzu.prepare(48000.0, 1024);
+    withPuzu.vocalRack.params.masterEnabled.store(true);
+    withoutPuzu.vocalRack.params.masterEnabled.store(true);
+    withPuzu.params.puzuBands[8].freq.store(1000.0f);
+    withPuzu.params.puzuBands[8].q.store(2.0f);
+    withPuzu.params.puzuBands[8].gainDb.store(12.0f);
+    withPuzu.params.puzuEnabled.store(true);
+    withPuzu.updateCoefficients();
+
+    juce::AudioBuffer<float> wet(1, 1024);
+    juce::AudioBuffer<float> dry(1, 1024);
+    for (int sample = 0; sample < wet.getNumSamples(); ++sample)
+    {
+        const float value = 0.25f * std::sin(
+            juce::MathConstants<float>::twoPi * 1000.0f * (float)sample / 48000.0f);
+        wet.setSample(0, sample, value);
+        dry.setSample(0, sample, value);
+    }
+    withPuzu.process(wet, wet.getNumSamples());
+    withoutPuzu.process(dry, dry.getNumSamples());
+
+    double differenceEnergy = 0.0;
+    for (int sample = 0; sample < wet.getNumSamples(); ++sample)
+    {
+        const double difference = wet.getSample(0, sample) - dry.getSample(0, sample);
+        differenceEnergy += difference * difference;
+    }
+    const double differenceRms = std::sqrt(differenceEnergy / wet.getNumSamples());
+    TEST_ASSERT(differenceRms > 0.01,
+                "15-band EQ remains connected when the vocal DSP rack is enabled");
+}
+
+void testPuzuCoefficientPublicationDuringAudioProcessing()
+{
+    BusDSPProcessor dsp;
+    dsp.prepare(48000.0, 128);
+    dsp.params.puzuEnabled.store(true);
+    dsp.params.puzuBands[8].gainDb.store(6.0f);
+    dsp.updatePuzuCoefficients();
+
+    std::thread parameterWriter([&]
+    {
+        for (int update = 0; update < 100; ++update)
+        {
+            dsp.params.puzuBands[8].freq.store(500.0f + (float)(update * 10));
+            dsp.params.puzuBands[8].gainDb.store((update % 2 == 0) ? 9.0f : -6.0f);
+            dsp.updatePuzuCoefficients();
+        }
+    });
+
+    bool outputFinite = true;
+    for (int blockIndex = 0; blockIndex < 100; ++blockIndex)
+    {
+        juce::AudioBuffer<float> block(1, 128);
+        for (int sample = 0; sample < block.getNumSamples(); ++sample)
+            block.setSample(0, sample, 0.2f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)(blockIndex * block.getNumSamples() + sample) / 48000.0f));
+        dsp.process(block, block.getNumSamples());
+        for (int sample = 0; sample < block.getNumSamples(); ++sample)
+            outputFinite = outputFinite && std::isfinite(block.getSample(0, sample));
+    }
+
+    parameterWriter.join();
+    TEST_ASSERT(outputFinite,
+                "Concurrent 15-band coefficient publication keeps audio output finite");
+}
+
+void testPuzuPrePostAnalyzerCapturesProcessedAudio()
+{
+    BusDSPProcessor dsp;
+    dsp.prepare(48000.0, 2048);
+    dsp.setPuzuAnalyzerEnabled(true);
+    dsp.params.puzuEnabled.store(false);
+
+    auto processSineBlock = [&](int blockNumber)
+    {
+        juce::AudioBuffer<float> block(1, 2048);
+        for (int sample = 0; sample < block.getNumSamples(); ++sample)
+        {
+            const int absoluteSample = blockNumber * block.getNumSamples() + sample;
+            block.setSample(0, sample, 0.1f * std::sin(
+                juce::MathConstants<float>::twoPi * 1000.0f *
+                (float)absoluteSample / 48000.0f));
+        }
+        dsp.process(block, block.getNumSamples());
+    };
+
+    processSineBlock(0);
+    std::array<float, 2048> pre{};
+    std::array<float, 2048> post{};
+    TEST_ASSERT(dsp.pullPuzuPreAnalyzer(pre.data(), (int)pre.size()),
+                "Pre-EQ analyzer receives captured input audio");
+    TEST_ASSERT(dsp.pullPuzuPostAnalyzer(post.data(), (int)post.size()),
+                "Post-EQ analyzer receives captured output audio");
+    double preEnergy = 0.0;
+    double postEnergy = 0.0;
+    for (size_t sample = 0; sample < pre.size(); ++sample)
+    {
+        preEnergy += (double)pre[sample] * pre[sample];
+        postEnergy += (double)post[sample] * post[sample];
+    }
+    TEST_ASSERT(std::abs(std::sqrt(preEnergy / pre.size()) -
+                         std::sqrt(postEnergy / post.size())) < 1e-5,
+                "Pre and post analyzer points match when the 15-band EQ is bypassed");
+
+    dsp.params.puzuBands[8].freq.store(1000.0f);
+    dsp.params.puzuBands[8].q.store(2.0f);
+    dsp.params.puzuBands[8].gainDb.store(12.0f);
+    dsp.updatePuzuCoefficients();
+    dsp.params.puzuEnabled.store(true);
+    processSineBlock(1);
+    processSineBlock(2);
+    TEST_ASSERT(dsp.pullPuzuPreAnalyzer(pre.data(), (int)pre.size()) &&
+                    dsp.pullPuzuPostAnalyzer(post.data(), (int)post.size()),
+                "Analyzer supplies aligned pre/post frames after EQ is enabled");
+    preEnergy = 0.0;
+    postEnergy = 0.0;
+    for (size_t sample = 0; sample < pre.size(); ++sample)
+    {
+        preEnergy += (double)pre[sample] * pre[sample];
+        postEnergy += (double)post[sample] * post[sample];
+    }
+    TEST_ASSERT(std::sqrt(postEnergy) > std::sqrt(preEnergy) * 2.0,
+                "Post-EQ analyzer reflects the actual EQ gain increase");
+}
+
+void testPuzuStereoAnalyzerPreservesChannelsAndMonoCompatibility()
+{
+    BusDSPProcessor dsp;
+    dsp.prepare(48000.0, 512);
+    dsp.setPuzuAnalyzerEnabled(true);
+    dsp.params.puzuEnabled.store(false);
+
+    constexpr int blockSize = 512;
+    constexpr int totalSamples = blockSize * 2;
+    constexpr float sampleRate = 48000.0f;
+    std::array<float, totalSamples> expectedLeft{};
+    std::array<float, totalSamples> expectedRight{};
+    for (int blockIndex = 0; blockIndex < 2; ++blockIndex)
+    {
+        juce::AudioBuffer<float> block(2, blockSize);
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const int position = blockIndex * blockSize + sample;
+            const float left = 0.2f * std::sin(
+                juce::MathConstants<float>::twoPi * 500.0f *
+                (float)position / sampleRate);
+            const float right = 0.4f * std::sin(
+                juce::MathConstants<float>::twoPi * 5000.0f *
+                (float)position / sampleRate);
+            expectedLeft[(size_t)position] = left;
+            expectedRight[(size_t)position] = right;
+            block.setSample(0, sample, left);
+            block.setSample(1, sample, right);
+        }
+        dsp.process(block, blockSize);
+    }
+
+    std::array<float, totalSamples> preLeft{}, preRight{}, postLeft{}, postRight{};
+    TEST_ASSERT(dsp.pullPuzuPreAnalyzerStereo(
+                    preLeft.data(), preRight.data(), totalSamples) &&
+                    dsp.pullPuzuPostAnalyzerStereo(
+                        postLeft.data(), postRight.data(), totalSamples),
+                "15-band analyzer exposes aligned stereo pre/post samples");
+    double leftError = 0.0;
+    double rightError = 0.0;
+    double channelDifference = 0.0;
+    for (int sample = 0; sample < totalSamples; ++sample)
+    {
+        leftError += std::abs(preLeft[(size_t)sample] -
+                              expectedLeft[(size_t)sample]);
+        rightError += std::abs(preRight[(size_t)sample] -
+                               expectedRight[(size_t)sample]);
+        channelDifference += std::abs(preLeft[(size_t)sample] -
+                                      preRight[(size_t)sample]);
+    }
+    TEST_ASSERT(leftError / totalSamples < 0.0001 &&
+                    rightError / totalSamples < 0.0001 &&
+                    channelDifference / totalSamples > 0.1,
+                "15-band analyzer preserves different left and right signals");
+
+    for (int blockIndex = 0; blockIndex < 2; ++blockIndex)
+    {
+        juce::AudioBuffer<float> block(2, blockSize);
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const int position = blockIndex * blockSize + sample;
+            block.setSample(0, sample, expectedLeft[(size_t)position]);
+            block.setSample(1, sample, expectedRight[(size_t)position]);
+        }
+        dsp.process(block, blockSize);
+    }
+    std::array<float, totalSamples> legacyMono{};
+    TEST_ASSERT(dsp.pullPuzuPreAnalyzer(
+                    legacyMono.data(), totalSamples),
+                "Existing 15-band mono analyzer API remains compatible");
+    for (int sample = 0; sample < totalSamples; ++sample)
+        TEST_ASSERT(std::abs(legacyMono[(size_t)sample] -
+                    0.5f * (expectedLeft[(size_t)sample] +
+                            expectedRight[(size_t)sample])) < 0.0001f,
+                    "Legacy 15-band mono analyzer returns the L/R average");
 }
 
 void testMidiInputBufferThreadSafety()
@@ -1326,18 +2760,37 @@ void testEightBandEQBypassAndBitTransparency()
         testBuf.setSample(1, i, val);
     }
 
-    juce::AudioBuffer<float> originalCopy;
-    originalCopy.makeCopyOf(testBuf);
-
     eq.process(testBuf, 256);
 
     // Verify 100% bit-transparent passthrough
     float maxDiff = 0.0f;
+    juce::AudioBuffer<float> bypassedBlock(2, 256);
+    juce::AudioBuffer<float> bypassedOriginal(2, 256);
+    for (int i = 0; i < 256; ++i)
+    {
+        const float value = std::sin((float)i * 0.1f) * 0.5f;
+        bypassedBlock.setSample(0, i, value);
+        bypassedBlock.setSample(1, i, value);
+    }
+    eq.process(bypassedBlock, 256);
+    bypassedOriginal.makeCopyOf(bypassedBlock);
+    eq.process(bypassedBlock, 256);
+    bypassedBlock.clear();
+    for (int i = 0; i < 256; ++i)
+    {
+        const float value = std::sin((float)i * 0.1f) * 0.5f;
+        bypassedBlock.setSample(0, i, value);
+        bypassedBlock.setSample(1, i, value);
+    }
+    bypassedOriginal.makeCopyOf(bypassedBlock);
+    eq.process(bypassedBlock, 256);
     for (int ch = 0; ch < 2; ++ch)
     {
         for (int i = 0; i < 256; ++i)
         {
-            float diff = std::abs(testBuf.getSample(ch, i) - originalCopy.getSample(ch, i));
+            float diff = std::abs(
+                bypassedBlock.getSample(ch, i) -
+                bypassedOriginal.getSample(ch, i));
             if (diff > maxDiff) maxDiff = diff;
         }
     }
@@ -1466,6 +2919,17 @@ void testEightBandEQSceneSerializationRoundTripAndLegacy()
     original.eightBandEQs[2].bands[0].freq = 95.0f;
     original.eightBandEQs[2].bands[0].q = 0.85f;
 
+    original.puzuEQs[17].masterEnabled = true; // Input channel 16
+    original.puzuEQs[17].bands[14].freq = 15750.0f;
+    original.puzuEQs[17].bands[14].gainDb = -8.25f;
+    original.puzuEQs[17].bands[14].q = 2.4f;
+    original.puzuEQs[17].bands[14].type = (int)PuzuFilterType::Notch;
+    original.puzuEQs[17].bands[14].enabled = false;
+    original.puzuEQs[16].bands[0].freq = 30000.0f;
+    original.puzuEQs[16].bands[0].gainDb = 25.0f;
+    original.puzuEQs[16].bands[0].q = 25.0f;
+    original.puzuEQs[16].bands[0].type = 99;
+
     bool saved = manager.saveScene("_eq_roundtrip_test", original);
     TEST_ASSERT(saved == true, "Scene with 8-Band EQ saved successfully");
 
@@ -1486,6 +2950,26 @@ void testEightBandEQSceneSerializationRoundTripAndLegacy()
     TEST_ASSERT(loaded.eightBandEQs[2].bands[0].type == (int)LiveBus::EQFilterType::HighPass, "Restored Mic HPF type matches");
     TEST_ASSERT(std::abs(loaded.eightBandEQs[2].bands[0].freq - 95.0f) < 0.01f, "Restored Mic HPF freq matches");
 
+    TEST_ASSERT(loaded.puzuEQs[17].masterEnabled, "Restored channel 16 15-band EQ enable matches");
+    TEST_ASSERT(std::abs(loaded.puzuEQs[17].bands[14].freq - 15750.0f) < 0.01f,
+                "Restored channel 16 15-band frequency matches");
+    TEST_ASSERT(std::abs(loaded.puzuEQs[17].bands[14].gainDb - (-8.25f)) < 0.01f,
+                "Restored channel 16 15-band gain matches");
+    TEST_ASSERT(std::abs(loaded.puzuEQs[17].bands[14].q - 2.4f) < 0.01f,
+                "Restored channel 16 15-band Q matches");
+    TEST_ASSERT(loaded.puzuEQs[17].bands[14].type == (int)PuzuFilterType::Notch,
+                "Restored channel 16 15-band filter type matches");
+    TEST_ASSERT(!loaded.puzuEQs[17].bands[14].enabled,
+                "Restored channel 16 15-band band bypass matches");
+    TEST_ASSERT(std::abs(loaded.puzuEQs[16].bands[0].freq - 20000.0f) < 0.01f,
+                "15-band scene frequency is clamped to its valid range");
+    TEST_ASSERT(std::abs(loaded.puzuEQs[16].bands[0].gainDb - 18.0f) < 0.01f,
+                "15-band scene gain is clamped to its valid range");
+    TEST_ASSERT(std::abs(loaded.puzuEQs[16].bands[0].q - 10.0f) < 0.01f,
+                "15-band scene Q is clamped to its valid range");
+    TEST_ASSERT(loaded.puzuEQs[16].bands[0].type == 5,
+                "15-band scene filter type is clamped to a supported type");
+
     // Test Legacy Scene (XML without EIGHT_BAND_EQS element)
     juce::String legacyXml =
         "<LIVEBUS_SCENE version=\"2\" name=\"LegacyTest\" sampleRate=\"48000\" blockSize=\"512\">"
@@ -1502,6 +2986,10 @@ void testEightBandEQSceneSerializationRoundTripAndLegacy()
     TEST_ASSERT(legacyOk == true, "Legacy XML deserialized without crash");
     TEST_ASSERT(legacyData.eightBandEQs[0].masterEnabled == true, "Legacy scene provides safe default EQ state");
     TEST_ASSERT(legacyData.eightBandEQs[0].bands[0].freq == 80.0f, "Legacy scene provides default 80Hz HPF");
+    TEST_ASSERT(!legacyData.puzuEQs[17].masterEnabled,
+                "Legacy scene defaults 15-band EQ to bypass");
+    TEST_ASSERT(std::abs(legacyData.puzuEQs[17].bands[14].freq - defaultPuzuFreqs[14]) < 0.01f,
+                "Legacy scene uses default 15-band frequency");
 
     manager.deleteScene("_eq_roundtrip_test");
 }
@@ -1534,6 +3022,7 @@ void testLevelMeterSilenceAndKnownSineWavePeakRms()
         sineBuf.setSample(0, i, val);
         sineBuf.setSample(1, i, val);
     }
+
     for (int k = 0; k < 15; ++k)
     {
         meter.processBlock(sineBuf, 960);
@@ -4599,6 +6088,640 @@ void testDiagnosticsQueueLockFreeRingBufferAndOverflowHandling()
     TEST_ASSERT(!queue.pop(dummy), "Queue empty after draining");
 }
 
+void testRealtimeAudioBlockQueueValidationAndOverflow()
+{
+    using Queue = LiveBus::RealtimeAudioBlockQueue<4, 2, 8>;
+    Queue queue;
+    float left[8]{};
+    float right[8]{};
+    const float* input[2] = { left, right };
+    float outputLeft[8]{};
+    float outputRight[8]{};
+    float* output[2] = { outputLeft, outputRight };
+
+    size_t channels = 0;
+    size_t samples = 0;
+    uint64_t sequence = 0;
+    TEST_ASSERT(!queue.tryPop(output, 2, 8, channels, samples, sequence),
+                "Empty audio queue returns no block");
+    TEST_ASSERT(!queue.tryPush(nullptr, 2, 8, 0), "Null input array is rejected");
+    TEST_ASSERT(!queue.tryPush(input, 0, 8, 0), "Zero-channel block is rejected");
+    TEST_ASSERT(!queue.tryPush(input, 3, 8, 0), "Too many channels are rejected");
+    TEST_ASSERT(!queue.tryPush(input, 2, 0, 0), "Empty block is rejected");
+    TEST_ASSERT(!queue.tryPush(input, 2, 9, 0), "Oversized block is rejected");
+
+    for (uint64_t block = 0; block < Queue::getCapacity(); ++block)
+    {
+        for (size_t sample = 0; sample < 8; ++sample)
+        {
+            left[sample] = static_cast<float>(block * 10 + sample);
+            right[sample] = -left[sample];
+        }
+        TEST_ASSERT(queue.tryPush(input, 2, 8, block), "Block fits while queue has capacity");
+    }
+    TEST_ASSERT(!queue.tryPush(input, 2, 8, 99), "Full queue rejects without blocking");
+    TEST_ASSERT(!queue.tryPop(output, 1, 8, channels, samples, sequence),
+                "Insufficient output channels do not consume a block");
+    TEST_ASSERT(!queue.tryPop(output, 2, 7, channels, samples, sequence),
+                "Insufficient output capacity does not consume a block");
+
+    for (uint64_t expected = 0; expected < Queue::getCapacity(); ++expected)
+    {
+        TEST_ASSERT(queue.tryPop(output, 2, 8, channels, samples, sequence),
+                    "Queued block can be read");
+        TEST_ASSERT(channels == 2 && samples == 8 && sequence == expected,
+                    "Block metadata remains ordered");
+        for (size_t sample = 0; sample < 8; ++sample)
+        {
+            const float expectedSample = static_cast<float>(expected * 10 + sample);
+            TEST_ASSERT(outputLeft[sample] == expectedSample &&
+                            outputRight[sample] == -expectedSample,
+                        "Stereo samples remain intact");
+        }
+    }
+    TEST_ASSERT(!queue.tryPop(output, 2, 8, channels, samples, sequence),
+                "Queue is empty after draining");
+}
+
+void testRealtimeAudioBlockQueueConcurrentTransfer()
+{
+    using Queue = LiveBus::RealtimeAudioBlockQueue<8, 2, 32>;
+    Queue queue;
+    constexpr uint64_t blockCount = 20000;
+    std::atomic<bool> transferFailed{false};
+
+    std::thread producer([&]()
+    {
+        float left[32];
+        float right[32];
+        const float* input[2] = { left, right };
+        for (uint64_t block = 0; block < blockCount; ++block)
+        {
+            const float value = static_cast<float>(block);
+            for (size_t sample = 0; sample < 32; ++sample)
+            {
+                left[sample] = value + static_cast<float>(sample) * 0.001f;
+                right[sample] = -left[sample];
+            }
+            while (!queue.tryPush(input, 2, 32, block))
+                std::this_thread::yield();
+        }
+    });
+
+    std::thread consumer([&]()
+    {
+        float left[32]{};
+        float right[32]{};
+        float* output[2] = { left, right };
+        for (uint64_t expected = 0; expected < blockCount; ++expected)
+        {
+            size_t channels = 0;
+            size_t samples = 0;
+            uint64_t sequence = 0;
+            while (!queue.tryPop(output, 2, 32, channels, samples, sequence))
+                std::this_thread::yield();
+
+            if (channels != 2 || samples != 32 || sequence != expected)
+                transferFailed.store(true, std::memory_order_relaxed);
+            for (size_t sample = 0; sample < 32; ++sample)
+            {
+                const float expectedLeft = static_cast<float>(expected) +
+                                           static_cast<float>(sample) * 0.001f;
+                if (left[sample] != expectedLeft || right[sample] != -expectedLeft)
+                    transferFailed.store(true, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    producer.join();
+    consumer.join();
+    TEST_ASSERT(!transferFailed.load(std::memory_order_relaxed),
+                "Concurrent SPSC transfer preserves block order and contents");
+}
+
+class ScaleAudioBlockProcessor final : public LiveBus::RealtimeAudioBlockProcessor
+{
+public:
+    explicit ScaleAudioBlockProcessor(float scale, std::atomic<bool>* release = nullptr,
+                                      std::atomic<bool>* entered = nullptr,
+                                      size_t latencySamples = 0) noexcept
+        : gain(scale), releaseProcessing(release), processingEntered(entered),
+          latency(latencySamples)
+    {
+    }
+
+    size_t getLatencySamples() const noexcept override { return latency; }
+
+    void process(float* const* channels, size_t numChannels,
+                 size_t numSamples) noexcept override
+    {
+        if (processingEntered != nullptr)
+            processingEntered->store(true, std::memory_order_release);
+        while (releaseProcessing != nullptr &&
+               !releaseProcessing->load(std::memory_order_acquire))
+            std::this_thread::yield();
+
+        for (size_t channel = 0; channel < numChannels; ++channel)
+            for (size_t sample = 0; sample < numSamples; ++sample)
+                channels[channel][sample] *= gain;
+    }
+
+private:
+    float gain;
+    std::atomic<bool>* releaseProcessing;
+    std::atomic<bool>* processingEntered;
+    size_t latency;
+};
+
+void testAsyncAudioWorkerDelayedProcessingAndDryFallback()
+{
+    using Worker = LiveBus::AsyncAudioWorker;
+    ScaleAudioBlockProcessor processor(2.0f);
+    Worker worker(processor);
+    TEST_ASSERT(worker.start(), "Worker starts once");
+    TEST_ASSERT(!worker.start(), "Worker rejects a duplicate start");
+    TEST_ASSERT(worker.getLatencySamples(512) == 2 * 512,
+                "Worker reports its fixed two-block transport latency");
+
+    float inputLeft[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float inputRight[4] = { -1.0f, -2.0f, -3.0f, -4.0f };
+    const float* input[2] = { inputLeft, inputRight };
+    float outputLeft[4]{};
+    float outputRight[4]{};
+    float* output[2] = { outputLeft, outputRight };
+
+    auto result = worker.processBlock(input, output, 2, 4);
+    TEST_ASSERT(result == Worker::BlockResult::StartupSilence &&
+                    outputLeft[0] == 0.0f && outputRight[0] == 0.0f,
+                "First block is silent during fixed pipeline startup");
+
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 5.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    result = worker.processBlock(input, output, 2, 4);
+    TEST_ASSERT(result == Worker::BlockResult::StartupSilence,
+                "Second block completes pipeline startup");
+
+    const auto waitForProcessedBlocks = [&worker](uint64_t target)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (worker.getProcessedBlockCount() < target &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return worker.getProcessedBlockCount() >= target;
+    };
+    TEST_ASSERT(waitForProcessedBlocks(2), "Worker processes queued blocks off-thread");
+
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 20.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    result = worker.processBlock(input, output, 2, 4);
+    TEST_ASSERT(result == Worker::BlockResult::Processed,
+                "Matching worker result replaces its delayed dry block");
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        TEST_ASSERT(outputLeft[sample] == 2.0f * (1.0f + static_cast<float>(sample)),
+                    "Processed left block matches sequence zero");
+        TEST_ASSERT(outputRight[sample] == -outputLeft[sample],
+                    "Processed right block preserves stereo relationship");
+    }
+
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 70.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    result = worker.processBlock(input, output, 2, 4, false);
+    TEST_ASSERT(result == Worker::BlockResult::DryFallback &&
+                    outputLeft[0] == inputLeft[0] &&
+                    outputRight[3] == inputRight[3],
+                "Disabled processing is an exact dry bypass without worker latency");
+    TEST_ASSERT(worker.getBypassBlockCount() == 1,
+                "Dry bypass blocks are counted");
+    worker.stop();
+
+    std::atomic<bool> releaseProcessing{false};
+    std::atomic<bool> processingEntered{false};
+    ScaleAudioBlockProcessor blockedProcessor(2.0f, &releaseProcessing, &processingEntered);
+    Worker blockedWorker(blockedProcessor);
+    TEST_ASSERT(blockedWorker.start(), "Fallback test worker starts");
+
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 30.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    blockedWorker.processBlock(input, output, 2, 4);
+    blockedWorker.processBlock(input, output, 2, 4);
+
+    const auto enteredDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!processingEntered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < enteredDeadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!processingEntered.load(std::memory_order_acquire))
+    {
+        releaseProcessing.store(true, std::memory_order_release);
+        blockedWorker.stop();
+        TEST_ASSERT(false, "Worker entered the deliberately stalled processor");
+    }
+
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 40.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    result = blockedWorker.processBlock(input, output, 2, 4);
+    bool delayedDryBlockMatches = true;
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        delayedDryBlockMatches = delayedDryBlockMatches &&
+            outputLeft[sample] == 30.0f + static_cast<float>(sample) &&
+            outputRight[sample] == -outputLeft[sample];
+    }
+
+    releaseProcessing.store(true, std::memory_order_release);
+    blockedWorker.stop();
+    TEST_ASSERT(result == Worker::BlockResult::DryFallback,
+                "Late worker result selects same-sequence delayed dry audio");
+    TEST_ASSERT(delayedDryBlockMatches,
+                "Fallback uses the delayed input block, not current or stale audio");
+    TEST_ASSERT(blockedWorker.getUnderrunCount() == 1,
+                "A missed processing deadline increments the underrun counter");
+
+    ScaleAudioBlockProcessor invalidProcessor(std::numeric_limits<float>::quiet_NaN());
+    Worker invalidWorker(invalidProcessor);
+    TEST_ASSERT(invalidWorker.start(), "Non-finite output test worker starts");
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 50.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    invalidWorker.processBlock(input, output, 2, 4);
+    invalidWorker.processBlock(input, output, 2, 4);
+    const auto invalidDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (invalidWorker.getOutputDropCount() == 0 &&
+           std::chrono::steady_clock::now() < invalidDeadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    TEST_ASSERT(invalidWorker.getOutputDropCount() > 0,
+                "Non-finite worker output is rejected");
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 60.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    result = invalidWorker.processBlock(input, output, 2, 4);
+    invalidWorker.stop();
+    TEST_ASSERT(result == Worker::BlockResult::DryFallback,
+                "Rejected non-finite output falls back to delayed dry audio");
+    for (int sample = 0; sample < 4; ++sample)
+        TEST_ASSERT(outputLeft[sample] == 50.0f + static_cast<float>(sample),
+                    "Non-finite worker output never reaches the audio output");
+
+    std::atomic<bool> releaseLatencyProcessor{false};
+    std::atomic<bool> latencyProcessingEntered{false};
+    ScaleAudioBlockProcessor latencyProcessor(
+        2.0f, &releaseLatencyProcessor, &latencyProcessingEntered, 2);
+    Worker latencyWorker(latencyProcessor);
+    TEST_ASSERT(latencyWorker.start(), "Latency-alignment worker starts");
+    TEST_ASSERT(latencyWorker.getLatencySamples(4) == 10,
+                "Worker latency includes two blocks plus processor latency");
+
+    for (int sample = 0; sample < 4; ++sample)
+    {
+        inputLeft[sample] = 30.0f + static_cast<float>(sample);
+        inputRight[sample] = -inputLeft[sample];
+    }
+    latencyWorker.processBlock(input, output, 2, 4);
+    latencyWorker.processBlock(input, output, 2, 4);
+    const auto latencyEnteredDeadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!latencyProcessingEntered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < latencyEnteredDeadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool latencyProcessorEntered =
+        latencyProcessingEntered.load(std::memory_order_acquire);
+
+    bool latencyFallbackAligned = false;
+    bool latencyUnderrunCounted = false;
+    bool queueOverflowCounted = false;
+    if (latencyProcessorEntered)
+    {
+        result = latencyWorker.processBlock(input, output, 2, 4);
+        latencyFallbackAligned = result == Worker::BlockResult::DryFallback &&
+            outputLeft[0] == 0.0f && outputLeft[1] == 0.0f &&
+            outputLeft[2] == 30.0f && outputLeft[3] == 31.0f;
+        latencyUnderrunCounted = latencyWorker.getUnderrunCount() == 1;
+
+        for (int block = 0; block < 12; ++block)
+        {
+            for (int sample = 0; sample < 4; ++sample)
+            {
+                inputLeft[sample] = 100.0f + static_cast<float>(block * 4 + sample);
+                inputRight[sample] = -inputLeft[sample];
+            }
+            latencyWorker.processBlock(input, output, 2, 4);
+        }
+        queueOverflowCounted = latencyWorker.getInputDropCount() > 0;
+    }
+    releaseLatencyProcessor.store(true, std::memory_order_release);
+    latencyWorker.stop();
+    TEST_ASSERT(latencyProcessorEntered,
+                "Latency processor reaches its deliberate stall");
+    TEST_ASSERT(latencyFallbackAligned,
+                "Dry fallback matches the processor's two-sample intrinsic delay");
+    TEST_ASSERT(latencyUnderrunCounted,
+                "Latency-aligned fallback is counted as an underrun");
+    TEST_ASSERT(queueOverflowCounted,
+                "A stalled worker never blocks the callback and reports queue overflow");
+}
+
+void testRNNoiseBackendProcessesArbitraryBlocks()
+{
+    using namespace LiveBus;
+    RNNoiseNoiseSuppressor processor;
+    TEST_ASSERT(processor.isReady(), "Bundled RNNoise model initializes both channel states");
+    TEST_ASSERT(processor.getFrameSize() == 480, "RNNoise frame size is read from the backend API");
+    TEST_ASSERT(processor.getLatencySamples() == 480,
+                "RNNoise reports its one-frame input/output buffering latency");
+    TEST_ASSERT(RNNoiseNoiseSuppressor::RequiredSampleRate == 48000,
+                "RNNoise backend is restricted to its supported 48 kHz rate");
+
+    std::array<std::array<float, 1024>, 2> quietAudio{};
+    float* quietChannels[2] = { quietAudio[0].data(), quietAudio[1].data() };
+    processor.process(quietChannels, 2, 1024);
+    for (const auto& channel : quietAudio)
+        for (const auto sample : channel)
+            TEST_ASSERT(std::isfinite(sample) && std::abs(sample) <= 1.0f,
+                        "Silence remains finite and bounded through RNNoise");
+
+    for (size_t sample = 0; sample < 1024; ++sample)
+    {
+        const float nearSilence = 1.0e-4f * std::sin(
+            juce::MathConstants<float>::twoPi * 220.0f *
+            static_cast<float>(sample) / static_cast<float>(processor.RequiredSampleRate));
+        quietAudio[0][sample] = nearSilence;
+        quietAudio[1][sample] = nearSilence;
+    }
+    processor.process(quietChannels, 2, 1024);
+    for (size_t channel = 0; channel < quietAudio.size(); ++channel)
+        for (size_t sample = 0; sample < 1024; ++sample)
+            TEST_ASSERT(std::isfinite(quietAudio[channel][sample]) &&
+                            std::abs(quietAudio[channel][sample]) <= 1.0f,
+                        "Near-silence remains finite and bounded through RNNoise");
+
+    const size_t blockSizes[] = { 128, 512, 1024, 480 };
+    std::array<std::array<float, 1024>, 2> audio{};
+    float* channels[2] = { audio[0].data(), audio[1].data() };
+    uint32_t randomState = 0x12345678u;
+    bool outputChanged = false;
+
+    for (const auto blockSize : blockSizes)
+    {
+        for (size_t sample = 0; sample < blockSize; ++sample)
+        {
+            randomState = randomState * 1664525u + 1013904223u;
+            const float noise = (static_cast<float>((randomState >> 8) & 0xffffu) / 32768.0f - 1.0f) * 0.15f;
+            const float tone = 0.35f * std::sin(juce::MathConstants<float>::twoPi *
+                                                440.0f * static_cast<float>(sample) /
+                                                static_cast<float>(processor.RequiredSampleRate));
+            audio[0][sample] = tone + noise;
+            audio[1][sample] = tone + noise;
+        }
+
+        const auto before = audio[0];
+        processor.process(channels, 2, blockSize);
+        for (size_t sample = 0; sample < blockSize; ++sample)
+        {
+            TEST_ASSERT(std::isfinite(audio[0][sample]) && std::isfinite(audio[1][sample]),
+                        "RNNoise output remains finite");
+            TEST_ASSERT(audio[0][sample] >= -1.0f && audio[0][sample] <= 1.0f &&
+                            audio[1][sample] >= -1.0f && audio[1][sample] <= 1.0f,
+                        "RNNoise output is bounded to normalized float audio");
+            outputChanged = outputChanged || audio[0][sample] != before[sample];
+        }
+    }
+    TEST_ASSERT(outputChanged, "RNNoise backend transforms the test signal");
+}
+
+void testBundledRNNoiseVST3LoadsAndProcesses()
+{
+    juce::AudioPluginFormatManager formatManager;
+    formatManager.addDefaultFormats();
+
+    const auto testExecutableDirectory =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    const auto buildDirectory = testExecutableDirectory.getParentDirectory().getParentDirectory();
+    const auto pluginBundle = buildDirectory.getChildFile("LiveBusMixer_artefacts")
+        .getChildFile("Release").getChildFile("Plugins")
+        .getChildFile("LiveBus RNNoise.vst3");
+    TEST_ASSERT(pluginBundle.isDirectory(), "Bundled RNNoise VST3 is copied beside the mixer");
+
+    juce::OwnedArray<juce::PluginDescription> descriptions;
+    for (int formatIndex = 0; formatIndex < formatManager.getNumFormats(); ++formatIndex)
+        if (auto* format = formatManager.getFormat(formatIndex))
+            format->findAllTypesForFile(descriptions, pluginBundle.getFullPathName());
+    TEST_ASSERT(!descriptions.isEmpty(), "VST3 host discovers the bundled RNNoise plugin");
+
+    juce::String error;
+    auto plugin = formatManager.createPluginInstance(
+        *descriptions[0], 48000.0, 128, error);
+    TEST_ASSERT(plugin != nullptr, "VST3 host instantiates RNNoise: " + error);
+    TEST_ASSERT(plugin->getNumParameters() >= 4,
+                "VST3 exposes VAD enable, threshold, grace, and wet parameters");
+
+    plugin->setPlayConfigDetails(2, 2, 48000.0, 128);
+    plugin->prepareToPlay(48000.0, 128);
+    TEST_ASSERT(plugin->getLatencySamples() == 736,
+                "VST3 reports two worker buffers plus one RNNoise frame");
+
+    juce::AudioBuffer<float> audio(2, 128);
+    juce::MidiBuffer midi;
+    for (int block = 0; block < 6; ++block)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                audio.setSample(channel, sample, 0.2f * std::sin(
+                    juce::MathConstants<float>::twoPi * 440.0f *
+                    static_cast<float>(block * audio.getNumSamples() + sample) / 48000.0f));
+
+        plugin->processBlock(audio, midi);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                TEST_ASSERT(std::isfinite(audio.getSample(channel, sample)),
+                            "VST3 output remains finite while worker processes audio");
+    }
+    plugin->releaseResources();
+}
+
+void testVocalFXPitchDetection()
+{
+    VocalPitchDetector detector;
+    detector.prepare(48000.0, 512);
+
+    // 1. Test Silence Response
+    std::vector<float> silence(512, 0.0f);
+    float pitchSil = detector.processBlock(silence.data(), 512);
+    TEST_ASSERT(pitchSil == 0.0f, "Pitch detector returns 0 Hz for silence");
+    TEST_ASSERT(detector.getConfidence() == 0.0f, "Confidence is 0 for silence");
+
+    // 2. Test Pure Sine Waves across vocal range (A3 = 220Hz, A4 = 440Hz, C5 = 523.25Hz)
+    const float testFreqs[] = { 130.81f /* C3 */, 220.0f /* A3 */, 440.0f /* A4 */, 523.25f /* C5 */ };
+    for (float f : testFreqs)
+    {
+        detector.reset();
+        // For low male pitch (130 Hz = 367 samples period), feed ~2048 samples so full ring buffer has tone
+        std::vector<float> tone(2048, 0.0f);
+        for (size_t s = 0; s < tone.size(); ++s)
+            tone[s] = 0.5f * std::sin(juce::MathConstants<float>::twoPi * f * (float)s / 48000.0f);
+
+        float detected = 0.0f;
+        for (size_t offset = 0; offset < tone.size(); offset += 512)
+            detected = detector.processBlock(tone.data() + offset, 512);
+
+        float errorHz = std::abs(detected - f);
+        TEST_ASSERT(errorHz < 8.0f, "Detected pitch (" + juce::String(detected) + " Hz) is close to target (" + juce::String(f) + " Hz)");
+        TEST_ASSERT(detector.getConfidence() > 0.6f, "Voiced tone produces high confidence");
+    }
+}
+
+void testVocalFXPitchCorrectionScaleQuantization()
+{
+    // Test Musical Conversion
+    float a4Midi = VocalPitchCorrection::hzToMidiNote(440.0f);
+    TEST_ASSERT(std::abs(a4Midi - 69.0f) < 0.05f, "440 Hz converts to MIDI 69 (A4)");
+    float a4Hz = VocalPitchCorrection::midiNoteToHz(69.0f);
+    TEST_ASSERT(std::abs(a4Hz - 440.0f) < 0.05f, "MIDI 69 converts to 440 Hz");
+
+    // Test Scale Snapping: C Major (C, D, E, F, G, A, B)
+    // Root Key = 0 (C)
+    // Input note 63.2 (D#4 / Eb4) in C Major should snap to 64 (E4) or 62 (D4)
+    float snappedMaj = VocalPitchCorrection::findClosestScaleNote(63.2f, 0, VocalPitchCorrection::ScaleMajor);
+    TEST_ASSERT(snappedMaj == 64.0f || snappedMaj == 62.0f, "D# in C Major snaps to diatonic neighbor D or E");
+
+    // Input note 63.0 (D#4 / Eb4) in C Minor (C, D, Eb, F, G, Ab, Bb) should snap to 63 (Eb)
+    float snappedMin = VocalPitchCorrection::findClosestScaleNote(63.0f, 0, VocalPitchCorrection::ScaleMinor);
+    TEST_ASSERT(snappedMin == 63.0f, "Eb is in C Minor and stays 63");
+
+    // Test Audio Buffer Processing & NaN Safety
+    VocalPitchCorrection corrector;
+    corrector.prepare(48000.0, 256);
+    juce::AudioBuffer<float> testBuf(2, 256);
+    for (int ch = 0; ch < 2; ++ch)
+        for (int s = 0; s < 256; ++s)
+            testBuf.setSample(ch, s, 0.3f * std::sin((float)s * 0.1f));
+
+    float targetHz = 0.0f;
+    corrector.process(testBuf, 256, 445.0f, 0, VocalPitchCorrection::ScaleMajor, 0.8f, false, 0.0f, 0.0f, &targetHz);
+    TEST_ASSERT(targetHz > 0.0f, "Target frequency calculated");
+
+    for (int ch = 0; ch < 2; ++ch)
+        for (int s = 0; s < 256; ++s)
+        {
+            float val = testBuf.getSample(ch, s);
+            TEST_ASSERT(std::isfinite(val), "Pitch corrector output is strictly finite");
+            TEST_ASSERT(std::abs(val) <= 1.5f, "Pitch corrector output remains bounded");
+        }
+}
+
+void testBundledVocalFXProVST3LoadsAndProcesses()
+{
+    juce::AudioPluginFormatManager formatManager;
+    formatManager.addDefaultFormats();
+
+    const auto testExecutableDirectory =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    const auto buildDirectory = testExecutableDirectory.getParentDirectory().getParentDirectory();
+    const auto pluginBundle = buildDirectory.getChildFile("LiveBusMixer_artefacts")
+        .getChildFile("Release").getChildFile("Plugins")
+        .getChildFile("Vocal FX Pro.vst3");
+    TEST_ASSERT(pluginBundle.isDirectory(), "Bundled Vocal FX Pro VST3 is copied beside the mixer");
+
+    juce::OwnedArray<juce::PluginDescription> descriptions;
+    for (int formatIndex = 0; formatIndex < formatManager.getNumFormats(); ++formatIndex)
+        if (auto* format = formatManager.getFormat(formatIndex))
+            format->findAllTypesForFile(descriptions, pluginBundle.getFullPathName());
+    TEST_ASSERT(!descriptions.isEmpty(), "VST3 host discovers the bundled Vocal FX Pro plugin");
+
+    juce::String error;
+    auto plugin = formatManager.createPluginInstance(
+        *descriptions[0], 48000.0, 128, error);
+    TEST_ASSERT(plugin != nullptr, "VST3 host instantiates Vocal FX Pro: " + error);
+    TEST_ASSERT(plugin->getNumParameters() >= 15,
+                "VST3 exposes AutoTune, Key, Scale, EQ, Comp, Reverb, Delay, Mix parameters");
+
+    plugin->setPlayConfigDetails(2, 2, 48000.0, 128);
+    plugin->prepareToPlay(48000.0, 128);
+
+    juce::AudioBuffer<float> audio(2, 128);
+    juce::MidiBuffer midi;
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                audio.setSample(channel, sample, 0.25f * std::sin(
+                    juce::MathConstants<float>::twoPi * 440.0f *
+                    static_cast<float>(block * audio.getNumSamples() + sample) / 48000.0f));
+
+        plugin->processBlock(audio, midi);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                TEST_ASSERT(std::isfinite(audio.getSample(channel, sample)),
+                            "Vocal FX Pro VST3 output is finite and glitch-free");
+    }
+    plugin->releaseResources();
+}
+
+void testBundledAlesisVST3LoadsAndProcesses()
+{
+    juce::AudioPluginFormatManager formatManager;
+    formatManager.addDefaultFormats();
+
+    const auto testExecutableDirectory =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    const auto buildDirectory = testExecutableDirectory.getParentDirectory().getParentDirectory();
+    const auto pluginBundle = buildDirectory.getChildFile("LiveBusMixer_artefacts")
+        .getChildFile("Release").getChildFile("Plugins")
+        .getChildFile("LiveBus Alesis.vst3");
+    TEST_ASSERT(pluginBundle.isDirectory(), "Bundled Alesis VST3 is copied beside the mixer");
+
+    juce::OwnedArray<juce::PluginDescription> descriptions;
+    for (int formatIndex = 0; formatIndex < formatManager.getNumFormats(); ++formatIndex)
+        if (auto* format = formatManager.getFormat(formatIndex))
+            format->findAllTypesForFile(descriptions, pluginBundle.getFullPathName());
+    TEST_ASSERT(!descriptions.isEmpty(), "VST3 host discovers the bundled Alesis plugin");
+
+    juce::String error;
+    auto plugin = formatManager.createPluginInstance(
+        *descriptions[0], 48000.0, 128, error);
+    TEST_ASSERT(plugin != nullptr, "VST3 host instantiates Alesis Studio: " + error);
+    TEST_ASSERT(plugin->getNumPrograms() >= 5, "Exposes 5 professional presets including Dangdut Koplo Live and Pop Vocal Pro");
+
+    plugin->setPlayConfigDetails(2, 2, 48000.0, 128);
+    plugin->prepareToPlay(48000.0, 128);
+
+    juce::AudioBuffer<float> audio(2, 128);
+    juce::MidiBuffer midi;
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                audio.setSample(channel, sample, 0.25f * std::sin(
+                    juce::MathConstants<float>::twoPi * 440.0f *
+                    static_cast<float>(block * audio.getNumSamples() + sample) / 48000.0f));
+
+        plugin->processBlock(audio, midi);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                TEST_ASSERT(std::isfinite(audio.getSample(channel, sample)),
+                            "Alesis Studio VST3 output is strictly finite and clean");
+    }
+    plugin->releaseResources();
+}
+
 void testDiagnosticsLogManagerSeverityFilteringAndTrimming()
 {
     using namespace LiveBus;
@@ -5718,6 +7841,117 @@ void testPerChannelInputSourceSelection()
     TEST_ASSERT(stream.getMagnitude(0, 0, 64) < 1e-5f, "Disabled channel produces silence on stream bus");
 }
 
+void testPlaybackInputChannelMapping()
+{
+    juce::AudioBuffer<float> source(2, 3);
+    juce::AudioBuffer<float> destination(2, 3);
+    source.setSample(0, 0, 0.2f);
+    source.setSample(0, 1, -0.6f);
+    source.setSample(0, 2, 0.8f);
+    source.setSample(1, 0, 0.6f);
+    source.setSample(1, 1, 0.2f);
+    source.setSample(1, 2, -0.4f);
+
+    LiveBus::copyPlaybackInputChannel(source, 0, destination, 3);
+    TEST_ASSERT(std::abs(destination.getSample(0, 1) + 0.6f) < 1.0e-6f &&
+                    std::abs(destination.getSample(1, 1) + 0.6f) < 1.0e-6f,
+                "Playback Left duplicates the left source to the channel's mono output");
+
+    LiveBus::copyPlaybackInputChannel(source, 1, destination, 3);
+    TEST_ASSERT(std::abs(destination.getSample(0, 0) - 0.6f) < 1.0e-6f &&
+                    std::abs(destination.getSample(1, 0) - 0.6f) < 1.0e-6f,
+                "Playback Right duplicates the right source to the channel's mono output");
+
+    LiveBus::copyPlaybackInputChannel(source, 2, destination, 3);
+    TEST_ASSERT(std::abs(destination.getSample(0, 0) - 0.4f) < 1.0e-6f &&
+                    std::abs(destination.getSample(1, 0) - 0.4f) < 1.0e-6f &&
+                    std::abs(destination.getSample(0, 1) + 0.2f) < 1.0e-6f &&
+                    std::abs(destination.getSample(1, 2) - 0.2f) < 1.0e-6f,
+                "Playback Sum averages left and right and duplicates the mono sum to both outputs");
+}
+
+void testReusedChannelStateResetsToDefaults()
+{
+    LiveBus::RoutingMatrix matrix;
+    matrix.setActiveChannels(4);
+    TEST_ASSERT(matrix.addChannel("Old channel"), "Adds a channel to configure for reuse");
+
+    auto& oldChannel = matrix.getChannel(4);
+    oldChannel.gain.store(0.2f);
+    oldChannel.pan.store(0.75f);
+    oldChannel.mute.store(true);
+    oldChannel.solo.store(true);
+    oldChannel.peakMeter.store(0.8f);
+    oldChannel.inputMeter.store(0.7f);
+    oldChannel.inputSource.store(LiveBus::ChannelInputSource::YouTube);
+    oldChannel.hardwareInputChannel.store(12);
+    oldChannel.playbackChannel.store(2);
+    oldChannel.stereoMode.store(LiveBus::ChannelStereoMode::StereoPair);
+    oldChannel.isEnabled.store(false);
+    oldChannel.isSourceAvailable.store(false);
+    oldChannel.duplicateWarning.store(true);
+    oldChannel.stereoLinked.store(true);
+    oldChannel.preFaderSendStream.store(true);
+    oldChannel.preFaderSendMonitor.store(true);
+    oldChannel.submixGroup.store(2);
+    for (int bus = 0; bus < numBuses; ++bus)
+    {
+        oldChannel.routeEnable[(size_t)bus].store(false);
+        oldChannel.sendLevel[(size_t)bus].store(0.25f);
+    }
+    for (int output = 0; output < maxHwOutputs; ++output)
+    {
+        oldChannel.hwRouteEnable[(size_t)output].store(true);
+        oldChannel.hwSendLevel[(size_t)output].store(0.25f);
+        oldChannel.preFaderHwSend[(size_t)output].store(true);
+    }
+    for (int aux = 0; aux < maxAuxBuses; ++aux)
+    {
+        oldChannel.auxRouteEnable[(size_t)aux].store(true);
+        oldChannel.auxSendLevel[(size_t)aux].store(0.25f);
+        oldChannel.preFaderAuxSend[(size_t)aux].store(true);
+    }
+
+    TEST_ASSERT(matrix.removeLastChannel(), "Removes the configured last channel");
+    TEST_ASSERT(matrix.addChannel("Fresh channel"), "Re-adds the removed channel slot");
+
+    const auto& freshChannel = matrix.getChannel(4);
+    bool routingDefaults = freshChannel.routeEnable[0].load() &&
+                           freshChannel.routeEnable[1].load() &&
+                           std::abs(freshChannel.sendLevel[0].load() - 1.0f) < 1.0e-6f &&
+                           std::abs(freshChannel.sendLevel[1].load() - 1.0f) < 1.0e-6f;
+    bool hardwareDefaults = true;
+    for (int output = 0; output < maxHwOutputs; ++output)
+        hardwareDefaults = hardwareDefaults && !freshChannel.hwRouteEnable[(size_t)output].load() &&
+                           std::abs(freshChannel.hwSendLevel[(size_t)output].load() - 1.0f) < 1.0e-6f &&
+                           !freshChannel.preFaderHwSend[(size_t)output].load();
+    bool auxDefaults = true;
+    for (int aux = 0; aux < maxAuxBuses; ++aux)
+        auxDefaults = auxDefaults && !freshChannel.auxRouteEnable[(size_t)aux].load() &&
+                      std::abs(freshChannel.auxSendLevel[(size_t)aux].load()) < 1.0e-6f &&
+                      !freshChannel.preFaderAuxSend[(size_t)aux].load();
+
+    TEST_ASSERT(freshChannel.name == "Fresh channel" &&
+                    freshChannel.inputSource.load() == LiveBus::ChannelInputSource::Hardware &&
+                    freshChannel.hardwareInputChannel.load() == 4 &&
+                    freshChannel.playbackChannel.load() == 0,
+                "Reused channel resets its name and input source mapping");
+    TEST_ASSERT(std::abs(freshChannel.gain.load() - 0.707f) < 1.0e-6f &&
+                    freshChannel.pan.load() == 0.0f &&
+                    !freshChannel.mute.load() && !freshChannel.solo.load() &&
+                    freshChannel.peakMeter.load() == 0.0f && freshChannel.inputMeter.load() == 0.0f,
+                "Reused channel resets fader, pan, mute, solo, and meters");
+    TEST_ASSERT(freshChannel.stereoMode.load() == LiveBus::ChannelStereoMode::Mono &&
+                    freshChannel.isEnabled.load() && freshChannel.isSourceAvailable.load() &&
+                    !freshChannel.duplicateWarning.load() && !freshChannel.stereoLinked.load(),
+                "Reused channel resets enable, availability, link, and duplicate flags");
+    TEST_ASSERT(routingDefaults && hardwareDefaults && auxDefaults &&
+                    !freshChannel.preFaderSendStream.load() &&
+                    !freshChannel.preFaderSendMonitor.load() &&
+                    freshChannel.submixGroup.load() == -1,
+                "Reused channel resets bus, hardware, aux, pre-fader, and submix routing");
+}
+
 void testPerChannelStreamAndMonitorSendsIndependent()
 {
     LiveBus::RoutingMatrix matrix;
@@ -5807,6 +8041,48 @@ void testDuplicateHardwareInputWarning()
     TEST_ASSERT(matrix.getChannel(0).duplicateWarning.load(), "Ch 0 flagged with duplicate warning");
     TEST_ASSERT(matrix.getChannel(1).duplicateWarning.load(), "Ch 1 flagged with duplicate warning");
     TEST_ASSERT(!matrix.getChannel(2).duplicateWarning.load(), "Ch 2 has no duplicate warning");
+}
+
+void testStereoPairHardwareOverlapAndAvailability()
+{
+    LiveBus::RoutingMatrix matrix;
+    matrix.setActiveChannels(4);
+    for (int channel = 0; channel < 4; ++channel)
+    {
+        auto& state = matrix.getChannel(channel);
+        state.inputSource.store(LiveBus::ChannelInputSource::Hardware);
+        state.hardwareInputChannel.store(channel);
+        state.stereoMode.store(LiveBus::ChannelStereoMode::Mono);
+    }
+
+    matrix.validateAvailableInputs(4);
+    matrix.updateDuplicateWarnings();
+    TEST_ASSERT(matrix.getChannel(2).isSourceAvailable.load() &&
+                    matrix.getChannel(3).isSourceAvailable.load(),
+                "Channels 3 and 4 mono inputs are available on a four-input device");
+
+    matrix.setChannelStereoMode(2, LiveBus::ChannelStereoMode::StereoPair);
+    TEST_ASSERT(matrix.getChannel(2).duplicateWarning.load() &&
+                    matrix.getChannel(3).duplicateWarning.load(),
+                "Stereo pair on channel 3 warns that its second input is also assigned to channel 4");
+    TEST_ASSERT(!matrix.getChannel(0).duplicateWarning.load() &&
+                    !matrix.getChannel(1).duplicateWarning.load(),
+                "Stereo-pair input overlap does not flag unrelated channels");
+
+    matrix.setChannelStereoMode(2, LiveBus::ChannelStereoMode::Mono);
+    matrix.setChannelStereoMode(3, LiveBus::ChannelStereoMode::StereoPair);
+    TEST_ASSERT(!matrix.getChannel(3).isSourceAvailable.load() &&
+                    !hardwareInputRangeIsAvailable(3, LiveBus::ChannelStereoMode::StereoPair, 4),
+                "Stereo pair on channel 4 is unavailable when its second hardware input is missing");
+    TEST_ASSERT(matrix.getChannel(2).isSourceAvailable.load() &&
+                    !matrix.getChannel(2).duplicateWarning.load() &&
+                    !matrix.getChannel(3).duplicateWarning.load(),
+                "Non-overlapping mono and stereo-pair routes remain warning-free");
+
+    matrix.validateAvailableInputs(5);
+    TEST_ASSERT(matrix.getChannel(3).isSourceAvailable.load() &&
+                    hardwareInputRangeIsAvailable(3, LiveBus::ChannelStereoMode::StereoPair, 5),
+                "Stereo pair becomes available when both hardware inputs are present");
 }
 
 void testStereoPairAndBalanceLaw()
@@ -5899,6 +8175,56 @@ void testRoutingMatrixXmlPersistence()
     TEST_ASSERT(stream.getMagnitude(0, 0, 64) > 0.34f &&
                     monitor.getMagnitude(0, 0, 64) == 0.0f,
                 "Restored Scene routing produces the expected independent audio output");
+}
+
+void testRoutingMatrixXmlRejectsInvalidState()
+{
+    auto xml = juce::XmlDocument::parse(
+        "<RoutingMatrix activeChannels=\"999\" availableHwOutputs=\"999\">"
+        "<Channel index=\"0\" gain=\"nan\" pan=\"8\" inputSource=\"99\" "
+        "hardwareInputChannel=\"999\" playbackChannel=\"-1\" stereoMode=\"99\" "
+        "submixGroup=\"99\" sendStream=\"-2\" sendMonitor=\"nan\" "
+        "hwSend_0=\"9\" auxSend_0=\"inf\"/>"
+        "<AuxBus index=\"0\" returnLevel=\"nan\" pan=\"-9\" fxType=\"99\" "
+        "fxParam1=\"-1\" fxParam2=\"9\" fxParam3=\"inf\"/>"
+        "<SubmixBus index=\"0\" gain=\"nan\" pan=\"9\" "
+        "sendLevelStream=\"-1\" sendLevelMonitor=\"9\"/>"
+        "</RoutingMatrix>");
+    TEST_ASSERT(xml != nullptr, "Malformed routing state XML parses for validation");
+
+    LiveBus::RoutingMatrix matrix;
+    matrix.restoreFromXml(*xml);
+
+    const auto& channel = matrix.getChannel(0);
+    TEST_ASSERT(matrix.getNumActiveChannels() == maxInputs,
+                "Active channel count is clamped to the engine capacity");
+    TEST_ASSERT(matrix.getNumAvailableHardwareOutputs() == maxHwOutputs,
+                "Available hardware output count is clamped to the engine capacity");
+    TEST_ASSERT(channel.gain.load() == 0.707f && channel.pan.load() == 1.0f,
+                "Non-finite gain falls back and out-of-range pan is clamped");
+    TEST_ASSERT(channel.inputSource.load() == LiveBus::ChannelInputSource::Hardware &&
+                    channel.hardwareInputChannel.load() == 0 &&
+                    channel.playbackChannel.load() == 0 &&
+                    channel.stereoMode.load() == LiveBus::ChannelStereoMode::Mono &&
+                    channel.submixGroup.load() == -1,
+                "Invalid routing enums and indices fall back to safe channel defaults");
+    TEST_ASSERT(channel.sendLevel[0].load() == 0.0f &&
+                    channel.sendLevel[1].load() == 1.0f &&
+                    channel.hwSendLevel[0].load() == 4.0f &&
+                    channel.auxSendLevel[0].load() == 0.0f,
+                "Channel send levels are finite and bounded");
+
+    const auto& aux = matrix.getAuxBus(0);
+    TEST_ASSERT(aux.returnLevel.load() == 0.707f && aux.pan.load() == -1.0f &&
+                    aux.fxType.load() == 1 && aux.fxParam1.load() == 0.0f &&
+                    aux.fxParam2.load() == 0.85f && aux.fxParam3.load() == 0.5f,
+                "Aux bus parameters use safe defaults or valid bounds");
+
+    const auto& submix = matrix.getSubmixBus(0);
+    TEST_ASSERT(submix.gain.load() == 1.0f && submix.pan.load() == 1.0f &&
+                    submix.sendLevelStream.load() == 0.0f &&
+                    submix.sendLevelMonitor.load() == 4.0f,
+                "Submix parameters use safe defaults or valid bounds");
 }
 
 void testRoutingMatrixPresets()
@@ -6565,6 +8891,7 @@ int main()
     RUN_TEST(testRoutingMatrixAndPanLaw);
     RUN_TEST(testAudioDelayCompensatorImpulseAlignment);
     RUN_TEST(testRoutingGraphEditsUpdateAudioEngine);
+    RUN_TEST(testRoutingGraphSoloIndicatorsMatchAudioRouting);
     RUN_TEST(testIndependentStreamMonitorRestore);
     RUN_TEST(testRoutingGraphConnectionValidation);
     RUN_TEST(testRoutingGraphConnectionSerialization);
@@ -6585,6 +8912,27 @@ int main()
     RUN_TEST(testDynamicChannelAdditionAndRemoval);
     RUN_TEST(testFourBandStudioEqualizer);
     RUN_TEST(testFifteenBandPuzuEqualizerAndSlopeFilters);
+    RUN_TEST(testPuzuEQStateCopyRestoreAndValidation);
+    RUN_TEST(testMonitorGraphicEQ31ResponseBypassAndTargetIsolation);
+    RUN_TEST(testMonitorGraphicEQAnalyzerCapturesPreAndPostAudio);
+    RUN_TEST(testMonitorGraphicEQStereoAnalyzerPreservesChannels);
+    RUN_TEST(testMainOutputEQ24ResponseBypassAndValidation);
+    RUN_TEST(testMainOutputEQBandSoloAudition);
+    RUN_TEST(testMainOutputDynamicEQDetectorAndRange);
+    RUN_TEST(testEQFrequencyPeakCandidateAnalysis);
+    RUN_TEST(testEQSpectrumPeakHoldDecayAndRise);
+    RUN_TEST(testEQSpectrumAveragingTimeResponse);
+    RUN_TEST(testEQAnalyzerFFTSizeSelection);
+    RUN_TEST(testCrossfadingEQFilterBankTransition);
+    RUN_TEST(testEightBandEQPresetChangeCrossfade);
+    RUN_TEST(testEQPresetCatalogAndTargetMappings);
+    RUN_TEST(testEQCatalogPresetPersistenceAndFavorites);
+    RUN_TEST(testMainOutputEQStereoAnalyzerPreservesChannels);
+    RUN_TEST(testPuzuBypassTransitionSmoothing);
+    RUN_TEST(testPuzuProcessesAfterVocalRack);
+    RUN_TEST(testPuzuCoefficientPublicationDuringAudioProcessing);
+    RUN_TEST(testPuzuPrePostAnalyzerCapturesProcessedAudio);
+    RUN_TEST(testPuzuStereoAnalyzerPreservesChannelsAndMonoCompatibility);
     RUN_TEST(testMidiInputBufferThreadSafety);
     RUN_TEST(testAudioFilePlaybackAndBuffering);
     RUN_TEST(testZipPresetPackaging);
@@ -6694,6 +9042,15 @@ int main()
     RUN_TEST(testCPULoadCalculationAndBoundaryClamping);
     RUN_TEST(testDeadlineMissAndDropoutCounters);
     RUN_TEST(testDiagnosticsQueueLockFreeRingBufferAndOverflowHandling);
+    RUN_TEST(testRealtimeAudioBlockQueueValidationAndOverflow);
+    RUN_TEST(testRealtimeAudioBlockQueueConcurrentTransfer);
+    RUN_TEST(testAsyncAudioWorkerDelayedProcessingAndDryFallback);
+    RUN_TEST(testRNNoiseBackendProcessesArbitraryBlocks);
+    RUN_TEST(testBundledRNNoiseVST3LoadsAndProcesses);
+    RUN_TEST(testVocalFXPitchDetection);
+    RUN_TEST(testVocalFXPitchCorrectionScaleQuantization);
+    RUN_TEST(testBundledVocalFXProVST3LoadsAndProcesses);
+    RUN_TEST(testBundledAlesisVST3LoadsAndProcesses);
     RUN_TEST(testDiagnosticsLogManagerSeverityFilteringAndTrimming);
     RUN_TEST(testDiagnosticReportSanitizationAndExport);
     RUN_TEST(testDeviceEventLifecycleAndFailureHandling);
@@ -6723,11 +9080,15 @@ int main()
 
     // Per-Channel Input & Output Routing Matrix Tests (v1.0)
     RUN_TEST(testPerChannelInputSourceSelection);
+    RUN_TEST(testPlaybackInputChannelMapping);
+    RUN_TEST(testReusedChannelStateResetsToDefaults);
     RUN_TEST(testPerChannelStreamAndMonitorSendsIndependent);
     RUN_TEST(testPreFaderVsPostFaderSend);
     RUN_TEST(testDuplicateHardwareInputWarning);
+    RUN_TEST(testStereoPairHardwareOverlapAndAvailability);
     RUN_TEST(testStereoPairAndBalanceLaw);
     RUN_TEST(testRoutingMatrixXmlPersistence);
+    RUN_TEST(testRoutingMatrixXmlRejectsInvalidState);
     RUN_TEST(testRoutingMatrixPresets);
     RUN_TEST(testMissingHardwareInputSafety);
     RUN_TEST(testIndependentHardwareDirectOutputRouting);

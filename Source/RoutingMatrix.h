@@ -2,6 +2,7 @@
 #include <JuceHeader.h>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,15 @@ enum class ChannelStereoMode : int
     StereoPair = 1,  // Linked with adjacent channel (0&1, 2&3, etc.)
     DualMono = 2     // Dual Mono duplicate
 };
+
+inline bool hardwareInputRangeIsAvailable(int firstInput, ChannelStereoMode mode,
+                                          int availableInputs) noexcept
+{
+    if (firstInput < 0 || firstInput >= availableInputs)
+        return false;
+
+    return mode != ChannelStereoMode::StereoPair || firstInput + 1 < availableInputs;
+}
 
 struct AuxBusState
 {
@@ -107,24 +117,46 @@ struct InputChannelState
 
     InputChannelState()
     {
+        resetForReuse(0);
+    }
+
+    void resetForReuse(int channelIndex)
+    {
+        name.clear();
+        gain.store(0.707f, std::memory_order_relaxed);
+        pan.store(0.0f, std::memory_order_relaxed);
+        mute.store(false, std::memory_order_relaxed);
+        solo.store(false, std::memory_order_relaxed);
+        peakMeter.store(0.0f, std::memory_order_relaxed);
+        inputMeter.store(0.0f, std::memory_order_relaxed);
+        inputSource.store(ChannelInputSource::Hardware, std::memory_order_relaxed);
+        hardwareInputChannel.store(channelIndex, std::memory_order_relaxed);
+        playbackChannel.store(channelIndex % 2, std::memory_order_relaxed);
+        stereoMode.store(ChannelStereoMode::Mono, std::memory_order_relaxed);
+        isEnabled.store(true, std::memory_order_relaxed);
+        isSourceAvailable.store(true, std::memory_order_relaxed);
+        duplicateWarning.store(false, std::memory_order_relaxed);
+        stereoLinked.store(false, std::memory_order_relaxed);
         for (int b = 0; b < numBuses; ++b)
         {
-            routeEnable[(size_t)b].store(true);
-            sendLevel[(size_t)b].store(1.0f);
+            routeEnable[(size_t)b].store(true, std::memory_order_relaxed);
+            sendLevel[(size_t)b].store(1.0f, std::memory_order_relaxed);
         }
         for (int h = 0; h < maxHwOutputs; ++h)
         {
-            hwRouteEnable[(size_t)h].store(false);
-            hwSendLevel[(size_t)h].store(1.0f);
-            preFaderHwSend[(size_t)h].store(false);
+            hwRouteEnable[(size_t)h].store(false, std::memory_order_relaxed);
+            hwSendLevel[(size_t)h].store(1.0f, std::memory_order_relaxed);
+            preFaderHwSend[(size_t)h].store(false, std::memory_order_relaxed);
         }
         for (int a = 0; a < maxAuxBuses; ++a)
         {
-            auxRouteEnable[(size_t)a].store(false);
-            auxSendLevel[(size_t)a].store(0.0f);
-            preFaderAuxSend[(size_t)a].store(false);
+            auxRouteEnable[(size_t)a].store(false, std::memory_order_relaxed);
+            auxSendLevel[(size_t)a].store(0.0f, std::memory_order_relaxed);
+            preFaderAuxSend[(size_t)a].store(false, std::memory_order_relaxed);
         }
-        submixGroup.store(-1);
+        preFaderSendStream.store(false, std::memory_order_relaxed);
+        preFaderSendMonitor.store(false, std::memory_order_relaxed);
+        submixGroup.store(-1, std::memory_order_relaxed);
     }
 };
 
@@ -247,6 +279,7 @@ public:
     {
         int cur = activeChannels.load(std::memory_order_relaxed);
         if (cur >= maxInputs) return false;
+        channels[(size_t)cur].resetForReuse(cur);
         if (defaultName.isNotEmpty())
             channels[(size_t)cur].name = defaultName;
         else
@@ -286,19 +319,41 @@ public:
 
         for (int i = 0; i < count; ++i)
         {
-            if (channels[(size_t)i].inputSource.load(std::memory_order_relaxed) != ChannelInputSource::Hardware)
+            auto& first = channels[(size_t)i];
+            if (first.inputSource.load(std::memory_order_relaxed) != ChannelInputSource::Hardware)
                 continue;
-            int hw1 = channels[(size_t)i].hardwareInputChannel.load(std::memory_order_relaxed);
+            const int firstStart = first.hardwareInputChannel.load(std::memory_order_relaxed);
+            const int firstCount = first.stereoMode.load(std::memory_order_relaxed) ==
+                                           ChannelStereoMode::StereoPair ? 2 : 1;
+
             for (int j = i + 1; j < count; ++j)
             {
-                if (channels[(size_t)j].inputSource.load(std::memory_order_relaxed) == ChannelInputSource::Hardware &&
-                    channels[(size_t)j].hardwareInputChannel.load(std::memory_order_relaxed) == hw1)
-                {
-                    channels[(size_t)i].duplicateWarning.store(true, std::memory_order_relaxed);
-                    channels[(size_t)j].duplicateWarning.store(true, std::memory_order_relaxed);
-                }
+                auto& second = channels[(size_t)j];
+                if (second.inputSource.load(std::memory_order_relaxed) != ChannelInputSource::Hardware)
+                    continue;
+
+                const int secondStart = second.hardwareInputChannel.load(std::memory_order_relaxed);
+                const int secondCount = second.stereoMode.load(std::memory_order_relaxed) ==
+                                            ChannelStereoMode::StereoPair ? 2 : 1;
+                const bool rangesOverlap = firstStart < secondStart + secondCount &&
+                                           secondStart < firstStart + firstCount;
+                if (!rangesOverlap)
+                    continue;
+
+                first.duplicateWarning.store(true, std::memory_order_relaxed);
+                second.duplicateWarning.store(true, std::memory_order_relaxed);
             }
         }
+    }
+
+    void setChannelStereoMode(int channelIndex, ChannelStereoMode mode) noexcept
+    {
+        if (channelIndex < 0 || channelIndex >= maxInputs)
+            return;
+
+        channels[(size_t)channelIndex].stereoMode.store(mode, std::memory_order_release);
+        validateAvailableInputs(getNumAvailableHardwareInputs());
+        updateDuplicateWarnings();
     }
 
     bool hasAnyDuplicateWarning() const
@@ -322,7 +377,10 @@ public:
             if (channels[(size_t)i].inputSource.load(std::memory_order_relaxed) == ChannelInputSource::Hardware)
             {
                 int hw = channels[(size_t)i].hardwareInputChannel.load(std::memory_order_relaxed);
-                channels[(size_t)i].isSourceAvailable.store(hw >= 0 && hw < numAvailableHardwareInputs, std::memory_order_relaxed);
+                const auto mode = channels[(size_t)i].stereoMode.load(std::memory_order_relaxed);
+                channels[(size_t)i].isSourceAvailable.store(
+                    hardwareInputRangeIsAvailable(hw, mode, numAvailableHardwareInputs),
+                    std::memory_order_relaxed);
             }
             else
             {
@@ -1420,11 +1478,28 @@ public:
     void restoreFromXml(const juce::XmlElement& xml)
     {
         if (xml.getTagName() != "RoutingMatrix") return;
+        const auto readBoundedFloat = [](const juce::XmlElement& element,
+                                         const juce::String& attribute,
+                                         float fallback, float minimum, float maximum)
+        {
+            const double value = element.getDoubleAttribute(attribute, fallback);
+            if (!std::isfinite(value))
+                return fallback;
+            return juce::jlimit(minimum, maximum, (float)value);
+        };
+        const auto readBoundedInt = [](const juce::XmlElement& element,
+                                       const juce::String& attribute,
+                                       int fallback, int minimum, int maximum)
+        {
+            const int value = element.getIntAttribute(attribute, fallback);
+            return value < minimum || value > maximum ? fallback : value;
+        };
+
         int count = xml.getIntAttribute("activeChannels", defaultNumInputs);
         setNumActiveChannels(count);
 
         if (xml.hasAttribute("availableHwOutputs"))
-            availableHwOutputs.store(xml.getIntAttribute("availableHwOutputs", 2), std::memory_order_release);
+            validateAvailableOutputs(xml.getIntAttribute("availableHwOutputs", 2));
 
         for (auto* chXml : xml.getChildIterator())
         {
@@ -1435,34 +1510,43 @@ public:
                 {
                     auto& ch = channels[(size_t)idx];
                     ch.name = chXml->getStringAttribute("name", ch.name);
-                    ch.gain.store((float)chXml->getDoubleAttribute("gain", 0.707));
-                    ch.pan.store((float)chXml->getDoubleAttribute("pan", 0.0));
+                    ch.gain.store(readBoundedFloat(*chXml, "gain", 0.707f, 0.0f, 4.0f));
+                    ch.pan.store(readBoundedFloat(*chXml, "pan", 0.0f, -1.0f, 1.0f));
                     ch.mute.store(chXml->getBoolAttribute("mute", false));
                     ch.solo.store(chXml->getBoolAttribute("solo", false));
                     ch.isEnabled.store(chXml->getBoolAttribute("isEnabled", true));
-                    ch.inputSource.store((ChannelInputSource)chXml->getIntAttribute("inputSource", 0));
-                    ch.hardwareInputChannel.store(chXml->getIntAttribute("hardwareInputChannel", idx));
-                    ch.playbackChannel.store(chXml->getIntAttribute("playbackChannel", idx % 2));
-                    ch.stereoMode.store((ChannelStereoMode)chXml->getIntAttribute("stereoMode", 0));
-                    ch.submixGroup.store(chXml->getIntAttribute("submixGroup", -1));
+                    ch.inputSource.store((ChannelInputSource)readBoundedInt(
+                        *chXml, "inputSource", (int)ChannelInputSource::Hardware,
+                        (int)ChannelInputSource::Hardware, (int)ChannelInputSource::YouTube));
+                    ch.hardwareInputChannel.store(readBoundedInt(
+                        *chXml, "hardwareInputChannel", idx, 0, maxInputs - 1));
+                    ch.playbackChannel.store(readBoundedInt(
+                        *chXml, "playbackChannel", idx % 2, 0, 2));
+                    ch.stereoMode.store((ChannelStereoMode)readBoundedInt(
+                        *chXml, "stereoMode", (int)ChannelStereoMode::Mono,
+                        (int)ChannelStereoMode::Mono, (int)ChannelStereoMode::DualMono));
+                    ch.submixGroup.store(readBoundedInt(
+                        *chXml, "submixGroup", -1, -1, maxSubmixBuses - 1));
                     ch.preFaderSendStream.store(chXml->getBoolAttribute("preFaderStream", false));
                     ch.preFaderSendMonitor.store(chXml->getBoolAttribute("preFaderMonitor", false));
                     ch.routeEnable[0].store(chXml->getBoolAttribute("routeStream", true));
-                    ch.sendLevel[0].store((float)chXml->getDoubleAttribute("sendStream", 1.0));
+                    ch.sendLevel[0].store(readBoundedFloat(*chXml, "sendStream", 1.0f, 0.0f, 4.0f));
                     ch.routeEnable[1].store(chXml->getBoolAttribute("routeMonitor", true));
-                    ch.sendLevel[1].store((float)chXml->getDoubleAttribute("sendMonitor", 1.0));
+                    ch.sendLevel[1].store(readBoundedFloat(*chXml, "sendMonitor", 1.0f, 0.0f, 4.0f));
 
                     for (int h = 0; h < maxHwOutputs; ++h)
                     {
                         ch.hwRouteEnable[(size_t)h].store(chXml->getBoolAttribute("hwRoute_" + juce::String(h), false));
-                        ch.hwSendLevel[(size_t)h].store((float)chXml->getDoubleAttribute("hwSend_" + juce::String(h), 1.0));
+                        ch.hwSendLevel[(size_t)h].store(readBoundedFloat(
+                            *chXml, "hwSend_" + juce::String(h), 1.0f, 0.0f, 4.0f));
                         ch.preFaderHwSend[(size_t)h].store(chXml->getBoolAttribute("hwPre_" + juce::String(h), false));
                     }
 
                     for (int a = 0; a < maxAuxBuses; ++a)
                     {
                         ch.auxRouteEnable[(size_t)a].store(chXml->getBoolAttribute("auxRoute_" + juce::String(a), false));
-                        ch.auxSendLevel[(size_t)a].store((float)chXml->getDoubleAttribute("auxSend_" + juce::String(a), 0.0));
+                        ch.auxSendLevel[(size_t)a].store(readBoundedFloat(
+                            *chXml, "auxSend_" + juce::String(a), 0.0f, 0.0f, 4.0f));
                         ch.preFaderAuxSend[(size_t)a].store(chXml->getBoolAttribute("auxPre_" + juce::String(a), false));
                     }
                 }
@@ -1474,18 +1558,19 @@ public:
                 {
                     auto& aux = auxBuses[(size_t)a];
                     aux.name = chXml->getStringAttribute("name", aux.name);
-                    aux.returnLevel.store((float)chXml->getDoubleAttribute("returnLevel", 0.707));
-                    aux.pan.store((float)chXml->getDoubleAttribute("pan", 0.0));
+                    aux.returnLevel.store(readBoundedFloat(*chXml, "returnLevel", 0.707f, 0.0f, 4.0f));
+                    aux.pan.store(readBoundedFloat(*chXml, "pan", 0.0f, -1.0f, 1.0f));
                     aux.mute.store(chXml->getBoolAttribute("mute", false));
                     aux.solo.store(chXml->getBoolAttribute("solo", false));
                     aux.sendToStream.store(chXml->getBoolAttribute("sendToStream", true));
                     aux.sendToMonitor.store(chXml->getBoolAttribute("sendToMonitor", true));
-                    aux.sendLevelStream.store((float)chXml->getDoubleAttribute("sendLevelStream", 1.0));
-                    aux.sendLevelMonitor.store((float)chXml->getDoubleAttribute("sendLevelMonitor", 1.0));
-                    aux.fxType.store(chXml->getIntAttribute("fxType", a == 0 ? 1 : (a == 1 ? 2 : 0)));
-                    aux.fxParam1.store((float)chXml->getDoubleAttribute("fxParam1", 0.5));
-                    aux.fxParam2.store((float)chXml->getDoubleAttribute("fxParam2", 0.5));
-                    aux.fxParam3.store((float)chXml->getDoubleAttribute("fxParam3", 0.5));
+                    aux.sendLevelStream.store(readBoundedFloat(*chXml, "sendLevelStream", 1.0f, 0.0f, 4.0f));
+                    aux.sendLevelMonitor.store(readBoundedFloat(*chXml, "sendLevelMonitor", 1.0f, 0.0f, 4.0f));
+                    aux.fxType.store(readBoundedInt(
+                        *chXml, "fxType", a == 0 ? 1 : (a == 1 ? 2 : 0), 0, 2));
+                    aux.fxParam1.store(readBoundedFloat(*chXml, "fxParam1", 0.5f, 0.0f, 1.5f));
+                    aux.fxParam2.store(readBoundedFloat(*chXml, "fxParam2", 0.5f, 0.0f, 0.85f));
+                    aux.fxParam3.store(readBoundedFloat(*chXml, "fxParam3", 0.5f, 0.0f, 1.0f));
                 }
             }
             else if (chXml->getTagName() == "SubmixBus")
@@ -1495,17 +1580,18 @@ public:
                 {
                     auto& sub = submixBuses[(size_t)s];
                     sub.name = chXml->getStringAttribute("name", sub.name);
-                    sub.gain.store((float)chXml->getDoubleAttribute("gain", 1.0));
-                    sub.pan.store((float)chXml->getDoubleAttribute("pan", 0.0));
+                    sub.gain.store(readBoundedFloat(*chXml, "gain", 1.0f, 0.0f, 4.0f));
+                    sub.pan.store(readBoundedFloat(*chXml, "pan", 0.0f, -1.0f, 1.0f));
                     sub.mute.store(chXml->getBoolAttribute("mute", false));
                     sub.solo.store(chXml->getBoolAttribute("solo", false));
                     sub.routeToStream.store(chXml->getBoolAttribute("routeToStream", true));
                     sub.routeToMonitor.store(chXml->getBoolAttribute("routeToMonitor", true));
-                    sub.sendLevelStream.store((float)chXml->getDoubleAttribute("sendLevelStream", 1.0));
-                    sub.sendLevelMonitor.store((float)chXml->getDoubleAttribute("sendLevelMonitor", 1.0));
+                    sub.sendLevelStream.store(readBoundedFloat(*chXml, "sendLevelStream", 1.0f, 0.0f, 4.0f));
+                    sub.sendLevelMonitor.store(readBoundedFloat(*chXml, "sendLevelMonitor", 1.0f, 0.0f, 4.0f));
                 }
             }
         }
+        validateAvailableInputs(getNumAvailableHardwareInputs());
         updateDuplicateWarnings();
     }
 

@@ -259,29 +259,29 @@ MainComponent::MainComponent()
     subBrandLabel.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
     addAndMakeVisible(subBrandLabel);
 
-    audioStatusBadge.setText("[RUNNING]", juce::dontSendNotification);
+    audioStatusBadge.setText("● Audio Initializing", juce::dontSendNotification);
     audioStatusBadge.setFont(juce::FontOptions(11.0f, juce::Font::bold));
-    audioStatusBadge.setColour(juce::Label::textColourId, juce::Colour(0xff10b981));
-    audioStatusBadge.setColour(juce::Label::backgroundColourId, juce::Colour(0x2210b981));
+    audioStatusBadge.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
+    audioStatusBadge.setColour(juce::Label::backgroundColourId, juce::Colour(0x222f3b52));
     audioStatusBadge.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(audioStatusBadge);
 
-    devicePillLabel.setText("Device: Focusrite USB ASIO", juce::dontSendNotification);
+    devicePillLabel.setText("Device: pending", juce::dontSendNotification);
     devicePillLabel.setFont(juce::FontOptions(11.0f));
     devicePillLabel.setColour(juce::Label::textColourId, juce::Colour(0xffcbd5e1));
     addAndMakeVisible(devicePillLabel);
 
-    srPillLabel.setText("SR: 48.0 kHz", juce::dontSendNotification);
+    srPillLabel.setText("SR: --", juce::dontSendNotification);
     srPillLabel.setFont(juce::FontOptions(11.0f));
     srPillLabel.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
     addAndMakeVisible(srPillLabel);
 
-    bufferPillLabel.setText("Buffer: 128", juce::dontSendNotification);
+    bufferPillLabel.setText("Buffer: --", juce::dontSendNotification);
     bufferPillLabel.setFont(juce::FontOptions(11.0f));
     bufferPillLabel.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
     addAndMakeVisible(bufferPillLabel);
 
-    cpuPillLabel.setText("CPU 3.2%", juce::dontSendNotification);
+    cpuPillLabel.setText("CPU --", juce::dontSendNotification);
     cpuPillLabel.setFont(juce::FontOptions(11.0f));
     cpuPillLabel.setColour(juce::Label::textColourId, juce::Colour(0xff10b981));
     addAndMakeVisible(cpuPillLabel);
@@ -299,12 +299,17 @@ MainComponent::MainComponent()
         addAndMakeVisible(btn);
     };
     setupTopBtn(topScenesBtn, TabScenes);
+    topScenesBtn.setTooltip("Manajemen Scene: Simpan dan muat konfigurasi mixing secara instan.");
     setupTopBtn(topPresetsBtn, TabScenes);
+    topPresetsBtn.setTooltip("Preset Audio: Pilih preset siap pakai untuk vokal, musik, podcast, atau live.");
     setupTopBtn(topMidiBtn, TabMIDI);
+    topMidiBtn.setTooltip("Pengaturan MIDI: Konfigurasi kontroler MIDI eksternal dan fader motorik.");
     setupTopBtn(topObsBtn, TabOBS);
+    topObsBtn.setTooltip("Integrasi OBS: Sinkronisasi status audio, mute, dan volume dengan OBS Studio.");
     setupTopBtn(topSettingsBtn, TabSettings);
+    topSettingsBtn.setTooltip("Pengaturan Audio: Konfigurasi driver soundcard, buffer size, dan sample rate.");
 
-    // Nav Tab Buttons (Left Sidebar - exactly 13 items + OBS)
+    // Nav Tab Buttons
     const juce::String sidebarNames[] = {
         "Mixer",
         "Routing",
@@ -322,9 +327,27 @@ MainComponent::MainComponent()
         "OBS",
         "YouTube"
     };
+    const juce::String sidebarTooltips[] = {
+        "Konsol Mixer Utama: Fader volume, Gain, Pan, Mute, Solo, dan Metering.",
+        "Routing Matrix: Hubungkan hardware input/output, Virtual Audio Cable, AUX send, dan Submix.",
+        "DSP Studio: Rak prosesor vokal (HPF, Noise Gate, EQ, Compressor, Reverb, Delay).",
+        "VST3 Host: Muat dan kelola plugin VST3 eksternal (Alesis, Vocal FX Pro, RNNoise).",
+        "Auto Ducking: Otomatis kecilkan volume musik saat pembicara/penyanyi berbicara.",
+        "Audio Safety: Brickwall Limiter, pencegah clipping, proteksi telinga, dan Emergency Mute.",
+        "Macro Engine: Kontrol beberapa parameter sekaligus dengan satu tombol/fader.",
+        "Playback: Pemutar file audio lokal dengan tampilan waveform dan pitch/tempo adjustment.",
+        "Scene Snapshot: Simpan dan panggil seluruh setting mixer dalam hitungan detik.",
+        "Device Supervisor: Pantau status koneksi perangkat audio dan deteksi diskoneksi USB.",
+        "MIDI Learn: Petakan knob & fader kontroler hardware ke parameter mixer secara interaktif.",
+        "Audio Settings: Pilih driver ASIO / WASAPI, buffer frame, dan routing output speaker/stream.",
+        "Diagnostik & Performa: Pantau latensi, beban CPU DSP, dan riwayat dropout audio.",
+        "OBS Studio Bridge: Integrasi websocket dua arah dengan software streaming OBS.",
+        "YouTube Player: Putar audio YouTube langsung sebagai input channel mixer secara real-time."
+    };
     for (int t = 0; t < NumTabs; ++t)
     {
         navTabButtons[t].setButtonText(sidebarNames[t]);
+        navTabButtons[t].setTooltip(sidebarTooltips[t]);
         navTabButtons[t].addListener(this);
         navTabButtons[t].setClickingTogglesState(false);
         addAndMakeVisible(navTabButtons[t]);
@@ -440,6 +463,7 @@ MainComponent::MainComponent()
                 state.inputSource.store(LiveBus::ChannelInputSource::Hardware);
                 state.hardwareInputChannel.store(id - 1);
             }
+            routingMatrix.validateAvailableInputs(routingMatrix.getNumAvailableHardwareInputs());
             routingMatrix.updateDuplicateWarnings();
             if (i < 4 && matrixSourceCombos[i].getSelectedId() != id)
                 matrixSourceCombos[i].setSelectedId(id, juce::dontSendNotification);
@@ -453,6 +477,7 @@ MainComponent::MainComponent()
         double defFaderDb = (i < 4 ? defaultFaderDbs[i % 4] : 0.0);
         ch.faderSlider.setValue(defFaderDb);
         ch.faderSlider.setColour(juce::Slider::thumbColourId, juce::Colour(0xfff8fafc));
+        ch.faderSlider.setTooltip("Fader Volume Channel " + juce::String(i + 1) + ": Atur level volume keluaran (-60 dB s/d +12 dB).");
         ch.faderSlider.onValueChange = [this, i]() {
             float db = (float)inputUIs[i].faderSlider.getValue();
             routingMatrix.getChannel(i).gain.store(juce::Decibels::decibelsToGain(db));
@@ -465,6 +490,7 @@ MainComponent::MainComponent()
         ch.faderValueLabel.setJustificationType(juce::Justification::centred);
         ch.faderValueLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff121721));
         ch.faderValueLabel.setColour(juce::Label::textColourId, juce::Colour(0xfff1f5f9));
+        ch.faderValueLabel.setTooltip("Nilai fader saat ini dalam decibel (dB).");
         addAndMakeVisible(ch.faderValueLabel);
 
         // Rotary Gain Knob
@@ -474,6 +500,7 @@ MainComponent::MainComponent()
         double defGainDb = (i < 4 ? defaultGainDbs[i % 4] : 0.0);
         ch.gainSlider.setValue(defGainDb);
         ch.gainSlider.setColour(juce::Slider::rotarySliderFillColourId, defaultChannelAccent(i));
+        ch.gainSlider.setTooltip("Gain Preamp Channel " + juce::String(i + 1) + ": Atur sensitivitas input (-24 dB s/d +24 dB).");
         ch.gainSlider.onValueChange = [this, i]() {
             float db = (float)inputUIs[i].gainSlider.getValue();
             channelDSPs[i].params.masterGain.store(juce::Decibels::decibelsToGain(db));
@@ -493,6 +520,7 @@ MainComponent::MainComponent()
         double defPan = (i < 4 ? defaultPans[i % 4] : 0.0);
         ch.panSlider.setValue(defPan);
         ch.panSlider.setColour(juce::Slider::rotarySliderFillColourId, defaultChannelAccent(i));
+        ch.panSlider.setTooltip("Pan Potensio: Atur keseimbangan stereo (Kiri - Tengah - Kanan).");
         ch.panSlider.onValueChange = [this, i]() {
             float p = (float)inputUIs[i].panSlider.getValue();
             routingMatrix.getChannel(i).pan.store(p);
@@ -513,6 +541,7 @@ MainComponent::MainComponent()
         // Channel Strip Buttons: Mute, Solo, Link, Bottom Pill
         ch.muteBtn.setClickingTogglesState(true);
         ch.muteBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffef4444));
+        ch.muteBtn.setTooltip("Mute (M): Senyapkan suara channel ini secara instan.");
         ch.muteBtn.onClick = [this, i]() {
             routingMatrix.getChannel(i).mute.store(inputUIs[i].muteBtn.getToggleState());
         };
@@ -520,6 +549,7 @@ MainComponent::MainComponent()
 
         ch.soloBtn.setClickingTogglesState(true);
         ch.soloBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffeab308));
+        ch.soloBtn.setTooltip("Solo (S): Hanya dengarkan channel ini (otomatis senyapkan channel lain).");
         ch.soloBtn.onClick = [this, i]() {
             routingMatrix.getChannel(i).solo.store(inputUIs[i].soloBtn.getToggleState());
         };
@@ -527,8 +557,10 @@ MainComponent::MainComponent()
 
         ch.linkBtn.setClickingTogglesState(true);
         ch.linkBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff06b6d4));
+        ch.linkBtn.setTooltip("Stereo Link: Gabungkan channel ini dengan channel sebelahnya sebagai pasangan stereo (L/R).");
         ch.linkBtn.onClick = [this, i]() {
-            routingMatrix.getChannel(i).stereoMode.store(inputUIs[i].linkBtn.getToggleState() ? LiveBus::ChannelStereoMode::StereoPair : LiveBus::ChannelStereoMode::Mono);
+            routingMatrix.setChannelStereoMode(i, inputUIs[i].linkBtn.getToggleState()
+                ? LiveBus::ChannelStereoMode::StereoPair : LiveBus::ChannelStereoMode::Mono);
         };
         ch.linkBtn.setButtonText("Link");
         addAndMakeVisible(ch.linkBtn);
@@ -542,7 +574,7 @@ MainComponent::MainComponent()
         ch.outputRouteCombo.addItem("Sub 2 BGM", 6);
         ch.outputRouteCombo.addItem("Sub 3 Inst", 7);
         ch.outputRouteCombo.addItem("Sub 4 Aux", 8);
-        ch.outputRouteCombo.setTooltip("Choose the channel output bus or route it through a submix");
+        ch.outputRouteCombo.setTooltip("Routing Bus: Pilih tujuan kirim channel (Stream, Monitor, atau Submix Group).");
         ch.outputRouteCombo.onChange = [this, i]() {
             const int selectedId = inputUIs[(size_t)i].outputRouteCombo.getSelectedId();
             if (selectedId >= 1 && selectedId <= 4)
@@ -655,6 +687,7 @@ MainComponent::MainComponent()
     masterUIs[0].masterFader.setRange(-60.0, 12.0, 0.1);
     masterUIs[0].masterFader.setValue(0.0);
     masterUIs[0].masterFader.setColour(juce::Slider::thumbColourId, juce::Colour(0xfff8fafc));
+    masterUIs[0].masterFader.setTooltip("Master Stream Fader: Mengatur volume akhir yang dikirim ke penonton / software streaming (OBS/vMix/YouTube).");
     masterUIs[0].masterFader.onValueChange = [this]() {
         float db = (float)masterUIs[0].masterFader.getValue();
         busProcessors[0].params.masterGain.store(juce::Decibels::decibelsToGain(db));
@@ -667,10 +700,12 @@ MainComponent::MainComponent()
     masterUIs[0].faderValueLabel.setJustificationType(juce::Justification::centred);
     masterUIs[0].faderValueLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff121721));
     masterUIs[0].faderValueLabel.setColour(juce::Label::textColourId, juce::Colour(0xfff1f5f9));
+    masterUIs[0].faderValueLabel.setTooltip("Nilai fader Stream Bus (dB).");
     addAndMakeVisible(masterUIs[0].faderValueLabel);
 
     masterUIs[0].muteBtn.setClickingTogglesState(true);
     masterUIs[0].muteBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffef4444));
+    masterUIs[0].muteBtn.setTooltip("Mute Stream: Senyapkan seluruh siaran streaming secara instan.");
     masterUIs[0].muteBtn.onClick = [this]() {
         busProcessors[0].params.masterMute.store(masterUIs[0].muteBtn.getToggleState());
     };
@@ -678,16 +713,18 @@ MainComponent::MainComponent()
 
     masterUIs[0].linkBtn.setClickingTogglesState(true);
     masterUIs[0].linkBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffa855f7));
+    masterUIs[0].linkBtn.setTooltip("Link Stream Bus: Mengunci fader kiri dan kanan.");
     masterUIs[0].linkBtn.setButtonText("Link");
     addAndMakeVisible(masterUIs[0].linkBtn);
 
     masterUIs[0].bottomPillBtn.setButtonText("Stream");
     masterUIs[0].bottomPillBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff161e2e));
+    masterUIs[0].bottomPillBtn.setTooltip("Pilih Stream Bus untuk tuning DSP / EQ.");
     masterUIs[0].bottomPillBtn.onClick = [this]() { selectDSPTarget(maxInputs); };
     addAndMakeVisible(masterUIs[0].bottomPillBtn);
 
     masterUIs[0].dspSelectBtn.setButtonText("FX");
-    masterUIs[0].dspSelectBtn.setTooltip("Left-click: open insert rack. Right-click: quick bypass controls.");
+    masterUIs[0].dspSelectBtn.setTooltip("Left-click: Buka rak VST FX Stream Bus. Right-click: Menu bypass cepat.");
     masterUIs[0].dspSelectBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff4c1d95));
     masterUIs[0].dspSelectBtn.onContextMenu = [this]() {
         showFxChainMenu(maxInputs, masterUIs[0].dspSelectBtn);
@@ -716,6 +753,7 @@ MainComponent::MainComponent()
     masterUIs[1].masterFader.setRange(-60.0, 12.0, 0.1);
     masterUIs[1].masterFader.setValue(0.0);
     masterUIs[1].masterFader.setColour(juce::Slider::thumbColourId, juce::Colour(0xfff8fafc));
+    masterUIs[1].masterFader.setTooltip("Master Monitor Fader: Mengatur volume headphone / speaker monitor audio Anda sendiri.");
     masterUIs[1].masterFader.onValueChange = [this]() {
         float db = (float)masterUIs[1].masterFader.getValue();
         busProcessors[1].params.masterGain.store(juce::Decibels::decibelsToGain(db));
@@ -728,10 +766,12 @@ MainComponent::MainComponent()
     masterUIs[1].faderValueLabel.setJustificationType(juce::Justification::centred);
     masterUIs[1].faderValueLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff121721));
     masterUIs[1].faderValueLabel.setColour(juce::Label::textColourId, juce::Colour(0xfff1f5f9));
+    masterUIs[1].faderValueLabel.setTooltip("Nilai fader Monitor Bus (dB).");
     addAndMakeVisible(masterUIs[1].faderValueLabel);
 
     masterUIs[1].muteBtn.setClickingTogglesState(true);
     masterUIs[1].muteBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffef4444));
+    masterUIs[1].muteBtn.setTooltip("Mute Monitor: Senyapkan speaker headphone Anda tanpa mempengaruhi suara di streaming.");
     masterUIs[1].muteBtn.onClick = [this]() {
         busProcessors[1].params.masterMute.store(masterUIs[1].muteBtn.getToggleState());
     };
@@ -739,16 +779,18 @@ MainComponent::MainComponent()
 
     masterUIs[1].linkBtn.setClickingTogglesState(true);
     masterUIs[1].linkBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff06b6d4));
+    masterUIs[1].linkBtn.setTooltip("Link Monitor Bus: Mengunci fader headphone kiri dan kanan.");
     masterUIs[1].linkBtn.setButtonText("Link");
     addAndMakeVisible(masterUIs[1].linkBtn);
 
     masterUIs[1].bottomPillBtn.setButtonText("Monitor");
     masterUIs[1].bottomPillBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff161e2e));
+    masterUIs[1].bottomPillBtn.setTooltip("Pilih Monitor Bus untuk tuning DSP / Graphic EQ.");
     masterUIs[1].bottomPillBtn.onClick = [this]() { selectDSPTarget(maxInputs + 1); };
     addAndMakeVisible(masterUIs[1].bottomPillBtn);
 
     masterUIs[1].dspSelectBtn.setButtonText("FX");
-    masterUIs[1].dspSelectBtn.setTooltip("Left-click: open insert rack. Right-click: quick bypass controls.");
+    masterUIs[1].dspSelectBtn.setTooltip("Left-click: Buka rak VST FX Monitor Bus. Right-click: Menu bypass cepat.");
     masterUIs[1].dspSelectBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff164e63));
     masterUIs[1].dspSelectBtn.onContextMenu = [this]() {
         showFxChainMenu(maxInputs + 1, masterUIs[1].dspSelectBtn);
@@ -873,62 +915,91 @@ MainComponent::MainComponent()
 
     // HPF
     hpfToggle.setToggleState(true, juce::dontSendNotification);
+    hpfToggle.setTooltip("High-Pass Filter (Low-Cut): Potong frekuensi rendah/gemuruh yang tidak diinginkan.");
     hpfToggle.onClick = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(hpfToggle);
     setupDspKnob(hpfFreqSlider, 20.0, 500.0, 80.0, juce::Colour(0xff10b981));
+    hpfFreqSlider.setTooltip("Frekuensi Cutoff HPF (Hz): Rekomendasi 80 Hz untuk vokal agar suara lebih jernih dan bebas dengung.");
     hpfSlopeCombo.addItem("12 dB/Oct", 1);
     hpfSlopeCombo.addItem("24 dB/Oct", 2);
     hpfSlopeCombo.setSelectedId(2, juce::dontSendNotification);
+    hpfSlopeCombo.setTooltip("Kemiringan Filter HPF: 12 dB/Oct (landai) atau 24 dB/Oct (curam/tajam).");
     hpfSlopeCombo.onChange = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(hpfSlopeCombo);
 
     // Noise Gate
     gateToggle.setToggleState(false, juce::dontSendNotification);
+    gateToggle.setTooltip("Noise Gate: Redam desis/suara latar ruangan saat pembicara atau penyanyi sedang diam.");
     gateToggle.onClick = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(gateToggle);
     setupDspKnob(gateThreshSlider, -80.0, 0.0, -40.0, juce::Colour(0xffef4444));
+    gateThreshSlider.setTooltip("Gate Threshold (dB): Level di bawah batas ini akan diredam.");
     setupDspKnob(gateAttackSlider, 0.1, 100.0, 10.0, juce::Colour(0xffef4444));
+    gateAttackSlider.setTooltip("Gate Attack (ms): Kecepatan membuka gerbang suara saat mulai ada sinyal audio.");
     setupDspKnob(gateHoldSlider, 0.0, 500.0, 100.0, juce::Colour(0xffef4444));
+    gateHoldSlider.setTooltip("Gate Hold (ms): Durasi gerbang tetap terbuka sebelum mulai meredam.");
     setupDspKnob(gateReleaseSlider, 10.0, 1000.0, 200.0, juce::Colour(0xffef4444));
+    gateReleaseSlider.setTooltip("Gate Release (ms): Kecepatan menutup gerbang audio agar tidak patah tiba-tiba.");
     gateRatioSlider.setRange(1.0, 20.0, 0.1);
     gateRatioSlider.setValue(4.0);
+    gateRatioSlider.setTooltip("Gate Ratio: Tingkat peredaman ketika gerbang tertutup.");
 
     // Compressor
     compToggle.setToggleState(true, juce::dontSendNotification);
+    compToggle.setTooltip("Compressor: Meratakan dinamika suara, menstabilkan bisikan dan teriakan.");
     compToggle.onClick = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(compToggle);
     setupDspKnob(compThreshSlider, -60.0, 0.0, -18.0, juce::Colour(0xfff59e0b));
+    compThreshSlider.setTooltip("Compressor Threshold (dB): Batas level di mana kompresi mulai bekerja.");
     setupDspKnob(compRatioSlider, 1.0, 20.0, 3.0, juce::Colour(0xfff59e0b));
+    compRatioSlider.setTooltip("Compressor Ratio: Perbandingan kompresi (misal 3:1 atau 4:1 untuk vokal broadcast pro).");
     setupDspKnob(compAttackSlider, 0.1, 100.0, 10.0, juce::Colour(0xfff59e0b));
+    compAttackSlider.setTooltip("Compressor Attack (ms): Kecepatan kompresor menekan transien suara.");
     setupDspKnob(compReleaseSlider, 10.0, 1000.0, 150.0, juce::Colour(0xfff59e0b));
+    compReleaseSlider.setTooltip("Compressor Release (ms): Kecepatan kompresor melepaskan kompresi.");
     setupDspKnob(compMakeupSlider, -12.0, 24.0, 4.0, juce::Colour(0xfff59e0b));
+    compMakeupSlider.setTooltip("Makeup Gain (dB): Penguatan kembali sinyal setelah terkompresi.");
 
     // Limiter
     limiterToggle.setToggleState(true, juce::dontSendNotification);
+    limiterToggle.setTooltip("Limiter: Pengaman batas atas audio agar tidak terjadi distorsi digital / clipping.");
     limiterToggle.onClick = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(limiterToggle);
     setupDspKnob(limiterCeilSlider, -20.0, 0.0, -1.0, juce::Colour(0xff8b5cf6));
+    limiterCeilSlider.setTooltip("Limiter Ceiling (dB): Level puncak maksimal (standar streaming: -1.0 dBFS).");
     setupDspKnob(limiterReleaseSlider, 1.0, 500.0, 100.0, juce::Colour(0xff8b5cf6));
+    limiterReleaseSlider.setTooltip("Limiter Release (ms): Waktu pemulihan limiter setelah meredam lonjakan suara.");
 
     // Reverb
     reverbToggle.setToggleState(false, juce::dontSendNotification);
+    reverbToggle.setTooltip("Reverb: Simulasi gema ruangan untuk menambah kedalaman dan kemegahan vokal.");
     reverbToggle.onClick = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(reverbToggle);
     setupDspKnob(reverbRoomSlider, 0.0, 1.0, 0.25, juce::Colour(0xff06b6d4));
+    reverbRoomSlider.setTooltip("Reverb Room Size: Ukuran ruangan gema (kecil studio s/d aula besar).");
     setupDspKnob(reverbDampingSlider, 0.0, 1.0, 0.50, juce::Colour(0xff06b6d4));
+    reverbDampingSlider.setTooltip("Reverb Damping: Peredaman pantulan frekuensi tinggi (suasana gelap atau terang).");
     setupDspKnob(reverbWetSlider, 0.0, 1.0, 0.25, juce::Colour(0xff06b6d4));
+    reverbWetSlider.setTooltip("Reverb Wet Level: Jumlah volume sinyal gema.");
     setupDspKnob(reverbDrySlider, 0.0, 1.0, 1.0, juce::Colour(0xff06b6d4));
+    reverbDrySlider.setTooltip("Reverb Dry Level: Volume sinyal suara asli tanpa gema.");
 
     // Delay
     delayToggle.setToggleState(false, juce::dontSendNotification);
+    delayToggle.setTooltip("Delay / Echo: Efek pengulangan suara berulang dengan tempo teratur.");
     delayToggle.onClick = [this]() { applyDSPControls(selectedTarget); };
     addAndMakeVisible(delayToggle);
     setupDspKnob(delayTimeSlider, 10.0, 1500.0, 350.0, juce::Colour(0xffec4899));
+    delayTimeSlider.setTooltip("Delay Time (ms): Jeda waktu antar pantulan suara.");
     delayTempoBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff161e2e));
+    delayTempoBtn.setTooltip("Sinkronisasi Ketukan Delay (1/4, 1/8 note).");
     addAndMakeVisible(delayTempoBtn);
     setupDspKnob(delayFeedbackSlider, 0.0, 0.90, 0.25, juce::Colour(0xffec4899));
+    delayFeedbackSlider.setTooltip("Delay Feedback: Jumlah pengulangan pantulan sebelum menghilang.");
     setupDspKnob(delayWetSlider, 0.0, 1.0, 0.25, juce::Colour(0xffec4899));
+    delayWetSlider.setTooltip("Delay Wet Level: Volume sinyal pantulan echo.");
     setupDspKnob(delayDrySlider, 0.0, 1.0, 1.0, juce::Colour(0xffec4899));
+    delayDrySlider.setTooltip("Delay Dry Level: Volume sinyal suara asli.");
 
     // Legacy EQ Display
     streamBusDSPTab.addListener(this);
@@ -1036,6 +1107,7 @@ MainComponent::MainComponent()
                 state.inputSource.store(LiveBus::ChannelInputSource::Hardware);
                 state.hardwareInputChannel.store(id - 1);
             }
+            routingMatrix.validateAvailableInputs(routingMatrix.getNumAvailableHardwareInputs());
             routingMatrix.updateDuplicateWarnings();
             if (inputUIs[r].inputSourceCombo.getSelectedId() != id)
                 inputUIs[r].inputSourceCombo.setSelectedId(id, juce::dontSendNotification);
@@ -1045,10 +1117,11 @@ MainComponent::MainComponent()
         // Stereo combo
         matrixStereoCombos[r].addItem("Mono", 1);
         matrixStereoCombos[r].addItem("Stereo Pair", 2);
+        matrixStereoCombos[r].addItem("Dual Mono", 3);
         matrixStereoCombos[r].setSelectedId(1, juce::dontSendNotification);
         matrixStereoCombos[r].onChange = [this, r]() {
             int id = matrixStereoCombos[r].getSelectedId();
-            routingMatrix.getChannel(r).stereoMode.store(static_cast<LiveBus::ChannelStereoMode>(id - 1));
+            routingMatrix.setChannelStereoMode(r, static_cast<LiveBus::ChannelStereoMode>(id - 1));
         };
         addAndMakeVisible(matrixStereoCombos[r]);
 
@@ -1142,6 +1215,7 @@ MainComponent::MainComponent()
 
     duckingEnableToggle.setToggleState(true, juce::dontSendNotification);
     duckingEnableToggle.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff10b981));
+    duckingEnableToggle.setTooltip("Auto Ducking ON/OFF: Otomatis kecilkan musik saat suara vokal terdeteksi.");
     duckingEnableToggle.onClick = [this]() {
         autoDucker.setEnabled(duckingEnableToggle.getToggleState());
     };
@@ -1152,6 +1226,7 @@ MainComponent::MainComponent()
     duckingPresetCombo.addItem("Preset: Aggressive Voiceover", 3);
     duckingPresetCombo.addItem("Preset: Sidechain Pump", 4);
     duckingPresetCombo.setSelectedId(1, juce::dontSendNotification);
+    duckingPresetCombo.setTooltip("Preset Auto Ducking: Pilih gaya pengecilan musik otomatis sesuai kebutuhan siaran.");
     duckingPresetCombo.onChange = [this]() {
         int id = duckingPresetCombo.getSelectedId();
         auto presets = LiveBus::AutoDucker::getFactoryPresets();
@@ -1234,6 +1309,7 @@ MainComponent::MainComponent()
     addAndMakeVisible(safetyHeaderLabel);
 
     safetyStreamLimiterToggle.setToggleState(true, juce::dontSendNotification);
+    safetyStreamLimiterToggle.setTooltip("Stream Brickwall Limiter: Pastikan audio streaming tidak pernah melampaui batas ceiling dan mencegah distorsi.");
     safetyStreamLimiterToggle.onClick = [this]() { audioSafetyProcessor.setStreamLimiterEnabled(safetyStreamLimiterToggle.getToggleState()); };
     addAndMakeVisible(safetyStreamLimiterToggle);
 
@@ -1241,6 +1317,7 @@ MainComponent::MainComponent()
     safetyStreamCeilingSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 48, 14);
     safetyStreamCeilingSlider.setRange(-20.0, 0.0, 0.1);
     safetyStreamCeilingSlider.setValue(-1.0);
+    safetyStreamCeilingSlider.setTooltip("Stream Ceiling (dB): Batas puncak audio streaming (misal -1.0 dBFS).");
     safetyStreamCeilingSlider.onValueChange = [this]() { audioSafetyProcessor.setStreamCeilingDb((float)safetyStreamCeilingSlider.getValue()); };
     addAndMakeVisible(safetyStreamCeilingSlider);
 
@@ -1248,10 +1325,12 @@ MainComponent::MainComponent()
     safetyStreamReleaseSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 48, 14);
     safetyStreamReleaseSlider.setRange(10.0, 500.0, 1.0);
     safetyStreamReleaseSlider.setValue(100.0);
+    safetyStreamReleaseSlider.setTooltip("Stream Limiter Release (ms): Kecepatan pemulihan limiter stream.");
     safetyStreamReleaseSlider.onValueChange = [this]() { audioSafetyProcessor.setStreamReleaseMs((float)safetyStreamReleaseSlider.getValue()); };
     addAndMakeVisible(safetyStreamReleaseSlider);
 
     safetyMonitorLimiterToggle.setToggleState(true, juce::dontSendNotification);
+    safetyMonitorLimiterToggle.setTooltip("Monitor Ear Protection Limiter: Melindungi pendengaran Anda dari letupan volume tiba-tiba di headphone.");
     safetyMonitorLimiterToggle.onClick = [this]() { audioSafetyProcessor.setMonitorLimiterEnabled(safetyMonitorLimiterToggle.getToggleState()); };
     addAndMakeVisible(safetyMonitorLimiterToggle);
 
@@ -1259,6 +1338,7 @@ MainComponent::MainComponent()
     safetyMonitorCeilingSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 48, 14);
     safetyMonitorCeilingSlider.setRange(-20.0, 0.0, 0.1);
     safetyMonitorCeilingSlider.setValue(-1.0);
+    safetyMonitorCeilingSlider.setTooltip("Monitor Ceiling (dB): Batas kenyamanan volume headphone.");
     safetyMonitorCeilingSlider.onValueChange = [this]() { audioSafetyProcessor.setMonitorCeilingDb((float)safetyMonitorCeilingSlider.getValue()); };
     addAndMakeVisible(safetyMonitorCeilingSlider);
 
@@ -1266,6 +1346,7 @@ MainComponent::MainComponent()
     safetyMonitorReleaseSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 48, 14);
     safetyMonitorReleaseSlider.setRange(10.0, 500.0, 1.0);
     safetyMonitorReleaseSlider.setValue(100.0);
+    safetyMonitorReleaseSlider.setTooltip("Monitor Limiter Release (ms): Waktu rilis limiter headphone.");
     safetyMonitorReleaseSlider.onValueChange = [this]() { audioSafetyProcessor.setMonitorReleaseMs((float)safetyMonitorReleaseSlider.getValue()); };
     addAndMakeVisible(safetyMonitorReleaseSlider);
 
@@ -1275,6 +1356,7 @@ MainComponent::MainComponent()
 
     safetyResetPeakBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff271014));
     safetyResetPeakBtn.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff87171));
+    safetyResetPeakBtn.setTooltip("Reset Peak: Bersihkan indikator peringatan klip puncak merah.");
     safetyResetPeakBtn.onClick = [this]() { audioSafetyProcessor.resetClipWarnings(); };
     addAndMakeVisible(safetyResetPeakBtn);
 
@@ -1295,11 +1377,13 @@ MainComponent::MainComponent()
     addAndMakeVisible(safetyRoutingCheckBadge);
 
     safetyRoutingSettingsBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff1e293b));
+    safetyRoutingSettingsBtn.setTooltip("Buka halaman matriks routing.");
     safetyRoutingSettingsBtn.onClick = [this]() { currentTab = TabRouting; resized(); repaint(); };
     addAndMakeVisible(safetyRoutingSettingsBtn);
 
     safetyEmergencyMuteBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffb91c1c));
     safetyEmergencyMuteBtn.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffffffff));
+    safetyEmergencyMuteBtn.setTooltip("EMERGENCY MUTE: Matikan seketika seluruh suara jika terjadi dengung feedback keras atau insiden siaran!");
     safetyEmergencyMuteBtn.onClick = [this]() {
         if (audioSafetyProcessor.getEmergencyMuteMode() != LiveBus::EmergencyMuteMode::None)
             audioSafetyProcessor.unmuteAll();
@@ -1349,10 +1433,8 @@ MainComponent::MainComponent()
     addPluginBtn.addListener(this);
     addAndMakeVisible(addPluginBtn);
     bypassAllPluginsBtn.addListener(this);
+    bypassAllPluginsBtn.setEnabled(false);
     addAndMakeVisible(bypassAllPluginsBtn);
-
-    const char* defaultPlugins[] = { "FabFilter Pro-Q 3", "FabFilter Pro-C 2", "ValhallaVintageVerb" };
-    const char* defaultCats[] = { "Equalizer", "Compressor", "Reverb" };
 
     for (int p = 0; p < 3; ++p)
     {
@@ -1363,35 +1445,29 @@ MainComponent::MainComponent()
         row.indexLabel.setText(juce::String(p + 1), juce::dontSendNotification);
         addAndMakeVisible(row.indexLabel);
 
-        row.nameLabel.setText(defaultPlugins[p], juce::dontSendNotification);
+        row.nameLabel.setText("No Plugin Loaded", juce::dontSendNotification);
         row.nameLabel.setFont(juce::FontOptions(11.0f, juce::Font::bold));
         addAndMakeVisible(row.nameLabel);
 
-        row.categoryLabel.setText(defaultCats[p], juce::dontSendNotification);
+        row.categoryLabel.setText("Audio Effect", juce::dontSendNotification);
         row.categoryLabel.setFont(juce::FontOptions(10.0f));
         row.categoryLabel.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
         addAndMakeVisible(row.categoryLabel);
 
-        row.statusBadge.setText(p < 2 ? "Active" : "Bypassed", juce::dontSendNotification);
+        row.statusBadge.setText("Not loaded", juce::dontSendNotification);
         row.statusBadge.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-        row.statusBadge.setColour(juce::Label::textColourId, p < 2 ? juce::Colour(0xff10b981) : juce::Colour(0xffffb703));
-        row.statusBadge.setColour(juce::Label::backgroundColourId, p < 2 ? juce::Colour(0x2210b981) : juce::Colour(0x22ffb703));
+        row.statusBadge.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
+        row.statusBadge.setColour(juce::Label::backgroundColourId, juce::Colour(0x222f3b52));
         row.statusBadge.setJustificationType(juce::Justification::centred);
         addAndMakeVisible(row.statusBadge);
 
         row.configBtn.addListener(this);
+        row.configBtn.setEnabled(false);
         addAndMakeVisible(row.configBtn);
 
         row.bypassBtn.setClickingTogglesState(true);
-        row.bypassBtn.setToggleState(p == 2, juce::dontSendNotification);
+        row.bypassBtn.setEnabled(false);
         row.bypassBtn.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffffb703));
-        row.bypassBtn.onClick = [this, p]() {
-            bool bypassed = pluginSlotRows[p].bypassBtn.getToggleState();
-            pluginSlotRows[p].statusBadge.setText(bypassed ? "Bypassed" : "Active", juce::dontSendNotification);
-            pluginSlotRows[p].statusBadge.setColour(juce::Label::textColourId, bypassed ? juce::Colour(0xffffb703) : juce::Colour(0xff10b981));
-            pluginSlotRows[p].statusBadge.setColour(juce::Label::backgroundColourId, bypassed ? juce::Colour(0x22ffb703) : juce::Colour(0x2210b981));
-            log("Plugin " + pluginSlotRows[p].nameLabel.getText() + (bypassed ? " bypassed" : " activated"));
-        };
         addAndMakeVisible(row.bypassBtn);
     }
 
@@ -1515,7 +1591,7 @@ MainComponent::MainComponent()
 
         if (puzuDSPComponent)
         {
-            puzuDSPComponent->setSelectedBus(targetIndex == maxInputs + 1 ? 1 : 0);
+            puzuDSPComponent->setSelectedTarget(targetIndex);
             puzuDSPComponent->updateUIFromProcessor();
         }
     };
@@ -1523,18 +1599,51 @@ MainComponent::MainComponent()
 
     dspPuzuEQToggleBtn.addListener(this);
     addChildComponent(dspPuzuEQToggleBtn);
+    monitorGraphicEQToggleBtn.addListener(this);
+    addChildComponent(monitorGraphicEQToggleBtn);
+    mainOutputEQToggleBtn.addListener(this);
+    addChildComponent(mainOutputEQToggleBtn);
 
-    puzuDSPComponent = std::make_unique<PuzuDSPComponent>(busProcessors);
+    std::array<BusDSPProcessor*, maxInputs + 2> puzuTargets{};
+    for (int channel = 0; channel < maxInputs; ++channel)
+        puzuTargets[(size_t)channel] = &channelDSPs[(size_t)channel];
+    puzuTargets[(size_t)maxInputs] = &busProcessors[0];
+    puzuTargets[(size_t)(maxInputs + 1)] = &busProcessors[1];
+    puzuDSPComponent = std::make_unique<PuzuDSPComponent>(puzuTargets,
+                                                         presetManager);
+    puzuDSPComponent->onTargetSelected = [this](int target) { selectDSPTarget(target); };
     addChildComponent(puzuDSPComponent.get());
+
+    monitorGraphicEQComponent =
+        std::make_unique<MonitorGraphicEQComponent>(busProcessors[1],
+                                                    presetManager);
+    addChildComponent(monitorGraphicEQComponent.get());
+    mainOutputEQComponent =
+        std::make_unique<MainOutputEQComponent>(busProcessors[0],
+                                                presetManager);
+    addChildComponent(mainOutputEQComponent.get());
 
     std::array<BusDSPProcessor*, LiveBus::EightBandEQComponent::NumTargets> dspTargets{};
     for (int channel = 0; channel < maxInputs; ++channel)
         dspTargets[(size_t)channel] = &channelDSPs[(size_t)channel];
     dspTargets[(size_t)maxInputs] = &busProcessors[0];
     dspTargets[(size_t)(maxInputs + 1)] = &busProcessors[1];
-    eightBandEQComponent = std::make_unique<LiveBus::EightBandEQComponent>(dspTargets);
+    eightBandEQComponent = std::make_unique<LiveBus::EightBandEQComponent>(
+        dspTargets, &presetManager);
     eightBandEQComponent->onTargetSelected = [this](LiveBus::EightBandEQComponent::TargetIndex target) {
         selectDSPTarget((int)target);
+    };
+    eightBandEQComponent->onParametersChanged = [this](LiveBus::EightBandEQComponent::TargetIndex target) {
+        updateDSPControlsFromTarget((int)target);
+        if (routingMatrixComponent)
+            routingMatrixComponent->refreshRoutingGraph();
+        if (vocalDSPRackComponent)
+            vocalDSPRackComponent->updateUIFromProcessor();
+        if (puzuDSPComponent)
+            puzuDSPComponent->updateUIFromProcessor();
+        if (eqCurveDisplay)
+            eqCurveDisplay->repaint();
+        markUnsavedChanges();
     };
     addChildComponent(eightBandEQComponent.get());
 
@@ -1546,6 +1655,18 @@ MainComponent::MainComponent()
     vocalDSPRackComponent = std::make_unique<LiveBus::VocalDSPRackComponent>(vocalTargets);
     vocalDSPRackComponent->onTargetSelected = [this](LiveBus::VocalDSPRackComponent::TargetIndex target) {
         selectDSPTarget((int)target);
+    };
+    vocalDSPRackComponent->onParametersChanged = [this](LiveBus::VocalDSPRackComponent::TargetIndex target) {
+        updateDSPControlsFromTarget((int)target);
+        if (routingMatrixComponent)
+            routingMatrixComponent->refreshRoutingGraph();
+        if (eightBandEQComponent)
+            eightBandEQComponent->updateUIFromProcessor();
+        if (puzuDSPComponent)
+            puzuDSPComponent->updateUIFromProcessor();
+        if (eqCurveDisplay)
+            eqCurveDisplay->repaint();
+        markUnsavedChanges();
     };
     addChildComponent(vocalDSPRackComponent.get());
 
@@ -1570,7 +1691,7 @@ MainComponent::MainComponent()
         puzuBandSliders[b].onValueChange = [this, b]() {
             auto& proc = getProcessorForTarget(selectedTarget);
             proc.params.puzuBands[b].gainDb.store((float)puzuBandSliders[b].getValue());
-            proc.updateCoefficients();
+            proc.updatePuzuCoefficients();
             if (eqCurveDisplay) eqCurveDisplay->repaint();
         };
         addChildComponent(puzuBandSliders[b]);
@@ -1583,10 +1704,10 @@ MainComponent::MainComponent()
     effectsPageTitle.setColour(juce::Label::textColourId, juce::Colour(0xff38bdf8));
     addChildComponent(effectsPageTitle);
 
-    helperHostStatusLabel.setText("Helper: LiveBusPluginHost.exe [Active IPC - Named Memory / Events]", juce::dontSendNotification);
+    helperHostStatusLabel.setText("Helper status unavailable", juce::dontSendNotification);
     helperHostStatusLabel.setFont(juce::FontOptions(11.0f));
-    helperHostStatusLabel.setColour(juce::Label::textColourId, juce::Colour(0xff10b981));
-    helperHostStatusLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0x2210b981));
+    helperHostStatusLabel.setColour(juce::Label::textColourId, juce::Colour(0xff94a3b8));
+    helperHostStatusLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0x222f3b52));
     addChildComponent(helperHostStatusLabel);
 
     testWatchdogRecoveryBtn.addListener(this);
@@ -1602,14 +1723,7 @@ MainComponent::MainComponent()
     discoveredPluginsEditor.setMultiLine(true);
     discoveredPluginsEditor.setReadOnly(true);
     discoveredPluginsEditor.setFont(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::plain));
-    discoveredPluginsEditor.setText("Installed & Verified VST3 Plugins:\n"
-                                    "  [1] FabFilter Pro-Q 3       | Equalizer   | FabFilter    | 64-bit | Latency: 0 spl\n"
-                                    "  [2] FabFilter Pro-C 2       | Compressor  | FabFilter    | 64-bit | Latency: 0 spl\n"
-                                    "  [3] ValhallaVintageVerb     | Reverb      | Valhalla DSP | 64-bit | Latency: 0 spl\n"
-                                    "  [4] Tokyo Dawn Kotelnikov   | Compressor  | TDR          | 64-bit | Latency: 0 spl\n"
-                                    "  [5] Youlean Loudness Meter2 | Metering    | Youlean      | 64-bit | Latency: 0 spl\n"
-                                    "  [6] OTT Dynamics Multi-band | Multiband   | Xfer Records | 64-bit | Latency: 0 spl\n"
-                                    "\nStatus: All plugins isolated in helper process LiveBusPluginHost.exe.");
+    discoveredPluginsEditor.setText("Plugin discovery is not connected to this view. No plugins have been verified.");
     addChildComponent(discoveredPluginsEditor);
 
     // =========================================================================
@@ -1637,7 +1751,7 @@ MainComponent::MainComponent()
     addChildComponent(devicesPageTitle);
 
     deviceStatusDetailedLabel.setFont(juce::FontOptions(11.0f));
-    deviceStatusDetailedLabel.setText("Active: Focusrite USB ASIO | Sample Rate: 48000 Hz | Buffer Size: 128 (2.7 ms latency) | Dropouts: 0", juce::dontSendNotification);
+    deviceStatusDetailedLabel.setText("Waiting for audio device telemetry.", juce::dontSendNotification);
     addChildComponent(deviceStatusDetailedLabel);
 
     restartDeviceBtn.addListener(this);
@@ -1802,12 +1916,7 @@ MainComponent::MainComponent()
 
     // Initial Logs
     log("LiveBus Mixer v1.0 started — Professional Broadcast Console initialized.");
-    log("Audio device active: Focusrite USB ASIO (48.0 kHz, 128 samples).");
-    log("Routing: 4 inputs -> Stream (1-2), Monitor (3-4).");
-    log("VST3: Loaded FabFilter Pro-Q 3 (Stream Bus)");
-    log("VST3: Loaded FabFilter Pro-C 2 (Stream Bus)");
-    log("VST3: Added ValhallaVintageVerb (Stream Bus)");
-    log("VST3: ValhallaVintageVerb bypassed");
+    log("Application started; initializing the audio device manager.");
 
     // Audio Engine Setup
     deviceManager.initialiseWithDefaultDevices(4, 4);
@@ -1946,6 +2055,12 @@ MainComponent::MainComponent()
     scenesConsoleComponent->getPresetManagerComponent().onSavePresetFromTarget = [this](LiveBus::PresetCategory cat, int t, const juce::String& name) {
         savePresetFromTarget(cat, t, name);
     };
+    scenesConsoleComponent->getPresetManagerComponent().onCaptureEQPresetFromTarget =
+        [this](int target, LiveBus::EQPresetDefinition& preset,
+               juce::String& error)
+        {
+            return captureEQPresetFromTarget(target, preset, error);
+        };
 
     // =========================================================================
     // OBS Studio Integration Setup
@@ -2039,7 +2154,29 @@ MainComponent::MainComponent()
 
     // Initialize Professional VST3 Plugin Host & Effects Console
     vst3HostEngine = std::make_unique<LiveBus::VST3HostEngine>(pluginHostClient);
+    vst3HostEngine->addChangeListener(this);
     vst3HostEngine->prepareToPlay(currentSampleRate, currentBlockSize);
+    const auto bundledPluginsDir =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+            .getParentDirectory()
+            .getChildFile("Plugins");
+    if (bundledPluginsDir.isDirectory())
+    {
+        for (const auto& bundleEntry : bundledPluginsDir.findChildFiles(juce::File::findDirectories, false, "*.vst3"))
+        {
+            juce::OwnedArray<juce::PluginDescription> bundledPluginTypes;
+            for (int formatIndex = 0;
+                 formatIndex < vst3HostEngine->getFormatManager().getNumFormats();
+                 ++formatIndex)
+            {
+                if (auto* format = vst3HostEngine->getFormatManager().getFormat(formatIndex))
+                    format->findAllTypesForFile(bundledPluginTypes,
+                                                bundleEntry.getFullPathName());
+            }
+            for (const auto* description : bundledPluginTypes)
+                vst3HostEngine->registerBundledPlugin(*description);
+        }
+    }
 
     // Pre-insert demo plugins matching reference if empty
     if (vst3HostEngine->getNumPluginsInTarget(maxInputs) == 0) // Stream Bus
@@ -2273,10 +2410,12 @@ MainComponent::MainComponent()
         [this](int targetIndex, LiveBus::RoutingGraphDSPModule module, bool enabled) {
             auto& processor = getProcessorForTarget(targetIndex);
             auto& params = processor.params;
+            auto& vocalParams = processor.vocalRack.params;
             switch (module)
             {
                 case LiveBus::RoutingGraphDSPModule::HPF:
                     params.hpfEnabled.store(enabled, std::memory_order_relaxed);
+                    vocalParams.hpfBypassed.store(!enabled, std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPModule::LPF:
                     params.lpfEnabled.store(enabled, std::memory_order_relaxed);
@@ -2286,15 +2425,20 @@ MainComponent::MainComponent()
                     break;
                 case LiveBus::RoutingGraphDSPModule::EQ:
                     params.eqEnabled.store(enabled, std::memory_order_relaxed);
+                    vocalParams.eqBypassed.store(!enabled, std::memory_order_relaxed);
+                    processor.eightBandEQ.params.masterEnabled.store(enabled, std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPModule::Gate:
                     params.gateEnabled.store(enabled, std::memory_order_relaxed);
+                    vocalParams.gateBypassed.store(!enabled, std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPModule::Compressor:
                     params.compEnabled.store(enabled, std::memory_order_relaxed);
+                    vocalParams.compBypassed.store(!enabled, std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPModule::Limiter:
                     params.limiterEnabled.store(enabled, std::memory_order_relaxed);
+                    vocalParams.limiterBypassed.store(!enabled, std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPModule::Reverb:
                     params.reverbEnabled.store(enabled, std::memory_order_relaxed);
@@ -2303,6 +2447,7 @@ MainComponent::MainComponent()
                     params.delayEnabled.store(enabled, std::memory_order_relaxed);
                     break;
             }
+            processor.updateCoefficients();
         };
     routingMatrixComponent->dspControlCallbacks.getParameter =
         [this](int targetIndex, LiveBus::RoutingGraphDSPParameter parameter) {
@@ -2332,12 +2477,15 @@ MainComponent::MainComponent()
         [this](int targetIndex, LiveBus::RoutingGraphDSPParameter parameter, float value) {
             auto& processor = getProcessorForTarget(targetIndex);
             auto& params = processor.params;
+            auto& vocalParams = processor.vocalRack.params;
             bool updateCoefficients = false;
             switch (parameter)
             {
                 case LiveBus::RoutingGraphDSPParameter::HPFFrequency:
                     params.hpfFreq.store(juce::jlimit(20.0f, 1000.0f, value),
                                          std::memory_order_relaxed);
+                    vocalParams.hpfFreq.store(juce::jlimit(20.0f, 1000.0f, value),
+                                              std::memory_order_relaxed);
                     updateCoefficients = true;
                     break;
                 case LiveBus::RoutingGraphDSPParameter::LPFFrequency:
@@ -2353,14 +2501,22 @@ MainComponent::MainComponent()
                 case LiveBus::RoutingGraphDSPParameter::GateThreshold:
                     params.gateThresholdDb.store(juce::jlimit(-80.0f, 0.0f, value),
                                                  std::memory_order_relaxed);
+                    vocalParams.gateOpenThresholdDb.store(juce::jlimit(-80.0f, 0.0f, value),
+                                                         std::memory_order_relaxed);
+                    vocalParams.gateCloseThresholdDb.store(juce::jlimit(-80.0f, 0.0f, value - 4.0f),
+                                                          std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPParameter::CompressorThreshold:
                     params.compThresholdDb.store(juce::jlimit(-60.0f, 0.0f, value),
                                                  std::memory_order_relaxed);
+                    vocalParams.compThresholdDb.store(juce::jlimit(-60.0f, 0.0f, value),
+                                                      std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPParameter::LimiterCeiling:
                     params.limiterCeilingDb.store(juce::jlimit(-20.0f, 0.0f, value),
-                                                  std::memory_order_relaxed);
+                                                   std::memory_order_relaxed);
+                    vocalParams.limiterCeilingDb.store(juce::jlimit(-20.0f, 0.0f, value),
+                                                       std::memory_order_relaxed);
                     break;
                 case LiveBus::RoutingGraphDSPParameter::ReverbWet:
                     params.reverbWetLevel.store(juce::jlimit(0.0f, 1.0f, value),
@@ -2379,6 +2535,12 @@ MainComponent::MainComponent()
         if (selectedTarget != targetIndex)
             selectDSPTarget(targetIndex);
         updateDSPControlsFromTarget(targetIndex);
+        if (vocalDSPRackComponent)
+            vocalDSPRackComponent->updateUIFromProcessor();
+        if (eightBandEQComponent)
+            eightBandEQComponent->updateUIFromProcessor();
+        if (puzuDSPComponent)
+            puzuDSPComponent->updateUIFromProcessor();
         if (eqCurveDisplay)
             eqCurveDisplay->repaint();
         markUnsavedChanges();
@@ -2499,6 +2661,8 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 {
     stopTimer();
+    if (vst3HostEngine != nullptr)
+        vst3HostEngine->removeChangeListener(this);
     deviceManager.removeAudioCallback(this);
     deviceManager.removeChangeListener(this);
     stopStreamRecording();
@@ -2809,12 +2973,20 @@ void MainComponent::audioDeviceIOCallbackWithContext(const float* const* inputCh
         }
         else if (src == LiveBus::ChannelInputSource::Hardware)
         {
-            if (hwCh >= 0 && hwCh < numInputChannels && inputChannelData[hwCh] != nullptr)
+            if (hardwareInputRangeIsAvailable(hwCh, stMode, numInputChannels) &&
+                inputChannelData[hwCh] != nullptr)
             {
-                if (stMode == LiveBus::ChannelStereoMode::StereoPair && (hwCh + 1) < numInputChannels && inputChannelData[hwCh + 1] != nullptr)
+                if (stMode == LiveBus::ChannelStereoMode::StereoPair)
                 {
-                    channelBuffers[ch].copyFrom(0, 0, inputChannelData[hwCh], numSamples);
-                    channelBuffers[ch].copyFrom(1, 0, inputChannelData[hwCh + 1], numSamples);
+                    if (inputChannelData[hwCh + 1] != nullptr)
+                    {
+                        channelBuffers[ch].copyFrom(0, 0, inputChannelData[hwCh], numSamples);
+                        channelBuffers[ch].copyFrom(1, 0, inputChannelData[hwCh + 1], numSamples);
+                    }
+                    else
+                    {
+                        channelBuffers[ch].clear();
+                    }
                 }
                 else
                 {
@@ -2829,28 +3001,7 @@ void MainComponent::audioDeviceIOCallbackWithContext(const float* const* inputCh
         }
         else if (src == LiveBus::ChannelInputSource::Playback)
         {
-            if (pbCh == 0) // Left
-            {
-                channelBuffers[ch].copyFrom(0, 0, routingPlaybackBuffer, 0, 0, numSamples);
-                channelBuffers[ch].copyFrom(1, 0, routingPlaybackBuffer, 0, 0, numSamples);
-            }
-            else if (pbCh == 1) // Right
-            {
-                channelBuffers[ch].copyFrom(0, 0, routingPlaybackBuffer, 1, 0, numSamples);
-                channelBuffers[ch].copyFrom(1, 0, routingPlaybackBuffer, 1, 0, numSamples);
-            }
-            else if (pbCh == 2) // Stereo
-            {
-                channelBuffers[ch].copyFrom(0, 0, routingPlaybackBuffer, 0, 0, numSamples);
-                channelBuffers[ch].copyFrom(1, 0, routingPlaybackBuffer, 1, 0, numSamples);
-            }
-            else // Sum / Mono
-            {
-                channelBuffers[ch].copyFrom(0, 0, routingPlaybackBuffer, 0, 0, numSamples);
-                channelBuffers[ch].addFrom(0, 0, routingPlaybackBuffer, 1, 0, numSamples);
-                channelBuffers[ch].applyGain(0, 0, numSamples, 0.5f);
-                channelBuffers[ch].copyFrom(1, 0, channelBuffers[ch], 0, 0, numSamples);
-            }
+            LiveBus::copyPlaybackInputChannel(routingPlaybackBuffer, pbCh, channelBuffers[ch], numSamples);
         }
         else if (src == LiveBus::ChannelInputSource::TestSignal)
         {
@@ -3078,7 +3229,6 @@ void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device)
     busProcessors[1].prepare(currentSampleRate, currentBlockSize);
     for (int i = 0; i < maxInputs; ++i)
         channelDSPs[i].prepare(currentSampleRate, currentBlockSize);
-
     for (int i = 0; i < maxInputs; ++i)
         channelLevelMeters[i].prepare(currentSampleRate, currentBlockSize);
     busLevelMeters[0].prepare(currentSampleRate, currentBlockSize);
@@ -3113,6 +3263,15 @@ void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device)
         safeComponent->srPillLabel.setText("SR: " + juce::String(sampleRate * 0.001, 1) + " kHz", juce::dontSendNotification);
         safeComponent->bufferPillLabel.setText("Buffer: " + juce::String(blockSize), juce::dontSendNotification);
         safeComponent->devicePillLabel.setText("Device: " + deviceName, juce::dontSendNotification);
+        const auto bufferDurationMs = sampleRate > 0.0
+            ? static_cast<double>(blockSize) * 1000.0 / sampleRate
+            : 0.0;
+        safeComponent->deviceStatusDetailedLabel.setText(
+            "Active: " + deviceName + " | Sample rate: " +
+            juce::String(sampleRate / 1000.0, 1) + " kHz | Buffer: " +
+            juce::String(blockSize) + " samples (" +
+            juce::String(bufferDurationMs, 2) + " ms)",
+            juce::dontSendNotification);
         if (safeComponent->routingMatrixComponent)
         {
             safeComponent->routingMatrixComponent->updateAvailableHardwareInputs(inNames.size(), inNames);
@@ -3152,6 +3311,11 @@ void MainComponent::audioDeviceStopped()
         safeComponent->audioStatusBadge.setText("● Audio Stopped", juce::dontSendNotification);
         safeComponent->audioStatusBadge.setColour(juce::Label::textColourId, juce::Colour(0xffef4444));
         safeComponent->audioStatusBadge.setColour(juce::Label::backgroundColourId, juce::Colour(0x22ef4444));
+        safeComponent->devicePillLabel.setText("Device: unavailable", juce::dontSendNotification);
+        safeComponent->srPillLabel.setText("SR: --", juce::dontSendNotification);
+        safeComponent->bufferPillLabel.setText("Buffer: --", juce::dontSendNotification);
+        safeComponent->deviceStatusDetailedLabel.setText(
+            "Audio device stopped; waiting for an active device.", juce::dontSendNotification);
         safeComponent->log("Audio device stopped.");
         safeComponent->refreshChannelInputSourceCombos();
         if (safeComponent->diagnosticsLogManager != nullptr)
@@ -3172,6 +3336,8 @@ void MainComponent::audioDeviceError(const juce::String& errorMessage)
             return;
         if (safeComponent->audioPerformanceMonitor != nullptr)
             safeComponent->audioPerformanceMonitor->recordDeviceError(errorMessage.toRawUTF8());
+        safeComponent->deviceStatusDetailedLabel.setText(
+            "Audio device error: " + errorMessage, juce::dontSendNotification);
         if (safeComponent->diagnosticsLogManager != nullptr)
             safeComponent->diagnosticsLogManager->log(
                 LiveBus::DiagnosticSeverity::Error, LiveBus::DiagnosticCategory::Device,
@@ -4402,27 +4568,87 @@ void MainComponent::resized()
     }
 
     bool isDSP = (currentTab == TabDSP);
+    const int dspSubY = subY + 32;
+    const int dspSubH = juce::jmax(0, subH - 32);
     dspViewSwitchBtn.setVisible(isDSP);
+    dspPuzuEQToggleBtn.setVisible(isDSP);
+    monitorGraphicEQToggleBtn.setVisible(isDSP);
+    mainOutputEQToggleBtn.setVisible(isDSP);
     if (isDSP)
     {
-        dspViewSwitchBtn.setBounds(getWidth() - 260, 10, 240, 24);
-        if (showVocalRack)
+        const int controlsX = subX;
+        const int controlsY = 30;
+        dspViewSwitchBtn.setBounds(controlsX, controlsY, 145, 24);
+        dspPuzuEQToggleBtn.setBounds(controlsX + 150, controlsY, 130, 24);
+        monitorGraphicEQToggleBtn.setBounds(controlsX + 285, controlsY, 155, 24);
+        mainOutputEQToggleBtn.setBounds(controlsX + 445, controlsY, 145, 24);
+        dspViewSwitchBtn.setButtonText(showVocalRack ? "Vocal DSP Rack" : "8-Band EQ");
+        dspViewSwitchBtn.setTooltip(
+            "Switch between the Vocal DSP Rack and standalone 8-band EQ");
+        dspPuzuEQToggleBtn.setButtonText(showPuzu15BandEQ ? "Close 15-Band EQ" : "Open 15-Band EQ");
+        dspPuzuEQToggleBtn.setTooltip("Open or close the Puzu 15-band EQ");
+        monitorGraphicEQToggleBtn.setButtonText(
+            showMonitorGraphicEQ ? "Close Monitor 31-Band" : "Open Monitor 31-Band");
+        monitorGraphicEQToggleBtn.setTooltip(
+            "Open or close the Monitor Bus 31-band Graphic EQ");
+        mainOutputEQToggleBtn.setButtonText(
+            showMainOutputEQ ? "Close Main 24-Band" : "Open Main 24-Band");
+        mainOutputEQToggleBtn.setTooltip(
+            "Open or close the Stream Bus Main Output 24-band EQ");
+        if (mainOutputEQComponent)
+            mainOutputEQComponent->setVisible(showMainOutputEQ);
+        if (showMainOutputEQ)
+        {
+            if (mainOutputEQComponent)
+            {
+                mainOutputEQComponent->setVisible(true);
+                mainOutputEQComponent->setBounds(subX, dspSubY, subW, dspSubH);
+            }
+            if (monitorGraphicEQComponent) monitorGraphicEQComponent->setVisible(false);
+            if (puzuDSPComponent) puzuDSPComponent->setVisible(false);
+            if (vocalDSPRackComponent) vocalDSPRackComponent->setVisible(false);
+            if (eightBandEQComponent) eightBandEQComponent->setVisible(false);
+        }
+        else if (showMonitorGraphicEQ)
+        {
+            if (monitorGraphicEQComponent)
+            {
+                monitorGraphicEQComponent->setVisible(true);
+                monitorGraphicEQComponent->setBounds(subX, dspSubY, subW, dspSubH);
+            }
+            if (puzuDSPComponent) puzuDSPComponent->setVisible(false);
+            if (vocalDSPRackComponent) vocalDSPRackComponent->setVisible(false);
+            if (eightBandEQComponent) eightBandEQComponent->setVisible(false);
+        }
+        else if (showPuzu15BandEQ)
+        {
+            if (puzuDSPComponent)
+            {
+                puzuDSPComponent->setVisible(true);
+                puzuDSPComponent->setBounds(subX, dspSubY, subW, dspSubH);
+            }
+            if (vocalDSPRackComponent) vocalDSPRackComponent->setVisible(false);
+            if (eightBandEQComponent) eightBandEQComponent->setVisible(false);
+        }
+        else if (showVocalRack)
         {
             if (vocalDSPRackComponent)
             {
                 vocalDSPRackComponent->setVisible(true);
-                vocalDSPRackComponent->setBounds(subX, subY, subW, subH);
+                vocalDSPRackComponent->setBounds(subX, dspSubY, subW, dspSubH);
             }
             if (eightBandEQComponent) eightBandEQComponent->setVisible(false);
+            if (puzuDSPComponent) puzuDSPComponent->setVisible(false);
             dspViewSwitchBtn.setButtonText("Switch to Standalone 8-Band EQ");
         }
         else
         {
             if (vocalDSPRackComponent) vocalDSPRackComponent->setVisible(false);
+            if (puzuDSPComponent) puzuDSPComponent->setVisible(false);
             if (eightBandEQComponent)
             {
                 eightBandEQComponent->setVisible(true);
-                eightBandEQComponent->setBounds(subX, subY, subW, subH);
+                eightBandEQComponent->setBounds(subX, dspSubY, subW, dspSubH);
             }
             dspViewSwitchBtn.setButtonText("Switch to Vocal DSP Rack");
         }
@@ -4431,6 +4657,9 @@ void MainComponent::resized()
     {
         if (vocalDSPRackComponent) vocalDSPRackComponent->setVisible(false);
         if (eightBandEQComponent) eightBandEQComponent->setVisible(false);
+        if (puzuDSPComponent) puzuDSPComponent->setVisible(false);
+        if (monitorGraphicEQComponent) monitorGraphicEQComponent->setVisible(false);
+        if (mainOutputEQComponent) mainOutputEQComponent->setVisible(false);
     }
 
     bool isEffects = (currentTab == TabEffects);
@@ -4586,6 +4815,8 @@ void MainComponent::buttonClicked(juce::Button* b)
                     vocalDSPRackComponent->updateUIFromProcessor();
                 if (puzuDSPComponent)
                     puzuDSPComponent->updateUIFromProcessor();
+                if (mainOutputEQComponent)
+                    mainOutputEQComponent->updateUIFromProcessor();
             }
             resized();
             repaint();
@@ -4596,6 +4827,9 @@ void MainComponent::buttonClicked(juce::Button* b)
 
     if (b == &dspViewSwitchBtn)
     {
+        showMainOutputEQ = false;
+        showMonitorGraphicEQ = false;
+        showPuzu15BandEQ = false;
         showVocalRack = !showVocalRack;
         if (eightBandEQComponent)
             eightBandEQComponent->updateUIFromProcessor();
@@ -4708,8 +4942,47 @@ void MainComponent::buttonClicked(juce::Button* b)
     }
     else if (b == &dspPuzuEQToggleBtn)
     {
+        showMainOutputEQ = false;
+        showMonitorGraphicEQ = false;
         showPuzu15BandEQ = !showPuzu15BandEQ;
-        dspPuzuEQToggleBtn.setButtonText(showPuzu15BandEQ ? "Switch to 4-Band Studio EQ" : "Switch to Puzu 15-Band EQ");
+        if (showPuzu15BandEQ)
+            showVocalRack = false;
+        if (puzuDSPComponent)
+        {
+            puzuDSPComponent->refreshPresetCatalog();
+            puzuDSPComponent->updateUIFromProcessor();
+        }
+        resized();
+        repaint();
+    }
+    else if (b == &monitorGraphicEQToggleBtn)
+    {
+        showMainOutputEQ = false;
+        showMonitorGraphicEQ = !showMonitorGraphicEQ;
+        if (showMonitorGraphicEQ)
+        {
+            showPuzu15BandEQ = false;
+            showVocalRack = false;
+        }
+        if (monitorGraphicEQComponent)
+            monitorGraphicEQComponent->updateUIFromProcessor();
+        resized();
+        repaint();
+    }
+    else if (b == &mainOutputEQToggleBtn)
+    {
+        showMainOutputEQ = !showMainOutputEQ;
+        if (showMainOutputEQ)
+        {
+            showMonitorGraphicEQ = false;
+            showPuzu15BandEQ = false;
+            showVocalRack = false;
+        }
+        if (mainOutputEQComponent)
+        {
+            mainOutputEQComponent->refreshPresetCatalog();
+            mainOutputEQComponent->updateUIFromProcessor();
+        }
         resized();
         repaint();
     }
@@ -4874,8 +5147,8 @@ void MainComponent::selectDSPTarget(int targetIndex)
             routingMatrixComponent->setSelectedChannel(targetIndex);
     }
 
-    if (puzuDSPComponent && targetIndex >= maxInputs)
-        puzuDSPComponent->setSelectedBus(targetIndex == maxInputs + 1 ? 1 : 0);
+    if (puzuDSPComponent)
+        puzuDSPComponent->setSelectedTarget(targetIndex);
 
     if (effectsConsoleComponent)
     {
@@ -5097,6 +5370,15 @@ void MainComponent::applyDSPControls(int targetIndex)
     proc.params.eqHighGainDb.store((float)eqHighGainSlider.getValue());
 
     proc.updateCoefficients();
+
+    if (routingMatrixComponent)
+        routingMatrixComponent->refreshRoutingGraph();
+    if (vocalDSPRackComponent)
+        vocalDSPRackComponent->updateUIFromProcessor();
+    if (eightBandEQComponent)
+        eightBandEQComponent->updateUIFromProcessor();
+    if (puzuDSPComponent)
+        puzuDSPComponent->updateUIFromProcessor();
 }
 
 void MainComponent::updateDSPControlsFromTarget(int targetIndex)
@@ -5906,6 +6188,155 @@ void MainComponent::applySceneToUI(const SceneData& data)
         }
         target->updateCoefficients();
     }
+
+    if (data.hasPuzuEQData)
+    {
+        for (int t = 0; t < (int)data.puzuEQs.size(); ++t)
+        {
+            auto* target = t == 0 ? &busProcessors[0]
+                : t == 1 ? &busProcessors[1]
+                : &channelDSPs[(size_t)(t - 2)];
+            auto& params = target->params;
+            const auto& eq = data.puzuEQs[(size_t)t];
+            params.puzuEnabled.store(eq.masterEnabled, std::memory_order_relaxed);
+            for (int b = 0; b < (int)eq.bands.size(); ++b)
+            {
+                params.puzuBands[(size_t)b].type.store((PuzuFilterType)eq.bands[(size_t)b].type,
+                                                        std::memory_order_relaxed);
+                params.puzuBands[(size_t)b].freq.store(eq.bands[(size_t)b].freq,
+                                                        std::memory_order_relaxed);
+                params.puzuBands[(size_t)b].gainDb.store(eq.bands[(size_t)b].gainDb,
+                                                          std::memory_order_relaxed);
+                params.puzuBands[(size_t)b].q.store(eq.bands[(size_t)b].q,
+                                                     std::memory_order_relaxed);
+                params.puzuBands[(size_t)b].enabled.store(eq.bands[(size_t)b].enabled,
+                                                           std::memory_order_relaxed);
+            }
+            target->updateCoefficients();
+        }
+        if (puzuDSPComponent) puzuDSPComponent->updateUIFromProcessor();
+    }
+    if (data.hasMonitorGraphicEQ31Data)
+    {
+        MonitorGraphicEQ31State state;
+        state.enabled = data.monitorGraphicEQ31.enabled;
+        state.gainDb = data.monitorGraphicEQ31.gainDb;
+        busProcessors[1].setMonitorGraphicEQState(state);
+    }
+    else
+    {
+        busProcessors[1].setMonitorGraphicEQState(MonitorGraphicEQ31State{});
+    }
+    if (monitorGraphicEQComponent)
+        monitorGraphicEQComponent->updateUIFromProcessor();
+    if (data.hasMainOutputEQ24Data)
+    {
+        MainOutputEQ24State state;
+        state.enabled = data.mainOutputEQ24.enabled;
+        state.bands = data.mainOutputEQ24.bands;
+        busProcessors[0].setMainOutputEQ24State(state);
+    }
+    else
+    {
+        busProcessors[0].setMainOutputEQ24State(MainOutputEQ24State{});
+    }
+    if (data.hasPuzuEQABData && puzuDSPComponent)
+    {
+        PuzuDSPComponent::ABSlots slots{};
+        for (size_t target = 0; target < slots.size(); ++target)
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                const size_t sceneTarget = target < (size_t)maxInputs
+                    ? target + 2 : target - (size_t)maxInputs;
+                const auto& source =
+                    data.puzuEQABSlots[sceneTarget][(size_t)slot];
+                auto& destination = slots[target][(size_t)slot];
+                destination.enabled = source.masterEnabled;
+                for (size_t band = 0; band < destination.bands.size(); ++band)
+                {
+                    destination.bands[band].type =
+                        (PuzuFilterType)source.bands[band].type;
+                    destination.bands[band].freq = source.bands[band].freq;
+                    destination.bands[band].gainDb = source.bands[band].gainDb;
+                    destination.bands[band].q = source.bands[band].q;
+                    destination.bands[band].enabled =
+                        source.bands[band].enabled;
+                }
+            }
+        PuzuDSPComponent::ActiveABSlots activeSlots{};
+        for (size_t target = 0; target < activeSlots.size(); ++target)
+        {
+            const size_t sceneTarget = target < (size_t)maxInputs
+                ? target + 2 : target - (size_t)maxInputs;
+            activeSlots[target] = data.puzuEQActiveABSlots[sceneTarget];
+        }
+        puzuDSPComponent->setSceneABStates(slots, activeSlots);
+    }
+    else if (puzuDSPComponent)
+    {
+        PuzuDSPComponent::ABSlots slots{};
+        PuzuDSPComponent::ActiveABSlots activeSlots{};
+        for (size_t target = 0; target < slots.size(); ++target)
+        {
+            const auto* processor = target < (size_t)maxInputs
+                ? &channelDSPs[target]
+                : target == (size_t)maxInputs ? &busProcessors[0]
+                : &busProcessors[1];
+            const auto state = processor->getPuzuEQState();
+            slots[target][0] = state;
+            slots[target][1] = state;
+        }
+        puzuDSPComponent->setSceneABStates(slots, activeSlots);
+    }
+
+    if (monitorGraphicEQComponent)
+    {
+        if (data.hasMonitorGraphicEQ31ABData)
+        {
+            MonitorGraphicEQComponent::ABState slots{};
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                slots[(size_t)slot].enabled =
+                    data.monitorGraphicEQ31ABSlots[(size_t)slot].enabled;
+                slots[(size_t)slot].gainDb =
+                    data.monitorGraphicEQ31ABSlots[(size_t)slot].gainDb;
+            }
+            monitorGraphicEQComponent->setABStates(
+                slots, data.monitorGraphicEQ31ActiveABSlot);
+        }
+        else
+        {
+            MonitorGraphicEQComponent::ABState slots{};
+            const auto state = busProcessors[1].getMonitorGraphicEQState();
+            slots[0] = state;
+            slots[1] = state;
+            monitorGraphicEQComponent->setABStates(slots, 0);
+        }
+    }
+    if (mainOutputEQComponent)
+    {
+        if (data.hasMainOutputEQ24ABData)
+        {
+            MainOutputEQComponent::ABSlots slots{};
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                slots[(size_t)slot].enabled =
+                    data.mainOutputEQ24ABSlots[(size_t)slot].enabled;
+                slots[(size_t)slot].bands =
+                    data.mainOutputEQ24ABSlots[(size_t)slot].bands;
+            }
+            mainOutputEQComponent->setSceneABStates(
+                slots, data.mainOutputEQ24ActiveABSlot);
+        }
+        else
+        {
+            MainOutputEQComponent::ABSlots slots{};
+            const auto state = busProcessors[0].getMainOutputEQ24State();
+            slots[0] = state;
+            slots[1] = state;
+            mainOutputEQComponent->setSceneABStates(slots, 0);
+        }
+    }
     if (eightBandEQComponent) eightBandEQComponent->updateUIFromProcessor();
 
     for (int t = 0; t < (int)data.vocalRacks.size(); ++t)
@@ -6110,6 +6541,103 @@ void MainComponent::captureSceneFromUI(SceneData& data)
         }
     }
 
+    for (int t = 0; t < (int)data.puzuEQs.size(); ++t)
+    {
+        const auto* target = t == 0 ? &busProcessors[0]
+            : t == 1 ? &busProcessors[1]
+            : &channelDSPs[(size_t)(t - 2)];
+        const auto& params = target->params;
+        auto& eq = data.puzuEQs[(size_t)t];
+        eq.masterEnabled = params.puzuEnabled.load(std::memory_order_relaxed);
+        for (int b = 0; b < (int)eq.bands.size(); ++b)
+        {
+            eq.bands[(size_t)b].type =
+                (int)params.puzuBands[(size_t)b].type.load(std::memory_order_relaxed);
+            eq.bands[(size_t)b].freq =
+                params.puzuBands[(size_t)b].freq.load(std::memory_order_relaxed);
+            eq.bands[(size_t)b].gainDb =
+                params.puzuBands[(size_t)b].gainDb.load(std::memory_order_relaxed);
+            eq.bands[(size_t)b].q =
+                params.puzuBands[(size_t)b].q.load(std::memory_order_relaxed);
+            eq.bands[(size_t)b].enabled =
+                params.puzuBands[(size_t)b].enabled.load(std::memory_order_relaxed);
+        }
+    }
+    data.hasPuzuEQData = true;
+
+    const auto graphicEQState = busProcessors[1].getMonitorGraphicEQState();
+    data.monitorGraphicEQ31.enabled = graphicEQState.enabled;
+    data.monitorGraphicEQ31.gainDb = graphicEQState.gainDb;
+    data.hasMonitorGraphicEQ31Data = true;
+
+    const auto mainOutputEQState = busProcessors[0].getMainOutputEQ24State();
+    data.mainOutputEQ24.enabled = mainOutputEQState.enabled;
+    data.mainOutputEQ24.bands = mainOutputEQState.bands;
+    data.hasMainOutputEQ24Data = true;
+
+    if (puzuDSPComponent)
+    {
+        const auto puzuSlots = puzuDSPComponent->getSceneABStates();
+        const auto activeSlots = puzuDSPComponent->getSceneActiveABSlots();
+        for (size_t target = 0; target < puzuSlots.size(); ++target)
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                const auto& source = puzuSlots[target][(size_t)slot];
+                const size_t sceneTarget = target < (size_t)maxInputs
+                    ? target + 2 : target - (size_t)maxInputs;
+                auto& destination =
+                    data.puzuEQABSlots[sceneTarget][(size_t)slot];
+                destination.masterEnabled = source.enabled;
+                for (size_t band = 0; band < source.bands.size(); ++band)
+                {
+                    destination.bands[band].type =
+                        (int)source.bands[band].type;
+                    destination.bands[band].freq = source.bands[band].freq;
+                    destination.bands[band].gainDb = source.bands[band].gainDb;
+                    destination.bands[band].q = source.bands[band].q;
+                    destination.bands[band].enabled =
+                        source.bands[band].enabled;
+                }
+            }
+        for (size_t target = 0; target < activeSlots.size(); ++target)
+        {
+            const size_t sceneTarget = target < (size_t)maxInputs
+                ? target + 2 : target - (size_t)maxInputs;
+            data.puzuEQActiveABSlots[sceneTarget] = activeSlots[target];
+        }
+        data.hasPuzuEQABData = true;
+    }
+
+    if (monitorGraphicEQComponent)
+    {
+        const auto slots = monitorGraphicEQComponent->getABStates();
+        data.monitorGraphicEQ31ActiveABSlot =
+            monitorGraphicEQComponent->getActiveABSlot();
+        for (int slot = 0; slot < 2; ++slot)
+        {
+            data.monitorGraphicEQ31ABSlots[(size_t)slot].enabled =
+                slots[(size_t)slot].enabled;
+            data.monitorGraphicEQ31ABSlots[(size_t)slot].gainDb =
+                slots[(size_t)slot].gainDb;
+        }
+        data.hasMonitorGraphicEQ31ABData = true;
+    }
+
+    if (mainOutputEQComponent)
+    {
+        const auto slots = mainOutputEQComponent->getSceneABStates();
+        data.mainOutputEQ24ActiveABSlot =
+            mainOutputEQComponent->getSceneActiveABSlot();
+        for (int slot = 0; slot < 2; ++slot)
+        {
+            data.mainOutputEQ24ABSlots[(size_t)slot].enabled =
+                slots[(size_t)slot].enabled;
+            data.mainOutputEQ24ABSlots[(size_t)slot].bands =
+                slots[(size_t)slot].bands;
+        }
+        data.hasMainOutputEQ24ABData = true;
+    }
+
     for (int t = 0; t < (int)data.vocalRacks.size(); ++t)
     {
         const auto* target = t == 0 ? &busProcessors[0].vocalRack
@@ -6199,19 +6727,18 @@ void MainComponent::captureSceneFromUI(SceneData& data)
 // ==============================================================================
 void MainComponent::scanVST3Plugins()
 {
-    log("Scanning VST3 directories: %CommonProgramFiles%\\VST3...");
     formatManager.addDefaultFormats();
-    log("VST3 Scan complete: 14 plugins discovered and verified.");
+    log("Plugin formats registered; this rack does not enumerate or verify installed VST3 plugins.");
 }
 
 void MainComponent::addSelectedPlugin()
 {
-    log("Added VST3 plugin: FabFilter Pro-Q 3 to Stream Bus rack.");
+    log("No plugin was added; plugin selection and insertion are not connected to this rack.");
 }
 
 void MainComponent::removePlugin()
 {
-    log("Removed VST3 plugin slot.");
+    log("No plugin was removed; this rack has no loaded plugin slot.");
 }
 
 void MainComponent::togglePluginBypass()
@@ -6257,6 +6784,24 @@ void MainComponent::handleAddChannel(juce::Component* menuTarget)
             else if (result == 3) name = "Test Signal " + channelNumber;
             else if (result == 4) name = "YouTube " + channelNumber;
             else if (result == 5) name = "Channel " + channelNumber;
+
+            if (newIndex >= maxInputs)
+                return;
+
+            auto& dsp = owner.channelDSPs[(size_t)newIndex];
+            dsp.params.setToDefault();
+            dsp.eightBandEQ.params.setToDefault();
+            dsp.eightBandEQ.params.masterEnabled.store(false, std::memory_order_relaxed);
+            dsp.eightBandEQ.updateCoefficients();
+            dsp.vocalRack.params.setToDefault();
+            dsp.updateCoefficients();
+            dsp.reset();
+            owner.channelLatencyCompensators[(size_t)newIndex].setDelaySamples(0);
+            owner.channelLatencyCompensators[(size_t)newIndex].reset();
+            owner.channelLevelMeters[(size_t)newIndex].reset();
+            owner.vstTargetIndex[newIndex].store(0, std::memory_order_release);
+            if (owner.vst3HostEngine != nullptr)
+                owner.vst3HostEngine->clearTargetChain(newIndex);
 
             if (!owner.routingMatrix.addChannel(name))
                 return;
@@ -6306,10 +6851,17 @@ void MainComponent::handleRemoveChannel()
 
 void MainComponent::updateChannelUIVisibility() {}
 
-void MainComponent::changeListenerCallback(juce::ChangeBroadcaster*)
+void MainComponent::changeListenerCallback(juce::ChangeBroadcaster* source)
 {
-    if (audioDeviceService != nullptr)
+    if (source == vst3HostEngine.get())
+    {
+        updateLatencyCompensation();
+        updateFxStripIndicators();
+    }
+    else if (audioDeviceService != nullptr)
+    {
         audioDeviceService->handleDeviceChange();
+    }
 }
 
 // ==============================================================================
@@ -6698,6 +7250,24 @@ void MainComponent::applySceneWithFilter(const SceneData& data, const LiveBus::R
                 p.delayFeedback.store(bd.delayFeedback);
                 p.delayWetLevel.store(bd.delayWetLevel);
                 busProcessors[b].updateCoefficients();
+                if (b == 1 && data.hasMonitorGraphicEQ31Data)
+                {
+                    MonitorGraphicEQ31State graphicEQState;
+                    graphicEQState.enabled = data.monitorGraphicEQ31.enabled;
+                    graphicEQState.gainDb = data.monitorGraphicEQ31.gainDb;
+                    busProcessors[b].setMonitorGraphicEQState(graphicEQState);
+                    if (monitorGraphicEQComponent)
+                        monitorGraphicEQComponent->updateUIFromProcessor();
+                }
+                if (b == 0 && data.hasMainOutputEQ24Data)
+                {
+                    MainOutputEQ24State mainEQState;
+                    mainEQState.enabled = data.mainOutputEQ24.enabled;
+                    mainEQState.bands = data.mainOutputEQ24.bands;
+                    busProcessors[b].setMainOutputEQ24State(mainEQState);
+                    if (mainOutputEQComponent)
+                        mainOutputEQComponent->updateUIFromProcessor();
+                }
 
                 // 8-Band EQ for bus target b
                 auto& eq = busProcessors[b].eightBandEQ.params;
@@ -6981,6 +7551,142 @@ void MainComponent::resetTargetDefaults(int targetIndex)
     markUnsavedChanges();
 }
 
+bool MainComponent::captureEQPresetFromTarget(
+    int targetIndex, LiveBus::EQPresetDefinition& outPreset,
+    juce::String& outError)
+{
+    using LiveBus::EQPresetBand;
+    using LiveBus::EQPresetFilterType;
+
+    LiveBus::EQPresetDefinition captured;
+    captured.id = "captured.current-eq";
+    captured.name = "Current EQ";
+    captured.category = LiveBus::EQPresetCategory::Vocal;
+    captured.description =
+        "User-created starting curve. Adjust to the microphone, source, room, and listener.";
+
+    const auto copyPuzuBand = [](const PuzuBandState& source)
+    {
+        EQPresetBand result;
+        const int type = (int)source.type;
+        result.type = type >= (int)PuzuFilterType::HighPass &&
+                              type <= (int)PuzuFilterType::LowPass
+            ? (EQPresetFilterType)type
+            : EQPresetFilterType::Bell;
+        result.frequencyHz = source.freq;
+        result.gainDb = source.gainDb;
+        result.q = source.q;
+        result.enabled = source.enabled;
+        return result;
+    };
+    const auto copyMainBand = [](const MainOutputEQ24BandState& source)
+    {
+        EQPresetBand result;
+        switch (source.type)
+        {
+            case MainOutputEQFilterType::HighPass:
+                result.type = EQPresetFilterType::HighPass;
+                break;
+            case MainOutputEQFilterType::LowShelf:
+                result.type = EQPresetFilterType::LowShelf;
+                break;
+            case MainOutputEQFilterType::HighShelf:
+                result.type = EQPresetFilterType::HighShelf;
+                break;
+            case MainOutputEQFilterType::LowPass:
+                result.type = EQPresetFilterType::LowPass;
+                break;
+            default:
+                result.type = EQPresetFilterType::Bell;
+                break;
+        }
+        result.frequencyHz = source.freq;
+        result.gainDb = source.gainDb;
+        result.q = source.q;
+        result.enabled = source.enabled;
+        return result;
+    };
+
+    if (targetIndex >= 0 && targetIndex < maxInputs + 2)
+    {
+        const auto& eq = getProcessorForTarget(targetIndex).eightBandEQ.params;
+        for (int band = 0; band < LiveBus::numEQBands; ++band)
+        {
+            const auto& source = eq.bands[(size_t)band];
+            const int type = (int)source.type.load(std::memory_order_relaxed);
+            captured.bands[(size_t)band] = {
+                type >= (int)LiveBus::EQFilterType::HighPass &&
+                        type < (int)LiveBus::EQFilterType::NumTypes
+                    ? (EQPresetFilterType)type : EQPresetFilterType::Bell,
+                source.freq.load(std::memory_order_relaxed),
+                source.gainDb.load(std::memory_order_relaxed),
+                source.q.load(std::memory_order_relaxed),
+                source.enabled.load(std::memory_order_relaxed)
+            };
+        }
+    }
+    else if (targetIndex >= LiveBus::eqCatalogPuzuTargetOffset &&
+             targetIndex < LiveBus::eqCatalogPuzuTargetOffset + maxInputs + 2)
+    {
+        const int processorTarget =
+            targetIndex - LiveBus::eqCatalogPuzuTargetOffset;
+        const auto state =
+            getProcessorForTarget(processorTarget).getPuzuEQState();
+        for (size_t band = 0; band < captured.bands.size(); ++band)
+            captured.bands[band] =
+                copyPuzuBand(state.bands[band * 2]);
+    }
+    else if (targetIndex == LiveBus::eqCatalogMonitor31Target)
+    {
+        const auto state = busProcessors[1].getMonitorGraphicEQState();
+        constexpr std::array<float, 8> captureFrequencies{
+            31.5f, 125.0f, 400.0f, 1000.0f,
+            2500.0f, 5000.0f, 10000.0f, 16000.0f
+        };
+        for (size_t band = 0; band < captured.bands.size(); ++band)
+        {
+            size_t closest = 0;
+            float distance = (std::numeric_limits<float>::max)();
+            for (size_t candidate = 0;
+                 candidate < monitorGraphicEQFrequencies.size(); ++candidate)
+            {
+                const float candidateDistance = std::abs(std::log(
+                    monitorGraphicEQFrequencies[candidate] /
+                    captureFrequencies[band]));
+                if (candidateDistance < distance)
+                {
+                    closest = candidate;
+                    distance = candidateDistance;
+                }
+            }
+            captured.bands[band] = {
+                EQPresetFilterType::Bell,
+                captureFrequencies[band],
+                state.gainDb[closest],
+                1.0f,
+                true
+            };
+        }
+    }
+    else if (targetIndex == LiveBus::eqCatalogMain24Target)
+    {
+        const auto state = busProcessors[0].getMainOutputEQ24State();
+        for (size_t band = 0; band < captured.bands.size(); ++band)
+            captured.bands[band] = copyMainBand(state.bands[band]);
+    }
+    else
+    {
+        outError = "Selected EQ target is not supported.";
+        return false;
+    }
+
+    if (!LiveBus::EQPresetCatalog::validate(captured, outError))
+        return false;
+    outPreset = std::move(captured);
+    outError.clear();
+    return true;
+}
+
 void MainComponent::loadPresetToTarget(LiveBus::PresetCategory cat, int targetIndex, const LiveBus::PresetItem& item)
 {
     juce::String err;
@@ -7129,6 +7835,118 @@ void MainComponent::loadPresetToTarget(LiveBus::PresetCategory cat, int targetIn
                 markUnsavedChanges();
                 log("Loaded Bus DSP Preset '" + item.name + "' to Bus " + juce::String(targetIndex));
             }
+            break;
+        }
+        case LiveBus::PresetCategory::EQCatalog:
+        {
+            LiveBus::EQPresetDefinition preset;
+            if (!presetManager.loadEQCatalogPreset(item, preset, err))
+            {
+                juce::AlertWindow::showMessageBox(
+                    juce::AlertWindow::WarningIcon, "Preset Error", err, "OK");
+                log(err);
+                return;
+            }
+
+            if (targetIndex >= LiveBus::eqCatalogPuzuTargetOffset &&
+                targetIndex < LiveBus::eqCatalogPuzuTargetOffset + maxInputs + 2)
+            {
+                const int processorTarget =
+                    targetIndex - LiveBus::eqCatalogPuzuTargetOffset;
+                PuzuEQState state;
+                if (!LiveBus::EQPresetCatalog::mapToPuzu15Band(
+                        preset, state, err, currentSampleRate))
+                {
+                    juce::AlertWindow::showMessageBox(
+                        juce::AlertWindow::WarningIcon, "Preset Error", err, "OK");
+                    log(err);
+                    return;
+                }
+                getProcessorForTarget(processorTarget).setPuzuEQState(state);
+                if (puzuDSPComponent)
+                {
+                    puzuDSPComponent->setSelectedTarget(processorTarget);
+                    puzuDSPComponent->updateUIFromProcessor();
+                }
+            }
+            else if (targetIndex == LiveBus::eqCatalogMonitor31Target)
+            {
+                MonitorGraphicEQ31State state;
+                if (!LiveBus::EQPresetCatalog::mapToMonitor31Band(
+                        preset, state, err, currentSampleRate))
+                {
+                    juce::AlertWindow::showMessageBox(
+                        juce::AlertWindow::WarningIcon, "Preset Error", err, "OK");
+                    log(err);
+                    return;
+                }
+                busProcessors[1].setMonitorGraphicEQState(state);
+                if (monitorGraphicEQComponent)
+                    monitorGraphicEQComponent->updateUIFromProcessor();
+            }
+            else if (targetIndex == LiveBus::eqCatalogMain24Target)
+            {
+                auto state = busProcessors[0].getMainOutputEQ24State();
+                if (!LiveBus::EQPresetCatalog::mapToMainOutput24Band(
+                        preset, state, err, currentSampleRate))
+                {
+                    juce::AlertWindow::showMessageBox(
+                        juce::AlertWindow::WarningIcon, "Preset Error", err, "OK");
+                    log(err);
+                    return;
+                }
+                busProcessors[0].setMainOutputEQ24State(state);
+                if (mainOutputEQComponent)
+                    mainOutputEQComponent->updateUIFromProcessor();
+            }
+            else if (targetIndex >= 0 && targetIndex < maxInputs + 2)
+            {
+                SceneData::EightBandEQSceneData state;
+                if (!LiveBus::EQPresetCatalog::mapToEightBand(
+                        preset, state, err))
+                {
+                    juce::AlertWindow::showMessageBox(
+                        juce::AlertWindow::WarningIcon, "Preset Error", err, "OK");
+                    log(err);
+                    return;
+                }
+                auto& processor = getProcessorForTarget(targetIndex).eightBandEQ;
+                processor.params.masterEnabled.store(state.masterEnabled);
+                for (int band = 0; band < 8; ++band)
+                {
+                    processor.params.bands[(size_t)band].type.store(
+                        (LiveBus::EQFilterType)state.bands[(size_t)band].type);
+                    processor.params.bands[(size_t)band].freq.store(
+                        state.bands[(size_t)band].freq);
+                    processor.params.bands[(size_t)band].gainDb.store(
+                        state.bands[(size_t)band].gainDb);
+                    processor.params.bands[(size_t)band].q.store(
+                        state.bands[(size_t)band].q);
+                    processor.params.bands[(size_t)band].enabled.store(
+                        state.bands[(size_t)band].enabled);
+                }
+                processor.updateCoefficients();
+                if (eightBandEQComponent)
+                {
+                    eightBandEQComponent->setSelectedTarget(
+                        (LiveBus::EightBandEQComponent::TargetIndex)targetIndex);
+                    eightBandEQComponent->updateUIFromProcessor();
+                }
+                if (eqCurveDisplay)
+                    eqCurveDisplay->repaint();
+            }
+            else
+            {
+                err = "The selected EQ target is invalid.";
+                juce::AlertWindow::showMessageBox(
+                    juce::AlertWindow::WarningIcon, "Preset Error", err, "OK");
+                log(err);
+                return;
+            }
+
+            markUnsavedChanges();
+            log("Applied EQ catalog preset '" + item.name +
+                "' to target " + juce::String(targetIndex));
             break;
         }
         default: break;

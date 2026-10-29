@@ -1,6 +1,7 @@
 #pragma once
 
 #include "RoutingMatrix.h"
+#include <array>
 #include <cstdint>
 
 namespace LiveBus
@@ -96,6 +97,111 @@ enum class RoutingGraphEditResult
     AlreadyConnected,
     Unsupported
 };
+
+struct RoutingGraphSoloState
+{
+    bool anySolo = false;
+    std::array<bool, maxInputs> channelSolo{};
+    std::array<bool, maxSubmixBuses> submixSolo{};
+    std::array<bool, maxAuxBuses> auxSolo{};
+    std::array<bool, maxSubmixBuses> submixHasSoloChannel{};
+    std::array<bool, maxAuxBuses> auxHasSoloChannel{};
+};
+
+inline RoutingGraphSoloState getRoutingGraphSoloState(const RoutingMatrix& matrix) noexcept
+{
+    RoutingGraphSoloState state;
+    for (int submix = 0; submix < maxSubmixBuses; ++submix)
+    {
+        state.submixSolo[(size_t)submix] =
+            matrix.getSubmixBus(submix).solo.load(std::memory_order_relaxed);
+        state.anySolo = state.anySolo || state.submixSolo[(size_t)submix];
+    }
+    for (int aux = 0; aux < maxAuxBuses; ++aux)
+    {
+        state.auxSolo[(size_t)aux] =
+            matrix.getAuxBus(aux).solo.load(std::memory_order_relaxed);
+        state.anySolo = state.anySolo || state.auxSolo[(size_t)aux];
+    }
+    for (int channelIndex = 0; channelIndex < matrix.getNumActiveChannels(); ++channelIndex)
+    {
+        const auto& channel = matrix.getChannel(channelIndex);
+        const bool channelSolo = channel.solo.load(std::memory_order_relaxed);
+        state.channelSolo[(size_t)channelIndex] = channelSolo;
+        if (!channelSolo)
+            continue;
+
+        state.anySolo = true;
+        const int submix = channel.submixGroup.load(std::memory_order_relaxed);
+        if (submix >= 0 && submix < maxSubmixBuses)
+            state.submixHasSoloChannel[(size_t)submix] = true;
+        for (int aux = 0; aux < maxAuxBuses; ++aux)
+            if (channel.auxRouteEnable[(size_t)aux].load(std::memory_order_relaxed))
+                state.auxHasSoloChannel[(size_t)aux] = true;
+    }
+    return state;
+}
+
+inline bool routingGraphChannelPassesSoloGate(const RoutingMatrix& matrix,
+                                               const RoutingGraphSoloState& soloState,
+                                               int channelIndex) noexcept
+{
+    if (!soloState.anySolo)
+        return true;
+    if (channelIndex < 0 || channelIndex >= matrix.getNumActiveChannels())
+        return false;
+    if (soloState.channelSolo[(size_t)channelIndex])
+        return true;
+
+    const auto& channel = matrix.getChannel(channelIndex);
+    const int submix = channel.submixGroup.load(std::memory_order_relaxed);
+    if (submix >= 0 && submix < maxSubmixBuses &&
+        soloState.submixSolo[(size_t)submix])
+        return true;
+    for (int aux = 0; aux < maxAuxBuses; ++aux)
+        if (soloState.auxSolo[(size_t)aux] &&
+            channel.auxRouteEnable[(size_t)aux].load(std::memory_order_relaxed))
+            return true;
+    return false;
+}
+
+inline bool routingGraphChannelRoutePassesSolo(const RoutingGraphSoloState& soloState,
+                                                int channelIndex,
+                                                RoutingGraphNodeType destinationType,
+                                                int destinationIndex) noexcept
+{
+    if (!soloState.anySolo)
+        return true;
+    if (channelIndex < 0 || channelIndex >= maxInputs ||
+        !soloState.channelSolo[(size_t)channelIndex])
+    {
+        if (destinationType == RoutingGraphNodeType::Aux &&
+            destinationIndex >= 0 && destinationIndex < maxAuxBuses)
+            return soloState.auxSolo[(size_t)destinationIndex];
+        if (destinationType == RoutingGraphNodeType::Submix &&
+            destinationIndex >= 0 && destinationIndex < maxSubmixBuses)
+            return soloState.submixSolo[(size_t)destinationIndex];
+        return false;
+    }
+    return true;
+}
+
+inline bool routingGraphBusPassesSolo(const RoutingGraphSoloState& soloState,
+                                       RoutingGraphNodeType busType,
+                                       int busIndex) noexcept
+{
+    if (!soloState.anySolo)
+        return true;
+    if (busType == RoutingGraphNodeType::Submix &&
+        busIndex >= 0 && busIndex < maxSubmixBuses)
+        return soloState.submixSolo[(size_t)busIndex] ||
+               soloState.submixHasSoloChannel[(size_t)busIndex];
+    if (busType == RoutingGraphNodeType::Aux &&
+        busIndex >= 0 && busIndex < maxAuxBuses)
+        return soloState.auxSolo[(size_t)busIndex] ||
+               soloState.auxHasSoloChannel[(size_t)busIndex];
+    return false;
+}
 
 inline bool routingGraphNodeExists(const RoutingMatrix& matrix,
                                    RoutingGraphNodeId node) noexcept

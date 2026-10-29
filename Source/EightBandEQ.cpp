@@ -12,21 +12,18 @@ namespace LiveBus
         currentSampleRate = (sampleRate > 0.0) ? sampleRate : 48000.0;
         currentBlockSize = juce::jmax(1, maxBlockSize);
 
-        juce::dsp::ProcessSpec spec;
-        spec.sampleRate = currentSampleRate;
-        spec.maximumBlockSize = (juce::uint32)currentBlockSize;
-        spec.numChannels = 1;
-
-        for (int ch = 0; ch < 2; ++ch)
-        {
-            for (int b = 0; b < numEQBands; ++b)
-            {
-                filters[ch][b].prepare(spec);
-                filters[ch][b].reset();
-            }
-        }
-
         updateCoefficients();
+        CrossfadingEQFilterBank<numEQBands>::EnabledSet initiallyEnabled{};
+        for (int band = 0; band < numEQBands; ++band)
+            initiallyEnabled[(size_t)band] =
+                params.bands[(size_t)band].enabled.load(
+                    std::memory_order_relaxed);
+        filterBank.prepare(currentCoefficients, initiallyEnabled);
+        prepared = true;
+        audioCoefficientSequence =
+            coefficientSequence.load(std::memory_order_acquire);
+        masterMix = params.masterEnabled.load(std::memory_order_relaxed)
+            ? 1.0f : 0.0f;
 
         meterInL.store(0.0f);
         meterInR.store(0.0f);
@@ -38,13 +35,9 @@ namespace LiveBus
 
     void EightBandEQProcessor::reset()
     {
-        for (int ch = 0; ch < 2; ++ch)
-        {
-            for (int b = 0; b < numEQBands; ++b)
-            {
-                filters[ch][b].reset();
-            }
-        }
+        filterBank.reset();
+        masterMix = params.masterEnabled.load(std::memory_order_relaxed)
+            ? 1.0f : 0.0f;
         meterInL.store(0.0f);
         meterInR.store(0.0f);
         meterOutL.store(0.0f);
@@ -85,6 +78,8 @@ namespace LiveBus
     void EightBandEQProcessor::updateCoefficients()
     {
         const double sr = (currentSampleRate > 0.0) ? currentSampleRate : 48000.0;
+        CrossfadingEQFilterBank<numEQBands>::CoefficientSet coefficients{};
+        CrossfadingEQFilterBank<numEQBands>::EnabledSet enabled{};
 
         for (int b = 0; b < numEQBands; ++b)
         {
@@ -125,13 +120,62 @@ namespace LiveBus
             }
 
             if (newCoeff)
+                currentCoefficients[(size_t)b] = newCoeff;
+
+            if (currentCoefficients[(size_t)b] != nullptr)
             {
-                for (int ch = 0; ch < 2; ++ch)
-                {
-                    filters[ch][b].coefficients = newCoeff;
-                }
+                const auto* raw =
+                    currentCoefficients[(size_t)b]->getRawCoefficients();
+                for (int coefficient = 0; coefficient < 5; ++coefficient)
+                    coefficients[(size_t)b][(size_t)coefficient] =
+                        raw[coefficient];
             }
+            enabled[(size_t)b] =
+                params.bands[(size_t)b].enabled.load(std::memory_order_relaxed);
         }
+
+        const std::lock_guard<std::mutex> lock(coefficientWriterMutex);
+        coefficientSequence.fetch_add(1, std::memory_order_acq_rel);
+        for (int band = 0; band < numEQBands; ++band)
+        {
+            for (int coefficient = 0; coefficient < 5; ++coefficient)
+                coefficientSnapshot[(size_t)band * 5u +
+                                    (size_t)coefficient].store(
+                    coefficients[(size_t)band][(size_t)coefficient],
+                    std::memory_order_relaxed);
+            enabledSnapshot[(size_t)band].store(
+                enabled[(size_t)band], std::memory_order_relaxed);
+        }
+        coefficientSequence.fetch_add(1, std::memory_order_release);
+    }
+
+    void EightBandEQProcessor::applyPendingCoefficients() noexcept
+    {
+        const auto sequence =
+            coefficientSequence.load(std::memory_order_acquire);
+        if (!prepared || sequence == audioCoefficientSequence ||
+            (sequence & 1u) != 0u)
+            return;
+
+        CrossfadingEQFilterBank<numEQBands>::CoefficientSet coefficients{};
+        CrossfadingEQFilterBank<numEQBands>::EnabledSet enabled{};
+        for (int band = 0; band < numEQBands; ++band)
+        {
+            for (int coefficient = 0; coefficient < 5; ++coefficient)
+                coefficients[(size_t)band][(size_t)coefficient] =
+                    coefficientSnapshot[(size_t)band * 5u +
+                                        (size_t)coefficient].load(
+                        std::memory_order_relaxed);
+            enabled[(size_t)band] =
+                enabledSnapshot[(size_t)band].load(std::memory_order_relaxed);
+        }
+        if (coefficientSequence.load(std::memory_order_acquire) != sequence)
+            return;
+
+        if (filterBank.beginTransition(
+                coefficients, enabled,
+                juce::roundToInt(currentSampleRate * 0.01)))
+            audioCoefficientSequence = sequence;
     }
 
     void EightBandEQProcessor::process(juce::AudioBuffer<float>& buffer, int numSamples)
@@ -155,34 +199,35 @@ namespace LiveBus
             pushToAnalyzer(buffer.getReadPointer(0), numSamples);
         }
 
-        // 2. Master Bypass Check
-        if (!params.masterEnabled.load(std::memory_order_relaxed))
+        applyPendingCoefficients();
+        const bool targetEnabled =
+            params.masterEnabled.load(std::memory_order_relaxed);
+        if (!targetEnabled && masterMix <= 0.0f)
         {
-            // Bit-transparent dry audio pass-through
+            for (int sample = 0; sample < numSamples; ++sample)
+                filterBank.advanceSample();
             meterOutL.store(inL, std::memory_order_relaxed);
             meterOutR.store(inR, std::memory_order_relaxed);
-
             if (analyzerEnabled.load(std::memory_order_relaxed) && analyzerPost.load(std::memory_order_relaxed))
-            {
                 pushToAnalyzer(buffer.getReadPointer(0), numSamples);
-            }
             return;
         }
 
-        // 3. Process Active Bands
-        juce::dsp::AudioBlock<float> block(buffer);
-
-        for (int b = 0; b < numEQBands; ++b)
+        const float mixStep =
+            1.0f / juce::jmax(1.0f, (float)(currentSampleRate * 0.01));
+        for (int sample = 0; sample < numSamples; ++sample)
         {
-            if (!params.bands[b].enabled.load(std::memory_order_relaxed))
-                continue; // Band is individually bypassed
-
+            masterMix = targetEnabled
+                ? juce::jmin(1.0f, masterMix + mixStep)
+                : juce::jmax(0.0f, masterMix - mixStep);
             for (int ch = 0; ch < numChannels; ++ch)
             {
-                auto singleBlock = block.getSingleChannelBlock((size_t)ch).getSubBlock(0, (size_t)numSamples);
-                juce::dsp::ProcessContextReplacing<float> context(singleBlock);
-                filters[ch][b].process(context);
+                const float dry = buffer.getSample(ch, sample);
+                const float wet = filterBank.processSample(ch, dry);
+                buffer.setSample(ch, sample,
+                                 dry + (wet - dry) * masterMix);
             }
+            filterBank.advanceSample();
         }
 
         // 4. Measure Output Peak Levels
@@ -208,9 +253,11 @@ namespace LiveBus
 
         for (int b = 0; b < numEQBands; ++b)
         {
-            if (params.bands[b].enabled.load(std::memory_order_relaxed) && filters[0][b].coefficients)
+            if (params.bands[b].enabled.load(std::memory_order_relaxed) &&
+                currentCoefficients[(size_t)b] != nullptr)
             {
-                totalMag *= filters[0][b].coefficients->getMagnitudeForFrequency((double)frequency, sr);
+                totalMag *= currentCoefficients[(size_t)b]
+                                ->getMagnitudeForFrequency((double)frequency, sr);
             }
         }
 
@@ -226,9 +273,10 @@ namespace LiveBus
             return 0.0f;
 
         const double sr = (currentSampleRate > 0.0) ? currentSampleRate : 48000.0;
-        if (filters[0][bandIndex].coefficients)
+        if (currentCoefficients[(size_t)bandIndex] != nullptr)
         {
-            double mag = filters[0][bandIndex].coefficients->getMagnitudeForFrequency((double)frequency, sr);
+            double mag = currentCoefficients[(size_t)bandIndex]
+                             ->getMagnitudeForFrequency((double)frequency, sr);
             return (float)juce::Decibels::gainToDecibels(mag, -60.0);
         }
 

@@ -1,0 +1,14 @@
+This release includes the following Microsoft Visual C++ x64 runtime DLLs
+next to the application executables:
+
+- MSVCP140.dll
+- VCRUNTIME140.dll
+- VCRUNTIME140_1.dll
+
+These are app-local redistributable components from Microsoft Visual Studio.
+Their redistribution is subject to the applicable Microsoft Visual Studio
+license terms:
+https://visualstudio.microsoft.com/license-terms/
+
+The Universal C Runtime is provided by supported Windows 10 and Windows 11
+systems.

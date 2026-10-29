@@ -3,7 +3,140 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <mutex>
 #include <string>
+
+template <int NumBands>
+class CrossfadingEQFilterBank
+{
+public:
+    using CoefficientSet = std::array<std::array<float, 5>, NumBands>;
+    using EnabledSet = std::array<bool, NumBands>;
+
+    template <typename CoefficientPointers>
+    void prepare(const CoefficientPointers& coefficients)
+    {
+        EnabledSet enabled{};
+        enabled.fill(true);
+        prepare(coefficients, enabled);
+    }
+
+    template <typename CoefficientPointers>
+    void prepare(const CoefficientPointers& coefficients,
+                 const EnabledSet& enabled)
+    {
+        for (int bank = 0; bank < 2; ++bank)
+            for (int channel = 0; channel < 2; ++channel)
+                for (int band = 0; band < NumBands; ++band)
+                {
+                    filters[(size_t)bank][(size_t)channel][(size_t)band]
+                        .coefficients = new juce::dsp::IIR::Coefficients<float>(
+                            *coefficients[(size_t)band]);
+                    filters[(size_t)bank][(size_t)channel][(size_t)band].reset();
+                }
+        enabledBanks[0] = enabled;
+        enabledBanks[1] = enabled;
+        activeBank = 0;
+        fadeProgress = fadeLength;
+    }
+
+    bool beginTransition(const CoefficientSet& coefficients,
+                         int transitionSamples) noexcept
+    {
+        return beginTransition(coefficients, enabledBanks[(size_t)activeBank],
+                               transitionSamples);
+    }
+
+    bool beginTransition(const CoefficientSet& coefficients,
+                         const EnabledSet& enabled,
+                         int transitionSamples) noexcept
+    {
+        if (isTransitioning())
+            return false;
+        const int nextBank = 1 - activeBank;
+        for (int channel = 0; channel < 2; ++channel)
+            for (int band = 0; band < NumBands; ++band)
+            {
+                auto& filter =
+                    filters[(size_t)nextBank][(size_t)channel][(size_t)band];
+                auto* destination = filter.coefficients->coefficients.begin();
+                for (int coefficient = 0; coefficient < 5; ++coefficient)
+                    destination[coefficient] =
+                        coefficients[(size_t)band][(size_t)coefficient];
+                filter.reset();
+            }
+        enabledBanks[(size_t)nextBank] = enabled;
+        fadeLength = juce::jmax(1, transitionSamples);
+        fadeProgress = 0;
+        return true;
+    }
+
+    float processSample(int channel, float input,
+                        const EnabledSet& enabled) noexcept
+    {
+        const auto processBank = [&](int bank)
+        {
+            float output = input;
+            for (int band = 0; band < NumBands; ++band)
+                if (enabled[(size_t)band])
+                    output = filters[(size_t)bank][(size_t)channel]
+                                     [(size_t)band].processSample(output);
+            return output;
+        };
+        const float active = processBank(activeBank);
+        if (!isTransitioning())
+            return active;
+        const float next = processBank(1 - activeBank);
+        const float proportion = (float)fadeProgress / (float)fadeLength;
+        return active + (next - active) * proportion;
+    }
+
+    float processSample(int channel, float input) noexcept
+    {
+        const auto processBank = [&](int bank)
+        {
+            float output = input;
+            for (int band = 0; band < NumBands; ++band)
+                if (enabledBanks[(size_t)bank][(size_t)band])
+                    output = filters[(size_t)bank][(size_t)channel]
+                                     [(size_t)band].processSample(output);
+            return output;
+        };
+        const float active = processBank(activeBank);
+        if (!isTransitioning())
+            return active;
+        const float next = processBank(1 - activeBank);
+        const float proportion = (float)fadeProgress / (float)fadeLength;
+        return active + (next - active) * proportion;
+    }
+
+    void advanceSample() noexcept
+    {
+        if (isTransitioning() && ++fadeProgress >= fadeLength)
+            activeBank = 1 - activeBank;
+    }
+
+    bool isTransitioning() const noexcept { return fadeProgress < fadeLength; }
+
+    void reset() noexcept
+    {
+        for (auto& bank : filters)
+            for (auto& channel : bank)
+                for (auto& filter : channel)
+                    filter.reset();
+        if (isTransitioning())
+            activeBank = 1 - activeBank;
+        fadeProgress = fadeLength;
+    }
+
+private:
+    std::array<std::array<std::array<juce::dsp::IIR::Filter<float>, NumBands>, 2>, 2>
+        filters{};
+    std::array<EnabledSet, 2> enabledBanks{};
+    int activeBank = 0;
+    int fadeProgress = 1;
+    int fadeLength = 1;
+};
 
 namespace LiveBus
 {
@@ -267,11 +400,24 @@ namespace LiveBus
         bool isAnalyzerPost() const { return analyzerPost.load(std::memory_order_relaxed); }
 
     private:
+        void applyPendingCoefficients() noexcept;
+
         double currentSampleRate = 48000.0;
         int currentBlockSize = 512;
 
-        // 2 audio channels (Stereo) x 8 cascaded IIR filters
-        juce::dsp::IIR::Filter<float> filters[2][numEQBands];
+        using CoefficientPointers =
+            std::array<juce::ReferenceCountedObjectPtr<
+                           juce::dsp::IIR::Coefficients<float>>,
+                       numEQBands>;
+        CoefficientPointers currentCoefficients{};
+        std::array<std::atomic<float>, numEQBands * 5> coefficientSnapshot{};
+        std::array<std::atomic<bool>, numEQBands> enabledSnapshot{};
+        std::atomic<uint64_t> coefficientSequence{0};
+        uint64_t audioCoefficientSequence = 0;
+        std::mutex coefficientWriterMutex;
+        CrossfadingEQFilterBank<numEQBands> filterBank;
+        bool prepared = false;
+        float masterMix = 1.0f;
 
         // Real-time meters
         std::atomic<float> meterInL{0.0f};

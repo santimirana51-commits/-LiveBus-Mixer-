@@ -1,4 +1,5 @@
 #include "EffectsConsoleComponent.h"
+#include "RNNoiseVST3Plugin.h"
 
 namespace LiveBus
 {
@@ -210,19 +211,29 @@ void EffectsConsoleComponent::rebuildSlotViews()
 
 void EffectsConsoleComponent::openEditorForSlot(int slotIndex)
 {
+    auto slot = hostEngine.getSlotInfo(currentTargetIndex, slotIndex);
     if (auto* inst = hostEngine.getPluginInstance(currentTargetIndex, slotIndex))
     {
-        auto slot = hostEngine.getSlotInfo(currentTargetIndex, slotIndex);
         PluginEditorWindow::openWindowFor(*inst, slot.pluginName + " — " + VST3HostEngine::getTargetName(currentTargetIndex));
+        return;
     }
-    else
+
+    // If running in isolated mode or bundled plugin mode, open the rich dedicated editor
+    if (slot.pluginName.containsIgnoreCase("RNNoise") || slot.fileOrIdentifier.containsIgnoreCase("RNNoise"))
     {
-        auto slot = hostEngine.getSlotInfo(currentTargetIndex, slotIndex);
-        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
-                                               slot.pluginName,
-                                               "Plug-in instance is active in chain (" + slot.fileOrIdentifier + ").\n"
-                                               "External binary GUI opened or simulated.");
+        if (!internalRNNoisePlugin)
+        {
+            internalRNNoisePlugin = std::make_unique<RNNoiseVST3Plugin>();
+            internalRNNoisePlugin->prepareToPlay(hostEngine.getCurrentSampleRate(), 512);
+        }
+        PluginEditorWindow::openWindowFor(*internalRNNoisePlugin, slot.pluginName + " (Isolated Editor) — " + VST3HostEngine::getTargetName(currentTargetIndex));
+        return;
     }
+
+    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                           slot.pluginName,
+                                           "Plug-in instance is active in chain (" + slot.fileOrIdentifier + ").\n"
+                                           "Isolated worker process is running.");
 }
 
 void EffectsConsoleComponent::paint(juce::Graphics& g)

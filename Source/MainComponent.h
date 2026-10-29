@@ -11,11 +11,14 @@
 #include "MidiEngine.h"
 #include "PresetZipManager.h"
 #include "PuzuDSPComponent.h"
+#include "MonitorGraphicEQComponent.h"
+#include "MainOutputEQComponent.h"
 #include "LevelMeterProcessor.h"
 #include "LevelMeterComponents.h"
 #include "AudioDeviceService.h"
 #include "AudioSettingsComponent.h"
 #include "PresetManager.h"
+#include "EQPresetCatalog.h"
 #include "RecallFilter.h"
 #include "ScenesConsoleComponent.h"
 #include "OBSIntegrationService.h"
@@ -211,6 +214,19 @@ public:
             g.drawRoundedRectangle(thumbRect, 3.0f, 1.5f);
         }
     }
+
+    void drawTooltip(juce::Graphics& g, const juce::String& text, int width, int height) override
+    {
+        auto bounds = juce::Rectangle<int>(0, 0, width, height).toFloat();
+        g.setColour(juce::Colour(0xf00b121e));
+        g.fillRoundedRectangle(bounds, 5.0f);
+        g.setColour(juce::Colour(0xff00f5d4).withAlpha(0.6f));
+        g.drawRoundedRectangle(bounds.reduced(0.5f), 5.0f, 1.0f);
+
+        g.setColour(juce::Colour(0xfff8fafc));
+        g.setFont(juce::FontOptions(11.0f, juce::Font::bold));
+        g.drawFittedText(text, bounds.reduced(6.0f, 3.0f).toNearestInt(), juce::Justification::centred, 3);
+    }
 };
 
 // ==============================================================================
@@ -330,6 +346,9 @@ private:
     void copyChannelStrip(int srcCh, int destCh, bool includeSends);
     void resetTargetDefaults(int targetIndex);
     void loadPresetToTarget(LiveBus::PresetCategory cat, int targetIndex, const LiveBus::PresetItem& item);
+    bool captureEQPresetFromTarget(int targetIndex,
+                                  LiveBus::EQPresetDefinition& outPreset,
+                                  juce::String& outError);
     void savePresetFromTarget(LiveBus::PresetCategory cat, int targetIndex, const juce::String& name);
     void markUnsavedChanges();
 
@@ -342,7 +361,6 @@ private:
     juce::AudioDeviceManager deviceManager;
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
-
     RoutingMatrix routingMatrix;
     std::array<BusDSPProcessor, maxInputs> channelDSPs;
     std::array<BusDSPProcessor, numBuses> busProcessors;
@@ -610,8 +628,8 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     juce::ToggleButton duckingTargetCh4Check{"Music Right (CH 4)"};
     juce::ToggleButton duckingApplyStreamCheck{"Stream Bus"};
     juce::ToggleButton duckingApplyMonitorCheck{"Monitor Bus"};
-    juce::Label duckingInputLevelLabel{"-12.3 dB"};
-    juce::Label duckingGRLabel{"-11.6 dB"};
+    juce::Label duckingInputLevelLabel{"-- dB"};
+    juce::Label duckingGRLabel{"-- dB"};
     std::unique_ptr<LiveBus::DigitalPeakMeterComponent> duckingInputMeter;
 
     // Card 3: Audio Safety
@@ -624,9 +642,9 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     juce::Slider safetyMonitorReleaseSlider;
     juce::Label safetyClipWarningLabel{"Clipping Warning"};
     juce::TextButton safetyResetPeakBtn{"Reset Peak"};
-    juce::Label safetyStreamClipLabel{"Stream: -0.3 dB"};
-    juce::Label safetyMonitorPeakHoldLabel{"Monitor: -1.2 dB"};
-    juce::Label safetyRoutingCheckBadge{"No feedback risk detected"};
+    juce::Label safetyStreamClipLabel{"Stream: -- dB"};
+    juce::Label safetyMonitorPeakHoldLabel{"Monitor: -- dB"};
+    juce::Label safetyRoutingCheckBadge{"Routing check pending"};
     juce::TextButton safetyRoutingSettingsBtn{"Settings"};
     juce::TextButton safetyEmergencyMuteBtn{"EMERGENCY MUTE"};
     juce::ToggleButton safetyMuteStreamRadio{"Stream Bus"};
@@ -707,12 +725,18 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     juce::Label dspPageTitle{"DSP Studio — Precision Audio Processing"};
     juce::ComboBox dspPageTargetCombo;
     juce::TextButton dspPuzuEQToggleBtn{"Switch to Puzu 15-Band EQ"};
+    juce::TextButton monitorGraphicEQToggleBtn{"Open Monitor 31-Band EQ"};
+    juce::TextButton mainOutputEQToggleBtn{"Open Main 24-Band EQ"};
     bool showPuzu15BandEQ = false;
+    bool showMonitorGraphicEQ = false;
+    bool showMainOutputEQ = false;
     juce::TextButton dspViewSwitchBtn{"Switch to Standalone 8-Band EQ"};
     bool showVocalRack = true;
     std::unique_ptr<LiveBus::VocalDSPRackComponent> vocalDSPRackComponent;
     std::unique_ptr<LiveBus::EightBandEQComponent> eightBandEQComponent;
     std::unique_ptr<PuzuDSPComponent> puzuDSPComponent;
+    std::unique_ptr<MonitorGraphicEQComponent> monitorGraphicEQComponent;
+    std::unique_ptr<MainOutputEQComponent> mainOutputEQComponent;
     std::array<juce::Slider, 15> puzuBandSliders;
     std::array<juce::Label, 15> puzuBandLabels;
 
@@ -720,7 +744,7 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     juce::Label effectsPageTitle{"VST3 Plugin Host — Isolated Sandbox"};
     juce::TextEditor vstPathEditor;
     juce::TextButton browseVSTPathBtn{"Scan Installed VST3 Plugins"};
-    juce::Label helperHostStatusLabel{"Helper: LiveBusPluginHost.exe [Running PID: Active]"};
+    juce::Label helperHostStatusLabel{"Helper status unavailable"};
     juce::TextButton testWatchdogRecoveryBtn{"Simulate Plugin Crash & Verify Audio Fallback"};
     juce::TextEditor discoveredPluginsEditor;
     std::unique_ptr<LiveBus::VST3HostEngine> vst3HostEngine;
@@ -812,6 +836,9 @@ std::atomic<int> vstTargetIndex[maxInputs + 2]; // Array ukuran 18 (0-17)
     juce::AudioBuffer<float> routingTestSignalBuffer;
     juce::AudioBuffer<float> routingYouTubeBuffer;
     juce::AudioBuffer<float> routingHwDirectBuffer; // Preallocated 8-channel buffer for direct hardware sends
+
+    // Interactive Hover Tooltips (Displays helpful usage guide when hovering controls)
+    juce::TooltipWindow tooltipWindow{this, 400};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

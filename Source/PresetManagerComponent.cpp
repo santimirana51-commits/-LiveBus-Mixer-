@@ -2,6 +2,24 @@
 
 namespace LiveBus
 {
+namespace
+{
+
+bool matchesEQCategory(const EQPresetDefinition& preset, int filterId)
+{
+    if (filterId <= 1)
+        return true;
+    return (int)preset.category == filterId - 2;
+}
+
+EQPresetCategory categoryForFilter(int filterId)
+{
+    return filterId > 1
+        ? (EQPresetCategory)(filterId - 2)
+        : EQPresetCategory::Vocal;
+}
+
+} // namespace
 
 PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
     : presetManager(pm)
@@ -11,10 +29,12 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
     categoryCombo.addItem("8-Band Parametric EQ", 2);
     categoryCombo.addItem("Channel Strip", 3);
     categoryCombo.addItem("Bus Master DSP", 4);
+    categoryCombo.addItem("EQ Preset Catalog", 5);
     categoryCombo.setSelectedId(1, juce::dontSendNotification);
     categoryCombo.onChange = [this] {
         updateTargetOptions();
         refreshList();
+        resized();
     };
     addAndMakeVisible(categoryCombo);
 
@@ -22,10 +42,26 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
     addAndMakeVisible(targetCombo);
     updateTargetOptions();
 
+    eqCategoryCombo.addItem("All EQ categories", 1);
+    eqCategoryCombo.addItem("Vocal", 2);
+    eqCategoryCombo.addItem("Streaming / Communication", 3);
+    eqCategoryCombo.addItem("Music", 4);
+    eqCategoryCombo.addItem("Monitoring", 5);
+    eqCategoryCombo.addItem("Tonal Correction", 6);
+    eqCategoryCombo.addItem("Sound Character", 7);
+    eqCategoryCombo.setSelectedId(1, juce::dontSendNotification);
+    eqCategoryCombo.onChange = [this] { updateFilteredList(); };
+    addAndMakeVisible(eqCategoryCombo);
+    eqCategoryCombo.setVisible(getSelectedCategory() == PresetCategory::EQCatalog);
+
     // Search box
     searchBox.setTextToShowWhenEmpty("Search presets...", juce::Colours::grey);
     searchBox.onTextChange = [this] { updateFilteredList(); };
     addAndMakeVisible(searchBox);
+    favoritesOnlyToggle.onClick = [this] { updateFilteredList(); };
+    addAndMakeVisible(favoritesOnlyToggle);
+    favoritesOnlyToggle.setVisible(
+        getSelectedCategory() == PresetCategory::EQCatalog);
 
     // ListBox
     presetListBox.setModel(this);
@@ -50,6 +86,16 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
         int row = presetListBox.getSelectedRow();
         if (row >= 0 && row < (int)filteredPresets.size())
         {
+            if (getSelectedCategory() == PresetCategory::EQCatalog &&
+                getSelectedTargetIndex() >= eqCatalogPuzuTargetOffset &&
+                !juce::AlertWindow::showOkCancelBox(
+                    juce::AlertWindow::WarningIcon,
+                    "Approximate EQ Mapping",
+                    "This preset will be approximated on the selected EQ's frequency grid. "
+                    "Filter shapes and some source details may not be preserved. Continue?",
+                    "Apply",
+                    "Cancel"))
+                return;
             if (onLoadPresetToTarget)
                 onLoadPresetToTarget(getSelectedCategory(), getSelectedTargetIndex(), filteredPresets[(size_t)row]);
             statusLabel.setText("Loaded preset: " + filteredPresets[(size_t)row].name, juce::dontSendNotification);
@@ -62,6 +108,14 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
         if (row >= 0 && row < (int)filteredPresets.size())
         {
             const auto& item = filteredPresets[(size_t)row];
+            if (getSelectedCategory() == PresetCategory::EQCatalog)
+            {
+                if (!saveEQPresetFromTarget(item.name, &item, true))
+                    return;
+                statusLabel.setText("Saved EQ preset: " + item.name,
+                                    juce::dontSendNotification);
+                return;
+            }
             if (item.isFactory)
             {
                 juce::AlertWindow::showMessageBox(juce::AlertWindow::WarningIcon, "Factory Preset",
@@ -87,6 +141,13 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
             auto name = alert.getTextEditorContents("name").trim();
             if (name.isNotEmpty())
             {
+                if (getSelectedCategory() == PresetCategory::EQCatalog)
+                {
+                    if (saveEQPresetFromTarget(name, nullptr, false))
+                        statusLabel.setText("Saved EQ preset as: " + name,
+                                            juce::dontSendNotification);
+                    return;
+                }
                 if (onSavePresetFromTarget)
                     onSavePresetFromTarget(getSelectedCategory(), getSelectedTargetIndex(), name);
                 refreshList();
@@ -107,9 +168,32 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
                 refreshList();
                 statusLabel.setText("Duplicated preset: " + newName, juce::dontSendNotification);
             }
+            else
+                statusLabel.setText("Could not duplicate preset.", juce::dontSendNotification);
         }
     };
     addAndMakeVisible(duplicateBtn);
+
+    favoriteBtn.onClick = [this] {
+        const int row = presetListBox.getSelectedRow();
+        if (row < 0 || row >= (int)filteredPresets.size())
+            return;
+        const auto item = filteredPresets[(size_t)row];
+        juce::String error;
+        if (!presetManager.setEQCatalogPresetFavorite(
+                item, !item.isFavorite, error))
+        {
+            statusLabel.setText("Favorite update failed: " + error,
+                                juce::dontSendNotification);
+            return;
+        }
+        refreshList();
+        statusLabel.setText(item.isFavorite ? "Removed from favorites."
+                                             : "Added to favorites.",
+                            juce::dontSendNotification);
+    };
+    addAndMakeVisible(favoriteBtn);
+    favoriteBtn.setVisible(getSelectedCategory() == PresetCategory::EQCatalog);
 
     renameBtn.onClick = [this] {
         int row = presetListBox.getSelectedRow();
@@ -134,6 +218,8 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
                     refreshList();
                     statusLabel.setText("Renamed preset to: " + newName, juce::dontSendNotification);
                 }
+                else if (newName.isNotEmpty())
+                    statusLabel.setText("Could not rename preset.", juce::dontSendNotification);
             }
         }
     };
@@ -159,6 +245,8 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
                     refreshList();
                     statusLabel.setText("Deleted preset: " + item.name, juce::dontSendNotification);
                 }
+                else
+                    statusLabel.setText("Could not delete preset.", juce::dontSendNotification);
             }
         }
     };
@@ -194,6 +282,8 @@ PresetManagerComponent::PresetManagerComponent(PresetManager& pm)
                 {
                     statusLabel.setText("Exported preset to: " + fc.getResult().getFileName(), juce::dontSendNotification);
                 }
+                else
+                    statusLabel.setText("Could not export the selected preset.", juce::dontSendNotification);
             }
         }
     };
@@ -212,11 +302,73 @@ int PresetManagerComponent::getSelectedTargetIndex() const
     return targetCombo.getSelectedId() - 1;
 }
 
+bool PresetManagerComponent::saveEQPresetFromTarget(
+    const juce::String& name, const PresetItem* existingItem, bool overwrite)
+{
+    if (!onCaptureEQPresetFromTarget)
+    {
+        statusLabel.setText("EQ preset capture is not available.",
+                            juce::dontSendNotification);
+        return false;
+    }
+
+    EQPresetDefinition preset;
+    juce::String error;
+    if (!onCaptureEQPresetFromTarget(getSelectedTargetIndex(), preset, error))
+    {
+        statusLabel.setText("Could not capture EQ state: " + error,
+                            juce::dontSendNotification);
+        return false;
+    }
+    if (eqCategoryCombo.getSelectedId() > 1)
+        preset.category = categoryForFilter(eqCategoryCombo.getSelectedId());
+
+    const auto description = existingItem != nullptr
+        ? existingItem->description
+        : "User-created starting curve. Adjust to the microphone, source, room, and listener.";
+    const bool favorite = existingItem != nullptr && existingItem->isFavorite;
+    if (!presetManager.saveEQCatalogPreset(name, preset, description, favorite,
+                                           overwrite, error))
+    {
+        statusLabel.setText("Could not save EQ preset: " + error,
+                            juce::dontSendNotification);
+        return false;
+    }
+    refreshList();
+    return true;
+}
+
 void PresetManagerComponent::updateTargetOptions()
 {
     targetCombo.clear();
     auto cat = getSelectedCategory();
-    if (cat == PresetCategory::VocalDSP || cat == PresetCategory::EightBandEQ)
+    if (cat == PresetCategory::EQCatalog)
+    {
+        const auto addTargetsForEQ = [this](const juce::String& prefix, int offset)
+        {
+            for (int channel = 0; channel < maxInputs; ++channel)
+            {
+                const auto name = channel == 0 ? "Input 1 - Mic"
+                    : channel == 1 ? "Input 2 - Guitar"
+                    : channel == 2 ? "Input 3 - Music L"
+                    : channel == 3 ? "Input 4 - Music R"
+                    : "Input " + juce::String(channel + 1);
+                targetCombo.addItem(prefix + name, offset + channel + 1);
+            }
+            targetCombo.addItem(prefix + "Stream Bus (Master)",
+                                offset + maxInputs + 1);
+            targetCombo.addItem(prefix + "Monitor Bus",
+                                offset + maxInputs + 2);
+        };
+        addTargetsForEQ("8-Band: ", 0);
+        addTargetsForEQ("15-Band: ", eqCatalogPuzuTargetOffset);
+        targetCombo.addItem("Monitor Graphic EQ 31-Band: Monitor Bus",
+                            eqCatalogMonitor31Target + 1);
+        targetCombo.addItem("Main Output EQ 24-Band: Stream Bus",
+                            eqCatalogMain24Target + 1);
+        targetCombo.setSelectedId(1, juce::dontSendNotification);
+    }
+    else if (cat == PresetCategory::VocalDSP || cat == PresetCategory::EightBandEQ)
     {
         for (int channel = 0; channel < maxInputs; ++channel)
         {
@@ -250,6 +402,19 @@ void PresetManagerComponent::updateTargetOptions()
         targetCombo.addItem("Monitor Bus", 2);
         targetCombo.setSelectedId(1, juce::dontSendNotification);
     }
+
+    const bool isCatalog = cat == PresetCategory::EQCatalog;
+    eqCategoryCombo.setVisible(isCatalog);
+    favoritesOnlyToggle.setVisible(isCatalog);
+    saveBtn.setEnabled(!isCatalog);
+    saveAsBtn.setEnabled(true);
+    duplicateBtn.setEnabled(true);
+    renameBtn.setEnabled(true);
+    deleteBtn.setEnabled(true);
+    importBtn.setEnabled(true);
+    exportBtn.setEnabled(true);
+    favoriteBtn.setVisible(isCatalog);
+    updateActionButtons();
 }
 
 void PresetManagerComponent::refreshList()
@@ -265,10 +430,25 @@ void PresetManagerComponent::updateFilteredList()
 
     for (const auto& item : currentPresets)
     {
-        if (query.isEmpty() || item.name.toLowerCase().contains(query) || item.description.toLowerCase().contains(query))
+        if (getSelectedCategory() == PresetCategory::EQCatalog)
         {
-            filteredPresets.push_back(item);
+            EQPresetDefinition preset;
+            juce::String error;
+            if (!presetManager.loadEQCatalogPreset(item, preset, error))
+            {
+                if (eqCategoryCombo.getSelectedId() > 1)
+                    continue;
+            }
+            else if (!matchesEQCategory(preset, eqCategoryCombo.getSelectedId()))
+                continue;
         }
+        if (favoritesOnlyToggle.getToggleState() && !item.isFavorite)
+            continue;
+        if (!query.isEmpty() &&
+            !item.name.toLowerCase().contains(query) &&
+            !item.description.toLowerCase().contains(query))
+            continue;
+        filteredPresets.push_back(item);
     }
 
     presetListBox.updateContent();
@@ -283,6 +463,28 @@ void PresetManagerComponent::updateFilteredList()
     {
         descriptionLabel.setText("No presets match query.", juce::dontSendNotification);
     }
+    updateActionButtons();
+}
+
+void PresetManagerComponent::updateActionButtons()
+{
+    const int row = presetListBox.getSelectedRow();
+    const bool hasSelection = row >= 0 && row < (int)filteredPresets.size();
+    const bool isCatalog = getSelectedCategory() == PresetCategory::EQCatalog;
+    const bool isFactory = hasSelection && filteredPresets[(size_t)row].isFactory;
+    loadBtn.setEnabled(hasSelection);
+    saveBtn.setEnabled(hasSelection && !isCatalog && !isFactory);
+    saveAsBtn.setEnabled(isCatalog || hasSelection);
+    duplicateBtn.setEnabled(hasSelection);
+    renameBtn.setEnabled(hasSelection && !isFactory);
+    deleteBtn.setEnabled(hasSelection && !isFactory);
+    importBtn.setEnabled(true);
+    exportBtn.setEnabled(hasSelection);
+    favoriteBtn.setEnabled(isCatalog && hasSelection);
+    favoriteBtn.setButtonText(hasSelection &&
+                              filteredPresets[(size_t)row].isFavorite
+                                  ? "Remove Favorite"
+                                  : "Add Favorite");
 }
 
 int PresetManagerComponent::getNumRows()
@@ -342,6 +544,7 @@ void PresetManagerComponent::selectedRowsChanged(int lastRowSelected)
     {
         descriptionLabel.setText(filteredPresets[(size_t)lastRowSelected].description, juce::dontSendNotification);
     }
+    updateActionButtons();
 }
 
 void PresetManagerComponent::resized()
@@ -349,9 +552,17 @@ void PresetManagerComponent::resized()
     auto b = getLocalBounds().reduced(16);
 
     int topY = b.getY();
-    categoryCombo.setBounds(b.getX(), topY, 220, 28);
-    targetCombo.setBounds(categoryCombo.getRight() + 10, topY, 220, 28);
-    searchBox.setBounds(targetCombo.getRight() + 10, topY, b.getRight() - (targetCombo.getRight() + 10), 28);
+    categoryCombo.setBounds(b.getX(), topY, 180, 28);
+    targetCombo.setBounds(categoryCombo.getRight() + 8, topY, 200, 28);
+    int filterX = targetCombo.getRight() + 8;
+    if (eqCategoryCombo.isVisible())
+    {
+        eqCategoryCombo.setBounds(filterX, topY, 150, 28);
+        filterX = eqCategoryCombo.getRight() + 8;
+        favoritesOnlyToggle.setBounds(filterX, topY, 112, 28);
+        filterX = favoritesOnlyToggle.getRight() + 8;
+    }
+    searchBox.setBounds(filterX, topY, juce::jmax(80, b.getRight() - filterX), 28);
 
     int actionColW = 140;
     int listW = b.getWidth() - actionColW - 16;
@@ -366,6 +577,7 @@ void PresetManagerComponent::resized()
     int spacing = 6;
 
     loadBtn.setBounds(btnX, btnY, actionColW, 34); btnY += 40;
+    favoriteBtn.setBounds(btnX, btnY, actionColW, btnH); btnY += btnH + spacing;
     saveBtn.setBounds(btnX, btnY, actionColW, btnH); btnY += btnH + spacing;
     saveAsBtn.setBounds(btnX, btnY, actionColW, btnH); btnY += btnH + spacing;
     duplicateBtn.setBounds(btnX, btnY, actionColW, btnH); btnY += btnH + spacing;
@@ -392,7 +604,10 @@ void PresetManagerComponent::paint(juce::Graphics& g)
     g.fillRect(16, getHeight() - 28, getWidth() - 32, 20);
     g.setColour(juce::Colour(0xff6e7687));
     g.setFont(juce::FontOptions(11.0f, juce::Font::italic));
-    g.drawText("Scope: Presets apply strictly to the selected processor. Routing matrix, device settings, and other channels are preserved.",
+    const auto notice = getSelectedCategory() == PresetCategory::EQCatalog
+        ? "EQ presets are starting curves, not universal correction. Cross-grid mappings are approximations."
+        : "Scope: Presets apply strictly to the selected processor. Routing matrix, device settings, and other channels are preserved.";
+    g.drawText(notice,
                24, getHeight() - 28, getWidth() - 48, 20, juce::Justification::centredLeft, true);
 }
 
